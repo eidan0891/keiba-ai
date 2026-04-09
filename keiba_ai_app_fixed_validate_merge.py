@@ -29,7 +29,7 @@ except Exception:
 APP_TITLE = "競馬AI予想 完全版"
 DEFAULT_RACE_URL = "https://race.netkeiba.com/race/shutuba.html?race_id=202601010811"
 REQUEST_TIMEOUT = 20
-REQUEST_SLEEP = 0.2
+REQUEST_SLEEP = 0.5
 TOP_FOR_TICKETS_DEFAULT = 10
 
 

@@ -435,17 +435,17 @@ class Scraper:
     def get_html(self, url: str) -> str:
         if "nar.netkeiba.com" in url:
             html = self._try_requests_then_selenium(url)
-            time.sleep(self.sleep_sec)
+            time.sleep(random.uniform(0.5, 1.2))
             return html
         try:
             html = self._requests_html(url)
-            time.sleep(self.sleep_sec)
+            time.sleep(random.uniform(0.5, 1.2))
             return html
         except Exception:
             if not SELENIUM_AVAILABLE:
                 raise
             html = self._selenium_html(url)
-            time.sleep(self.sleep_sec)
+            time.sleep(random.uniform(0.5, 1.2))
             return html
 
     def _requests_html(self, url: str) -> str:

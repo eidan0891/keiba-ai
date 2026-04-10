@@ -27,9 +27,9 @@ except Exception:
 # ============================================================
 
 APP_TITLE = "競馬AI予想 完全版"
-DEFAULT_RACE_URL = ""
+DEFAULT_RACE_URL = "https://race.netkeiba.com/race/shutuba.html?race_id=202601010811"
 REQUEST_TIMEOUT = 20
-REQUEST_SLEEP = 0.5
+REQUEST_SLEEP = 0.2
 TOP_FOR_TICKETS_DEFAULT = 10
 
 
@@ -129,18 +129,6 @@ def clean_text(value: Any) -> str:
 
 def norm_text(value: Any) -> str:
     return str(value).replace(" ", "").replace("\u3000", "").strip()
-
-
-def is_valid_horse_name(name: Any) -> bool:
-    text = clean_text(name)
-    if not text:
-        return False
-    ng_words = ["データベース", "のデータベース", "database", "http://", "https://"]
-    if any(w.lower() in text.lower() for w in ng_words):
-        return False
-    if len(text) > 20:
-        return False
-    return True
 
 
 def only_digits(value: Any) -> str:
@@ -447,17 +435,17 @@ class Scraper:
     def get_html(self, url: str) -> str:
         if "nar.netkeiba.com" in url:
             html = self._try_requests_then_selenium(url)
-            time.sleep(np.random.uniform(0.5, 1.2))
+            time.sleep(self.sleep_sec)
             return html
         try:
             html = self._requests_html(url)
-            time.sleep(np.random.uniform(0.5, 1.2))
+            time.sleep(self.sleep_sec)
             return html
         except Exception:
             if not SELENIUM_AVAILABLE:
                 raise
             html = self._selenium_html(url)
-            time.sleep(np.random.uniform(0.5, 1.2))
+            time.sleep(self.sleep_sec)
             return html
 
     def _requests_html(self, url: str) -> str:
@@ -700,7 +688,7 @@ def parse_race_card_jra(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
             odds=to_float(pick("odds", len(text_cells) - 2 if len(text_cells) >= 2 else None)),
             popularity=to_int(pick("popularity", len(text_cells) - 1 if len(text_cells) >= 1 else None)),
         )
-        if row.horse_name and is_valid_horse_name(row.horse_name):
+        if row.horse_name:
             rows.append(row)
 
     if not rows:
@@ -786,7 +774,7 @@ def parse_race_card_nar(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
                 odds=odds,
                 popularity=popularity,
             )
-            if row.horse_name and is_valid_horse_name(row.horse_name):
+            if row.horse_name:
                 rows.append(row)
 
     if not rows:
@@ -1628,72 +1616,36 @@ def calc_recovery_rate(
 
 def validate_predictions(pred_df: pd.DataFrame, result_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     work = pred_df.copy()
+    work["馬名_norm"] = work["horse_name"].map(normalize_horse_name)
     result2 = result_df.copy()
 
-    # 正規化
-    work["horse_name_norm"] = work["horse_name"].map(normalize_horse_name) if "horse_name" in work.columns else ""
-    result2["horse_name_norm"] = result2["馬名"].map(normalize_horse_name) if "馬名" in result2.columns else ""
-
-    # result側の重複除去
-    if "馬番" in result2.columns and pd.to_numeric(result2["馬番"], errors="coerce").notna().sum() > 0:
-        result2["馬番"] = pd.to_numeric(result2["馬番"], errors="coerce")
-        result2 = result2.sort_values(["着順", "馬番"], na_position="last").drop_duplicates(subset=["馬番"], keep="first")
-    result2 = result2.sort_values(["着順", "horse_name_norm"], na_position="last").drop_duplicates(subset=["horse_name_norm"], keep="first")
-
-    # pred側の重複除去
-    if "horse_no" in work.columns and pd.to_numeric(work["horse_no"], errors="coerce").notna().sum() > 0:
-        work["horse_no"] = pd.to_numeric(work["horse_no"], errors="coerce")
-        work = work.sort_values(["horse_no", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_no"], keep="first")
-    work = work.sort_values(["horse_name_norm", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_name_norm"], keep="first")
-
-    # まず馬番で結合
-    merged = pd.DataFrame()
-    if "horse_no" in work.columns and "馬番" in result2.columns and pd.to_numeric(work["horse_no"], errors="coerce").notna().sum() > 0:
+    if "horse_no" in work.columns:
         merged = work.merge(
-            result2[["着順", "馬番", "馬名", "horse_name_norm"]],
+            result2[["着順", "馬番", "馬名", "馬名_norm"]],
             left_on="horse_no",
             right_on="馬番",
             how="left",
             suffixes=("", "_result"),
         )
+    else:
+        merged = work.merge(
+            result2[["着順", "馬番", "馬名", "馬名_norm"]],
+            on="馬名_norm",
+            how="left",
+            suffixes=("", "_result"),
+        )
 
-    # 馬番で取れない行だけ名前で補完
-    if merged.empty:
-        merged = work.copy()
-        merged["着順"] = pd.NA
-        merged["馬番"] = pd.NA
-        merged["馬名"] = pd.NA
-
-    missing_mask = merged["着順"].isna() if "着順" in merged.columns else pd.Series([True] * len(merged))
-    if missing_mask.any():
-        fill_src = result2[["着順", "馬番", "馬名", "horse_name_norm"]].copy()
-        fill_map = fill_src.set_index("horse_name_norm")[["着順", "馬番", "馬名"]]
-        for idx in merged.index[missing_mask]:
-            key = merged.at[idx, "horse_name_norm"]
-            if key in fill_map.index:
-                vals = fill_map.loc[key]
-                if isinstance(vals, pd.DataFrame):
-                    vals = vals.iloc[0]
-                merged.at[idx, "着順"] = vals["着順"]
-                merged.at[idx, "馬番"] = vals["馬番"]
-                merged.at[idx, "馬名"] = vals["馬名"]
-
-    # 最終重複除去
-    if "horse_no" in merged.columns and pd.to_numeric(merged["horse_no"], errors="coerce").notna().sum() > 0:
-        merged = merged.sort_values(["予想順位" if "予想順位" in merged.columns else "ai_score"], na_position="last").drop_duplicates(subset=["horse_no"], keep="first")
-    merged = merged.sort_values(["horse_name_norm", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_name_norm"], keep="first")
-
-    merged = merged.reset_index(drop=True)
     merged["予想順位"] = np.arange(1, len(merged) + 1)
     merged["3着内"] = pd.to_numeric(merged["着順"], errors="coerce").le(3)
     merged["1着的中"] = pd.to_numeric(merged["着順"], errors="coerce").eq(1)
 
+    top1_name = merged.iloc[0]["horse_name"] if len(merged) else ""
     top5 = merged.head(5)
     top3 = merged.head(3)
 
     summary = {
         "勝ち馬を上位5頭に含む": bool(top5["1着的中"].fillna(False).any()) if len(top5) else False,
-        "◎の着順": int(pd.to_numeric(merged.iloc[0]["着順"], errors="coerce")) if len(merged) and pd.notna(pd.to_numeric(merged.iloc[0]["着順"], errors="coerce")) else None,
+        "◎の着順": int(merged.iloc[0]["着順"]) if len(merged) and pd.notna(merged.iloc[0]["着順"]) else None,
         "上位3頭中の3着内頭数": int(top3["3着内"].fillna(False).sum()) if len(top3) else 0,
         "上位5頭中の3着内頭数": int(top5["3着内"].fillna(False).sum()) if len(top5) else 0,
     }
@@ -1812,7 +1764,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     c4.metric("穴", ana.iloc[0]["horse_name"] if len(ana) else "-")
 
     st.subheader("本命候補")
-    st.table(honmei[["mark", "horse_no", "horse_name", "win_prob", "place_prob", "ai_score", "running_style"]], use_container_width=True, hide_index=True)
+    st.dataframe(honmei[["mark", "horse_no", "horse_name", "win_prob", "place_prob", "ai_score", "running_style"]], use_container_width=True, hide_index=True)
 
     ana_cols = ["horse_no", "horse_name", "running_style", "win_prob", "market_prob", "gap", "ana_score"]
     if odds_valid:
@@ -1820,7 +1772,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     if "pop_f" in ana.columns:
         ana_cols.insert(3 if odds_valid else 2, "pop_f")
     st.subheader("穴候補")
-    st.table(ana[ana_cols], use_container_width=True, hide_index=True)
+    st.dataframe(ana[ana_cols], use_container_width=True, hide_index=True)
 
     wide_df = build_pair_table(top, "place_prob", "ワイド")
     umaren_df = build_pair_table(top, "win_prob", "馬連")
@@ -1840,21 +1792,21 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     ])
 
     with tabs[0]:
-        st.table(wide_df.head(wide_count), use_container_width=True, hide_index=True)
+        st.dataframe(wide_df.head(wide_count), use_container_width=True, hide_index=True)
     with tabs[1]:
-        st.table(umaren_df.head(umaren_count), use_container_width=True, hide_index=True)
+        st.dataframe(umaren_df.head(umaren_count), use_container_width=True, hide_index=True)
     with tabs[2]:
-        st.table(trio_df.head(trio_count), use_container_width=True, hide_index=True)
+        st.dataframe(trio_df.head(trio_count), use_container_width=True, hide_index=True)
     with tabs[3]:
-        st.table(trifecta_df.head(trifecta_count), use_container_width=True, hide_index=True)
+        st.dataframe(trifecta_df.head(trifecta_count), use_container_width=True, hide_index=True)
     with tabs[4]:
-        st.table(honmei_ana_wide.head(wide_count), use_container_width=True, hide_index=True)
+        st.dataframe(honmei_ana_wide.head(wide_count), use_container_width=True, hide_index=True)
     with tabs[5]:
-        st.table(honmei_ana_umaren.head(umaren_count), use_container_width=True, hide_index=True)
+        st.dataframe(honmei_ana_umaren.head(umaren_count), use_container_width=True, hide_index=True)
     with tabs[6]:
-        st.table(honmei_ana_trio.head(trio_count), use_container_width=True, hide_index=True)
+        st.dataframe(honmei_ana_trio.head(trio_count), use_container_width=True, hide_index=True)
     with tabs[7]:
-        st.table(honmei_ana_trifecta.head(trifecta_count), use_container_width=True, hide_index=True)
+        st.dataframe(honmei_ana_trifecta.head(trifecta_count), use_container_width=True, hide_index=True)
 
     st.session_state["latest_prediction_df"] = df.copy()
     st.session_state["latest_ticket_tables"] = {
@@ -1882,7 +1834,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
             merged_df, summary = validate_predictions(df, result_df)
             st.write("### 予想と実着順")
             view_cols = [c for c in ["mark", "horse_no", "horse_name", "running_style", "予想順位", "着順", "3着内", "1着的中"] if c in merged_df.columns]
-            st.table(merged_df[view_cols], use_container_width=True, hide_index=True)
+            st.dataframe(merged_df[view_cols], use_container_width=True, hide_index=True)
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("◎の着順", summary["◎の着順"] if summary["◎の着順"] is not None else "-")
@@ -1892,7 +1844,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
 
             st.write("### 券種別的中")
             hit_df = ticket_hit_summary(result_df, st.session_state["latest_ticket_tables"])
-            st.table(hit_df, use_container_width=True, hide_index=True)
+            st.dataframe(hit_df, use_container_width=True, hide_index=True)
 
             payout_tables = extract_payout_tables(result_url.strip(), result_html)
             recovery_df, recovery_summary = calc_recovery_rate(
@@ -1906,11 +1858,11 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
             c1.metric("購入総額", f"{int(recovery_summary['購入総額'])}円")
             c2.metric("払戻総額", f"{int(recovery_summary['払戻総額'])}円")
             c3.metric("総合回収率", f"{recovery_summary['総合回収率']:.1f}%")
-            st.table(recovery_df, use_container_width=True, hide_index=True)
+            st.dataframe(recovery_df, use_container_width=True, hide_index=True)
             if payout_tables:
                 st.write("### 払戻テーブル（文字化け対策版）")
                 for name, ptable in payout_tables.items():
-                    st.table(ptable, use_container_width=True, hide_index=True)
+                    st.dataframe(ptable, use_container_width=True, hide_index=True)
             else:
                 st.caption("払戻テーブルは取得できませんでした。")
         except Exception as e:

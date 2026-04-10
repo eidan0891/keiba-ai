@@ -657,7 +657,7 @@ def parse_race_card_jra(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
                 horse_url = urljoin(race_url, href)
                 horse_name = clean_text(a.get_text())
 　　　　　# 👇これ追加（ここ！！）
-        　　　　if "データベース" in horse_name:
+        　　　#　if "データベース" in horse_name:
             　　continue
           elif "/jockey/" in href and not jockey_url:
                 jockey_url = urljoin(race_url, href)

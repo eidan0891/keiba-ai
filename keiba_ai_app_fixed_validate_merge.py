@@ -131,6 +131,18 @@ def norm_text(value: Any) -> str:
     return str(value).replace(" ", "").replace("\u3000", "").strip()
 
 
+def is_valid_horse_name(name: Any) -> bool:
+    text = clean_text(name)
+    if not text:
+        return False
+    ng_words = ["データベース", "のデータベース", "database", "http://", "https://"]
+    if any(w.lower() in text.lower() for w in ng_words):
+        return False
+    if len(text) > 20:
+        return False
+    return True
+
+
 def only_digits(value: Any) -> str:
     return re.sub(r"[^0-9-]", "", str(value))
 
@@ -656,10 +668,6 @@ def parse_race_card_jra(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
             if "/horse/" in href and not horse_url:
                 horse_url = urljoin(race_url, href)
                 horse_name = clean_text(a.get_text())
-                if "データベース" in horse_name or "のデータベース" in horse_name:
-                    horse_name = ""
-                    horse_url = ""
-                    continue
             elif "/jockey/" in href and not jockey_url:
                 jockey_url = urljoin(race_url, href)
                 jockey = clean_text(a.get_text())
@@ -692,7 +700,7 @@ def parse_race_card_jra(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
             odds=to_float(pick("odds", len(text_cells) - 2 if len(text_cells) >= 2 else None)),
             popularity=to_int(pick("popularity", len(text_cells) - 1 if len(text_cells) >= 1 else None)),
         )
-        if row.horse_name:
+        if row.horse_name and is_valid_horse_name(row.horse_name):
             rows.append(row)
 
     if not rows:
@@ -778,7 +786,7 @@ def parse_race_card_nar(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
                 odds=odds,
                 popularity=popularity,
             )
-            if row.horse_name:
+            if row.horse_name and is_valid_horse_name(row.horse_name):
                 rows.append(row)
 
     if not rows:

@@ -52,6 +52,32 @@ HEADERS = {
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
+# ==== mobile fix ====
+st.markdown("""
+<style>
+.block-container {
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+}
+div[data-testid="stDataFrame"] {
+    overflow-x: auto !important;
+}
+table {
+    width: 100% !important;
+    display: block;
+}
+@media (max-width: 768px) {
+    .stDataFrame {
+        font-size: 10px !important;
+    }
+    th, td {
+        padding: 4px !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 if "race_df_store" not in st.session_state:
     st.session_state["race_df_store"] = None
 if "hist_df_store" not in st.session_state:

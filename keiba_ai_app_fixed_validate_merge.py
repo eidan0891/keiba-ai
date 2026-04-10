@@ -52,32 +52,6 @@ HEADERS = {
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# ==== mobile fix ====
-st.markdown("""
-<style>
-.block-container {
-    padding-left: 10px !important;
-    padding-right: 10px !important;
-}
-div[data-testid="stDataFrame"] {
-    overflow-x: auto !important;
-}
-table {
-    width: 100% !important;
-    display: block;
-}
-@media (max-width: 768px) {
-    .stDataFrame {
-        font-size: 10px !important;
-    }
-    th, td {
-        padding: 4px !important;
-    }
-}
-</style>
-""", unsafe_allow_html=True)
-
-
 if "race_df_store" not in st.session_state:
     st.session_state["race_df_store"] = None
 if "hist_df_store" not in st.session_state:
@@ -1838,7 +1812,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     c4.metric("穴", ana.iloc[0]["horse_name"] if len(ana) else "-")
 
     st.subheader("本命候補")
-    st.dataframe(honmei[["mark", "horse_no", "horse_name", "win_prob", "place_prob", "ai_score", "running_style"]], use_container_width=True, hide_index=True)
+    st.table(honmei[["mark", "horse_no", "horse_name", "win_prob", "place_prob", "ai_score", "running_style"]], use_container_width=True, hide_index=True)
 
     ana_cols = ["horse_no", "horse_name", "running_style", "win_prob", "market_prob", "gap", "ana_score"]
     if odds_valid:
@@ -1846,7 +1820,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     if "pop_f" in ana.columns:
         ana_cols.insert(3 if odds_valid else 2, "pop_f")
     st.subheader("穴候補")
-    st.dataframe(ana[ana_cols], use_container_width=True, hide_index=True)
+    st.table(ana[ana_cols], use_container_width=True, hide_index=True)
 
     wide_df = build_pair_table(top, "place_prob", "ワイド")
     umaren_df = build_pair_table(top, "win_prob", "馬連")
@@ -1866,21 +1840,21 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     ])
 
     with tabs[0]:
-        st.dataframe(wide_df.head(wide_count), use_container_width=True, hide_index=True)
+        st.table(wide_df.head(wide_count), use_container_width=True, hide_index=True)
     with tabs[1]:
-        st.dataframe(umaren_df.head(umaren_count), use_container_width=True, hide_index=True)
+        st.table(umaren_df.head(umaren_count), use_container_width=True, hide_index=True)
     with tabs[2]:
-        st.dataframe(trio_df.head(trio_count), use_container_width=True, hide_index=True)
+        st.table(trio_df.head(trio_count), use_container_width=True, hide_index=True)
     with tabs[3]:
-        st.dataframe(trifecta_df.head(trifecta_count), use_container_width=True, hide_index=True)
+        st.table(trifecta_df.head(trifecta_count), use_container_width=True, hide_index=True)
     with tabs[4]:
-        st.dataframe(honmei_ana_wide.head(wide_count), use_container_width=True, hide_index=True)
+        st.table(honmei_ana_wide.head(wide_count), use_container_width=True, hide_index=True)
     with tabs[5]:
-        st.dataframe(honmei_ana_umaren.head(umaren_count), use_container_width=True, hide_index=True)
+        st.table(honmei_ana_umaren.head(umaren_count), use_container_width=True, hide_index=True)
     with tabs[6]:
-        st.dataframe(honmei_ana_trio.head(trio_count), use_container_width=True, hide_index=True)
+        st.table(honmei_ana_trio.head(trio_count), use_container_width=True, hide_index=True)
     with tabs[7]:
-        st.dataframe(honmei_ana_trifecta.head(trifecta_count), use_container_width=True, hide_index=True)
+        st.table(honmei_ana_trifecta.head(trifecta_count), use_container_width=True, hide_index=True)
 
     st.session_state["latest_prediction_df"] = df.copy()
     st.session_state["latest_ticket_tables"] = {
@@ -1908,7 +1882,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
             merged_df, summary = validate_predictions(df, result_df)
             st.write("### 予想と実着順")
             view_cols = [c for c in ["mark", "horse_no", "horse_name", "running_style", "予想順位", "着順", "3着内", "1着的中"] if c in merged_df.columns]
-            st.dataframe(merged_df[view_cols], use_container_width=True, hide_index=True)
+            st.table(merged_df[view_cols], use_container_width=True, hide_index=True)
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("◎の着順", summary["◎の着順"] if summary["◎の着順"] is not None else "-")
@@ -1918,7 +1892,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
 
             st.write("### 券種別的中")
             hit_df = ticket_hit_summary(result_df, st.session_state["latest_ticket_tables"])
-            st.dataframe(hit_df, use_container_width=True, hide_index=True)
+            st.table(hit_df, use_container_width=True, hide_index=True)
 
             payout_tables = extract_payout_tables(result_url.strip(), result_html)
             recovery_df, recovery_summary = calc_recovery_rate(
@@ -1932,11 +1906,11 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
             c1.metric("購入総額", f"{int(recovery_summary['購入総額'])}円")
             c2.metric("払戻総額", f"{int(recovery_summary['払戻総額'])}円")
             c3.metric("総合回収率", f"{recovery_summary['総合回収率']:.1f}%")
-            st.dataframe(recovery_df, use_container_width=True, hide_index=True)
+            st.table(recovery_df, use_container_width=True, hide_index=True)
             if payout_tables:
                 st.write("### 払戻テーブル（文字化け対策版）")
                 for name, ptable in payout_tables.items():
-                    st.dataframe(ptable, use_container_width=True, hide_index=True)
+                    st.table(ptable, use_container_width=True, hide_index=True)
             else:
                 st.caption("払戻テーブルは取得できませんでした。")
         except Exception as e:

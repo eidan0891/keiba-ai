@@ -131,6 +131,130 @@ def norm_text(value: Any) -> str:
     return str(value).replace(" ", "").replace("\u3000", "").strip()
 
 
+def normalize_jockey_name(value: Any) -> str:
+    text = norm_text(value)
+    text = text.replace("・", "").replace(".", "").replace("Ｊ．", "").replace("Ｍ．", "")
+    text = text.replace("C.", "").replace("M.", "").replace("D.", "").replace("L.", "")
+    return text
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def fetch_jra_jockey_scores() -> pd.DataFrame:
+    """JRAの公開ページから騎手スコア候補を取得する。取得失敗時は空DataFrame。"""
+    urls = [
+        "https://www.jra.go.jp/JRADB/accessK.html",
+        "https://www.jra.go.jp/datafile/leading/",
+        "https://www.jra.go.jp/datafile/meikan/",
+    ]
+
+    all_frames = []
+    for url in urls:
+        try:
+            html = fetch_text_with_encoding(url, timeout=REQUEST_TIMEOUT)
+            tables = pd.read_html(io.StringIO(html))
+        except Exception:
+            continue
+
+        for raw in tables:
+            try:
+                df = flatten_columns(raw).copy()
+                cols = [clean_text(c) for c in df.columns]
+                joined = " ".join(cols)
+
+                # 騎手名列の推定
+                name_col = None
+                for c in df.columns:
+                    cc = clean_text(c)
+                    if any(k in cc for k in ["騎手名", "騎手", "氏名", "名前"]):
+                        name_col = c
+                        break
+
+                if name_col is None:
+                    # 先頭列が名前っぽいケース
+                    first_col = df.columns[0] if len(df.columns) else None
+                    if first_col is not None and df[first_col].astype(str).str.contains(r"[一-龠ぁ-んァ-ンA-Za-z]", regex=True, na=False).mean() > 0.5:
+                        name_col = first_col
+
+                if name_col is None:
+                    continue
+
+                # 数値列の候補
+                work = pd.DataFrame()
+                work["jockey"] = df[name_col].astype(str).map(clean_text)
+                work["jockey_key"] = work["jockey"].map(normalize_jockey_name)
+
+                for c in df.columns:
+                    s = df[c]
+                    cname = clean_text(c)
+
+                    # 勝率系
+                    if any(k in cname for k in ["勝率", "連対率", "3着内率", "複勝率", "入着率"]):
+                        work[cname] = pd.to_numeric(s.astype(str).str.replace("%", "", regex=False), errors="coerce") / (
+                            100.0 if s.astype(str).str.contains("%", regex=False, na=False).any() else 1.0
+                        )
+                    # 回数系
+                    elif any(k in cname for k in ["1着", "2着", "3着", "勝利度数", "騎乗回数", "出走回数"]):
+                        work[cname] = pd.to_numeric(s, errors="coerce")
+
+                # 最低限の情報がないものは除外
+                usable_cols = [c for c in work.columns if c not in ["jockey", "jockey_key"]]
+                if len(usable_cols) == 0:
+                    continue
+
+                work = work[work["jockey_key"] != ""].copy()
+                if len(work) == 0:
+                    continue
+
+                # スコア算出（ある列だけ使う）
+                score = pd.Series(0.0, index=work.index)
+
+                if "勝率" in work.columns:
+                    score += pd.to_numeric(work["勝率"], errors="coerce").fillna(0) * 0.40
+                if "連対率" in work.columns:
+                    score += pd.to_numeric(work["連対率"], errors="coerce").fillna(0) * 0.25
+                if "3着内率" in work.columns:
+                    score += pd.to_numeric(work["3着内率"], errors="coerce").fillna(0) * 0.20
+                if "複勝率" in work.columns:
+                    score += pd.to_numeric(work["複勝率"], errors="coerce").fillna(0) * 0.20
+                if "入着率" in work.columns:
+                    score += pd.to_numeric(work["入着率"], errors="coerce").fillna(0) * 0.15
+
+                if "1着" in work.columns:
+                    score += pd.to_numeric(work["1着"], errors="coerce").rank(pct=True).fillna(0) * 0.08
+                if "勝利度数" in work.columns:
+                    score += pd.to_numeric(work["勝利度数"], errors="coerce").rank(pct=True).fillna(0) * 0.08
+                if "騎乗回数" in work.columns:
+                    score += pd.to_numeric(work["騎乗回数"], errors="coerce").rank(pct=True).fillna(0) * 0.02
+                if "出走回数" in work.columns:
+                    score += pd.to_numeric(work["出走回数"], errors="coerce").rank(pct=True).fillna(0) * 0.02
+
+                work["jra_jockey_score_raw"] = score
+                all_frames.append(work[["jockey", "jockey_key", "jra_jockey_score_raw"]].copy())
+            except Exception:
+                continue
+
+    if not all_frames:
+        return pd.DataFrame(columns=["jockey", "jockey_key", "jra_jockey_score"])
+
+    out = pd.concat(all_frames, ignore_index=True)
+    out = out.dropna(subset=["jockey_key"]).copy()
+    out = out[out["jockey_key"] != ""].copy()
+
+    # 同名重複は最大値採用
+    out = out.groupby("jockey_key", as_index=False).agg({
+        "jockey": "first",
+        "jra_jockey_score_raw": "max",
+    })
+
+    vals = pd.to_numeric(out["jra_jockey_score_raw"], errors="coerce").fillna(0)
+    if vals.max() > vals.min():
+        out["jra_jockey_score"] = (vals - vals.min()) / (vals.max() - vals.min())
+    else:
+        out["jra_jockey_score"] = 0.5
+
+    return out[["jockey", "jockey_key", "jra_jockey_score"]].copy()
+
+
 def only_digits(value: Any) -> str:
     return re.sub(r"[^0-9-]", "", str(value))
 
@@ -1095,6 +1219,8 @@ def build_features(hist: pd.DataFrame, recent_n: int = 10) -> pd.DataFrame:
                 "auto_running_style": infer_running_style_from_history(r3["passing"].tolist() if "passing" in r3.columns else [], 18),
                 "hist_odds_avg": o3.mean() if len(o3) else np.nan,
                 "hist_pop_avg": p3.mean() if len(p3) else np.nan,
+                "growth": (f_all.iloc[1] - f_all.iloc[0]) if len(f_all) >= 2 else np.nan,
+                "nakayama_score": ((g[(g["venue"].astype(str).str.contains("中山")) & (g["distance"].astype(str) == "2000")]["finish_num"] <= 3).mean()) if len(g) else np.nan,
             }
         )
     cols = [
@@ -1163,6 +1289,36 @@ def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10) -> 
     else:
         df["running_style"] = "不明"
 
+    # 手動脚質上書き
+    try:
+        for i in df.index:
+            key = df.loc[i, "key"]
+            manual = manual_styles.get(key, "自動") if 'manual_styles' in globals() else "自動"
+            if manual != "自動":
+                df.loc[i, "running_style"] = manual
+    except Exception:
+        pass
+
+
+    top_jockeys = ["ルメール", "川田", "横山武", "戸崎", "武豊"]
+    fallback_jockey_score = df["jockey"].apply(lambda x: 1.0 if any(j in str(x) for j in top_jockeys) else 0.35)
+
+    try:
+        jockey_master = fetch_jra_jockey_scores()
+    except Exception:
+        jockey_master = pd.DataFrame(columns=["jockey_key", "jra_jockey_score"])
+
+    if len(jockey_master):
+        df["jockey_key"] = df["jockey"].map(normalize_jockey_name)
+        df = df.merge(
+            jockey_master[["jockey_key", "jra_jockey_score"]],
+            on="jockey_key",
+            how="left"
+        )
+        df["jockey_score"] = pd.to_numeric(df["jra_jockey_score"], errors="coerce").fillna(fallback_jockey_score)
+    else:
+        df["jockey_score"] = fallback_jockey_score
+
     df["s_recent3"] = 1 - rank_score(df["recent3_avg"], True) if "recent3_avg" in df.columns else 0
     df["s_recent5"] = 1 - rank_score(df["recent5_avg"], True) if "recent5_avg" in df.columns else 0
     df["s_best"] = 1 - rank_score(df["recent3_best"], True) if "recent3_best" in df.columns else 0
@@ -1187,6 +1343,9 @@ def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10) -> 
         + pd.to_numeric(df["s_median"], errors="coerce").fillna(0) * 0.06
         + pd.to_numeric(df["s_std"], errors="coerce").fillna(0) * 0.03
         + pd.to_numeric(df["s_last3f"], errors="coerce").fillna(0) * 0.10
+        + (pd.to_numeric(df["growth"], errors="coerce").fillna(0) if "growth" in df.columns else 0) * 0.12
+        + (pd.to_numeric(df["nakayama_score"], errors="coerce").fillna(0) if "nakayama_score" in df.columns else 0) * 0.10
+        + (pd.to_numeric(df["jockey_score"], errors="coerce").fillna(0) if "jockey_score" in df.columns else 0) * 0.05
     )
 
     if "last3f_avg" in df.columns and pd.to_numeric(df["last3f_avg"], errors="coerce").notna().sum() >= 5:
@@ -1616,36 +1775,72 @@ def calc_recovery_rate(
 
 def validate_predictions(pred_df: pd.DataFrame, result_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     work = pred_df.copy()
-    work["馬名_norm"] = work["horse_name"].map(normalize_horse_name)
     result2 = result_df.copy()
 
-    if "horse_no" in work.columns:
+    # 正規化
+    work["horse_name_norm"] = work["horse_name"].map(normalize_horse_name) if "horse_name" in work.columns else ""
+    result2["horse_name_norm"] = result2["馬名"].map(normalize_horse_name) if "馬名" in result2.columns else ""
+
+    # result側の重複除去
+    if "馬番" in result2.columns and pd.to_numeric(result2["馬番"], errors="coerce").notna().sum() > 0:
+        result2["馬番"] = pd.to_numeric(result2["馬番"], errors="coerce")
+        result2 = result2.sort_values(["着順", "馬番"], na_position="last").drop_duplicates(subset=["馬番"], keep="first")
+    result2 = result2.sort_values(["着順", "horse_name_norm"], na_position="last").drop_duplicates(subset=["horse_name_norm"], keep="first")
+
+    # pred側の重複除去
+    if "horse_no" in work.columns and pd.to_numeric(work["horse_no"], errors="coerce").notna().sum() > 0:
+        work["horse_no"] = pd.to_numeric(work["horse_no"], errors="coerce")
+        work = work.sort_values(["horse_no", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_no"], keep="first")
+    work = work.sort_values(["horse_name_norm", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_name_norm"], keep="first")
+
+    # まず馬番で結合
+    merged = pd.DataFrame()
+    if "horse_no" in work.columns and "馬番" in result2.columns and pd.to_numeric(work["horse_no"], errors="coerce").notna().sum() > 0:
         merged = work.merge(
-            result2[["着順", "馬番", "馬名", "馬名_norm"]],
+            result2[["着順", "馬番", "馬名", "horse_name_norm"]],
             left_on="horse_no",
             right_on="馬番",
             how="left",
             suffixes=("", "_result"),
         )
-    else:
-        merged = work.merge(
-            result2[["着順", "馬番", "馬名", "馬名_norm"]],
-            on="馬名_norm",
-            how="left",
-            suffixes=("", "_result"),
-        )
 
+    # 馬番で取れない行だけ名前で補完
+    if merged.empty:
+        merged = work.copy()
+        merged["着順"] = pd.NA
+        merged["馬番"] = pd.NA
+        merged["馬名"] = pd.NA
+
+    missing_mask = merged["着順"].isna() if "着順" in merged.columns else pd.Series([True] * len(merged))
+    if missing_mask.any():
+        fill_src = result2[["着順", "馬番", "馬名", "horse_name_norm"]].copy()
+        fill_map = fill_src.set_index("horse_name_norm")[["着順", "馬番", "馬名"]]
+        for idx in merged.index[missing_mask]:
+            key = merged.at[idx, "horse_name_norm"]
+            if key in fill_map.index:
+                vals = fill_map.loc[key]
+                if isinstance(vals, pd.DataFrame):
+                    vals = vals.iloc[0]
+                merged.at[idx, "着順"] = vals["着順"]
+                merged.at[idx, "馬番"] = vals["馬番"]
+                merged.at[idx, "馬名"] = vals["馬名"]
+
+    # 最終重複除去
+    if "horse_no" in merged.columns and pd.to_numeric(merged["horse_no"], errors="coerce").notna().sum() > 0:
+        merged = merged.sort_values(["予想順位" if "予想順位" in merged.columns else "ai_score"], na_position="last").drop_duplicates(subset=["horse_no"], keep="first")
+    merged = merged.sort_values(["horse_name_norm", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_name_norm"], keep="first")
+
+    merged = merged.reset_index(drop=True)
     merged["予想順位"] = np.arange(1, len(merged) + 1)
     merged["3着内"] = pd.to_numeric(merged["着順"], errors="coerce").le(3)
     merged["1着的中"] = pd.to_numeric(merged["着順"], errors="coerce").eq(1)
 
-    top1_name = merged.iloc[0]["horse_name"] if len(merged) else ""
     top5 = merged.head(5)
     top3 = merged.head(3)
 
     summary = {
         "勝ち馬を上位5頭に含む": bool(top5["1着的中"].fillna(False).any()) if len(top5) else False,
-        "◎の着順": int(merged.iloc[0]["着順"]) if len(merged) and pd.notna(merged.iloc[0]["着順"]) else None,
+        "◎の着順": int(pd.to_numeric(merged.iloc[0]["着順"], errors="coerce")) if len(merged) and pd.notna(pd.to_numeric(merged.iloc[0]["着順"], errors="coerce")) else None,
         "上位3頭中の3着内頭数": int(top3["3着内"].fillna(False).sum()) if len(top3) else 0,
         "上位5頭中の3着内頭数": int(top5["3着内"].fillna(False).sum()) if len(top5) else 0,
     }
@@ -1688,9 +1883,49 @@ def ticket_hit_summary(result_df: pd.DataFrame, ticket_tables: Dict[str, pd.Data
     return pd.DataFrame(rows)
 
 
+
+# ================= 手動補正設定 =================
+manual_styles = {}
+
+with st.expander("詳細設定（脚質・天候・馬場）", expanded=False):
+    weather_override = st.selectbox(
+        "天候",
+        ["自動", "晴", "曇", "雨", "小雨", "雪"],
+        key="weather_override",
+    )
+    ground_override = st.selectbox(
+        "馬場",
+        ["自動", "良", "稍重", "重", "不良"],
+        key="ground_override",
+    )
+
+    st.caption("脚質は必要な時だけ手動で上書きできます。普段は自動のままでOKです。")
+    if "race_df_store" in st.session_state and st.session_state["race_df_store"] is not None:
+        race_ui = st.session_state["race_df_store"].copy()
+        if "key" not in race_ui.columns and "horse_name" in race_ui.columns:
+            race_ui["key"] = race_ui["horse_name"].astype(str).str.replace(r"\s+", "", regex=True)
+
+        for i, row in race_ui.iterrows():
+            horse = row["horse_name"]
+            style = st.selectbox(
+                f"{horse}",
+                ["自動", "逃げ", "先行", "中団", "差し"],
+                key=f"style_{i}"
+            )
+            manual_styles[row["key"] if "key" in row else horse] = style
+
+
 def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
     df, top, honmei, ana, odds_valid = analyze_race(race, hist, recent_n=recent_n)
     df = dedupe_race_df(df)
+
+    weather_override = st.session_state.get("weather_override", "自動")
+    ground_override = st.session_state.get("ground_override", "自動")
+    if weather_override != "自動":
+        df["weather"] = weather_override
+    if ground_override != "自動":
+        df["ground"] = ground_override
+
     df = apply_style_ground_pace_adjustments(df)
 
     display_cols = ["mark", "horse_no", "frame_no", "horse_name", "running_style", "ai_score", "win_prob", "place_prob", "ana_score"]
@@ -1698,6 +1933,25 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
         display_cols += ["odds_f", "ev_tansho"]
     if "pop_f" in df.columns:
         display_cols += ["pop_f"]
+
+    used_weather = clean_text(df["weather"].dropna().iloc[0]) if "weather" in df.columns and df["weather"].notna().any() else "不明"
+    used_ground = clean_text(df["ground"].dropna().iloc[0]) if "ground" in df.columns and df["ground"].notna().any() else "不明"
+    try:
+        jockey_master_count = len(fetch_jra_jockey_scores())
+    except Exception:
+        jockey_master_count = 0
+    jockey_source = f"JRA騎手データ {jockey_master_count}件" if jockey_master_count > 0 else "JRA騎手データ取得失敗 → 簡易騎手補正"
+    st.caption(f"予想に使用した条件: 天候={used_weather} / 馬場={used_ground} / 騎手={jockey_source}")
+
+    st.subheader("騎手スコア確認")
+    if "jockey_score" in df.columns:
+        show_cols = [c for c in ["horse_name", "jockey", "jockey_score", "ai_score"] if c in df.columns]
+        st.dataframe(
+            df[show_cols].sort_values("ai_score", ascending=False) if "ai_score" in df.columns else df[show_cols],
+            use_container_width=True
+        )
+    else:
+        st.warning("騎手スコアが存在しません（取得失敗 or 未反映）")
 
     st.subheader("総合ランキング")
     editor_df = df[display_cols].copy()

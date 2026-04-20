@@ -29,7 +29,7 @@ except Exception:
 APP_TITLE = "競馬AI予想 完全版"
 DEFAULT_RACE_URL = "https://race.netkeiba.com/race/shutuba.html?race_id=202601010811"
 REQUEST_TIMEOUT = 20
-REQUEST_SLEEP = 0.2
+REQUEST_SLEEP = 0.8
 TOP_FOR_TICKETS_DEFAULT = 10
 
 
@@ -133,9 +133,11 @@ def norm_text(value: Any) -> str:
 
 def normalize_jockey_name(value: Any) -> str:
     text = norm_text(value)
-    text = text.replace("・", "").replace(".", "").replace("Ｊ．", "").replace("Ｍ．", "")
-    text = text.replace("C.", "").replace("M.", "").replace("D.", "").replace("L.", "")
-    return text
+    text = text.replace("・", "").replace(".", "").replace("．", "")
+    text = text.replace("Ｊ", "").replace("Ｍ", "").replace("Ｃ", "").replace("Ｄ", "").replace("Ｌ", "")
+    text = text.replace("J", "").replace("M", "").replace("C", "").replace("D", "").replace("L", "")
+    text = text.replace(" ", "").replace("　", "")
+    return text.strip()
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
@@ -296,10 +298,20 @@ def extract_num(x: Any) -> float:
     return float(m.group()) if m else np.nan
 
 
-def parse_passing_positions(x: Any) -> List[int]:
+def normalize_passing_text(x: Any) -> str:
     if pd.isna(x):
+        return ""
+    nums = re.findall(r"\d+", str(x))
+    if len(nums) >= 2:
+        return "-".join(nums)
+    return ""
+
+
+def parse_passing_positions(x: Any) -> List[int]:
+    s = normalize_passing_text(x)
+    if not s:
         return []
-    return [int(n) for n in re.findall(r"\d+", str(x))]
+    return [int(n) for n in s.split("-")]
 
 
 def last_corner(x: Any) -> float:
@@ -310,20 +322,24 @@ def last_corner(x: Any) -> float:
 def infer_running_style_from_history(passings: Iterable[Any], field_size: Any) -> str:
     if pd.isna(field_size) or field_size is None or field_size <= 0:
         return "不明"
-    last_positions: List[float] = []
-    for p in passings:
+
+    ratios: List[float] = []
+    for p in list(passings)[:3]:
         pos = last_corner(p)
         if not pd.isna(pos):
-            last_positions.append(float(pos))
-    if not last_positions:
+            ratios.append(float(pos) / float(field_size))
+
+    if not ratios:
         return "不明"
-    avg_last = float(np.mean(last_positions))
-    rate = avg_last / float(field_size)
-    if rate <= 0.33:
+
+    avg_ratio = float(np.mean(ratios))
+    if avg_ratio <= 0.15:
+        return "逃げ"
+    if avg_ratio <= 0.35:
         return "先行"
-    if rate <= 0.66:
-        return "中団"
-    return "差し"
+    if avg_ratio <= 0.65:
+        return "差"
+    return "追込"
 
 
 def rank_score(s: pd.Series, ascending: bool = True) -> pd.Series:
@@ -368,63 +384,41 @@ def estimate_race_pace(df: pd.DataFrame) -> str:
     if "running_style" not in df.columns or len(df) == 0:
         return "平均"
     styles = df["running_style"].fillna("不明").astype(str)
-    front_ratio = (styles == "先行").mean()
-    closer_ratio = (styles == "差し").mean()
-    if front_ratio >= 0.38:
+    front_ratio = ((styles == "逃げ") | (styles == "先行")).mean()
+    closer_ratio = ((styles == "差") | (styles == "追込")).mean()
+    if front_ratio >= 0.45:
         return "ハイ"
-    if front_ratio <= 0.18 and closer_ratio >= 0.45:
+    if front_ratio <= 0.25 and closer_ratio >= 0.40:
         return "スロー"
     return "平均"
 
 
-def style_ground_pace_bonus(style: str, track_type: str, ground: str, pace: str) -> float:
+def style_ground_pace_bonus(style, track_type, ground, pace):
     bonus = 0.0
-    style = clean_text(style)
-    track_type = normalize_track_type(track_type)
-    ground = normalize_ground(ground)
 
-    # ペース補正
     if pace == "ハイ":
-        if style == "差し":
-            bonus += 0.035
-        elif style == "中団":
-            bonus += 0.015
-        elif style == "先行":
-            bonus -= 0.015
+        if style == "差":
+            bonus += 0.05
+        elif style == "追込":
+            bonus += 0.04
+        elif style == "逃げ":
+            bonus -= 0.04
+
     elif pace == "スロー":
-        if style == "先行":
-            bonus += 0.035
-        elif style == "中団":
-            bonus += 0.010
-        elif style == "差し":
-            bonus -= 0.015
+        if style == "逃げ":
+            bonus += 0.08
+        elif style == "先行":
+            bonus += 0.06
+        elif style == "差":
+            bonus -= 0.04
+        elif style == "追込":
+            bonus -= 0.06
+
     else:
         if style == "先行":
-            bonus += 0.010
-        elif style == "差し":
-            bonus += 0.008
-
-    # 馬場 × 脚質
-    if track_type == "芝":
-        if ground == "良":
-            if style == "差し":
-                bonus += 0.010
-            elif style == "先行":
-                bonus += 0.005
-        elif ground in ["稍重", "重", "不良"]:
-            if style == "先行":
-                bonus += 0.020
-            elif style == "差し":
-                bonus -= 0.005
-    elif track_type == "ダート":
-        if ground == "良":
-            if style == "先行":
-                bonus += 0.015
-        elif ground in ["稍重", "重", "不良"]:
-            if style == "先行":
-                bonus += 0.025
-            elif style == "差し":
-                bonus -= 0.010
+            bonus += 0.03
+        elif style == "差":
+            bonus += 0.01
 
     return bonus
 
@@ -440,7 +434,7 @@ def apply_style_ground_pace_adjustments(df: pd.DataFrame) -> pd.DataFrame:
 
     out["pace"] = pace
     out["style_bonus"] = out["running_style"].map(lambda s: style_ground_pace_bonus(s, track_type, ground, pace))
-    out["ai_score"] = pd.to_numeric(out["ai_score"], errors="coerce").fillna(0) + pd.to_numeric(out["style_bonus"], errors="coerce").fillna(0)
+    out["ai_score"] = pd.to_numeric(out["ai_score"], errors="coerce").fillna(0) + pd.to_numeric(out["style_bonus"], errors="coerce").fillna(0) * 1.5
 
     expv = np.exp(out["ai_score"] - out["ai_score"].max())
     out["win_prob"] = expv / expv.sum()
@@ -485,6 +479,14 @@ def fmt_no(v: Any) -> Any:
         return int(v)
     except Exception:
         return v
+
+def normalize_combination_text(comb: Any, sep: str = "-") -> str:
+    nums = [int(x) for x in re.findall(r"\d+", str(comb))]
+    if not nums:
+        return clean_text(comb)
+    nums = sorted(nums)
+    return sep.join(str(n) for n in nums)
+
 
 
 def detect_track_type(course_text: str) -> str:
@@ -949,7 +951,10 @@ def normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
         "後3F": "last3f",
         "3F": "last3f",
         "単勝": "odds",
+        "単勝オッズ": "odds",
+        "オッズ": "odds",
         "人気": "popularity",
+        "人気順": "popularity",
         "馬体重": "body_weight",
         "馬体重(増減)": "body_weight",
         "賞金": "prize",
@@ -969,58 +974,63 @@ def normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
         if "distance_raw" not in df.columns:
             df["distance_raw"] = None
 
-    if "odds" not in df.columns or pd.Series(df["odds"]).isna().all():
+    if "passing" not in df.columns or df["passing"].astype(str).str.contains(r"\d+-\d+", regex=True, na=False).sum() == 0:
         for c in df.columns:
             s = df[c].astype(str)
-            cnt = s.str.fullmatch(r"\d+(?:\.\d+)?", na=False).sum()
-            if cnt >= max(1, len(df) // 2) and s.str.contains(r"\.", regex=True, na=False).sum() >= max(1, len(df) // 3):
-                df["odds"] = pd.to_numeric(df[c], errors="coerce")
+            if s.str.contains(r"\d+-\d+", regex=True, na=False).sum() >= max(1, len(df) // 3):
+                df["passing"] = s.map(normalize_passing_text)
                 break
+    else:
+        df["passing"] = df["passing"].map(normalize_passing_text)
 
-    if "popularity" not in df.columns or pd.Series(df["popularity"]).isna().all():
-        for c in df.columns:
-            nums = pd.to_numeric(df[c], errors="coerce")
-            if nums.notna().sum() >= max(1, len(df) // 2):
-                valid = nums.dropna()
-                if len(valid) and valid.between(1, 18).mean() > 0.8:
-                    df["popularity"] = nums
-                    break
-
-    if "last3f" not in df.columns or pd.Series(df["last3f"]).isna().all():
+    if "odds" not in df.columns or pd.to_numeric(df["odds"], errors="coerce").notna().sum() == 0:
         for c in df.columns:
             cname = clean_text(c)
-            if any(k in cname for k in ["上り", "上がり", "上り3F", "上がり3F", "後3F", "3F"]):
-                nums = pd.to_numeric(df[c], errors="coerce")
-                if nums.notna().sum() >= max(1, len(df) // 3):
-                    valid = nums.dropna()
-                    if len(valid) and valid.between(30, 50).mean() > 0.6:
-                        df["last3f"] = nums
-                        break
+            s = df[c].astype(str)
+            nums = pd.to_numeric(s.str.replace(",", "", regex=False), errors="coerce")
+            if any(k in cname for k in ["単勝", "オッズ"]) or (
+                nums.notna().sum() >= max(1, len(df) // 2)
+                and nums.dropna().between(1.0, 500.0).mean() > 0.8
+                and s.str.contains(r"\.", regex=True, na=False).sum() >= max(1, len(df) // 3)
+            ):
+                df["odds"] = nums
+                break
 
-    if "last3f" not in df.columns:
-        df["last3f"] = np.nan
+    if "popularity" not in df.columns or pd.to_numeric(df["popularity"], errors="coerce").notna().sum() == 0:
+        for c in df.columns:
+            cname = clean_text(c)
+            nums = pd.to_numeric(df[c], errors="coerce")
+            if "人気" in cname or (
+                nums.notna().sum() >= max(1, len(df) // 2)
+                and nums.dropna().between(1, 18).mean() > 0.8
+            ):
+                df["popularity"] = nums
+                break
+
+    if "last3f" not in df.columns or pd.to_numeric(df["last3f"], errors="coerce").notna().sum() == 0:
+        for c in df.columns:
+            cname = clean_text(c)
+            nums = pd.to_numeric(df[c], errors="coerce")
+            if any(k in cname for k in ["上り", "上がり", "3F", "後3F"]) or (
+                nums.notna().sum() >= max(1, len(df) // 3)
+                and nums.dropna().between(30, 50).mean() > 0.6
+            ):
+                df["last3f"] = nums
+                break
+
     if "odds" not in df.columns:
         df["odds"] = np.nan
     if "popularity" not in df.columns:
         df["popularity"] = np.nan
+    if "last3f" not in df.columns:
+        df["last3f"] = np.nan
+    if "passing" not in df.columns:
+        df["passing"] = ""
 
     for col in [
-        "race_date",
-        "venue",
-        "race_name",
-        "class_name",
-        "weather",
-        "ground",
-        "horse_no",
-        "frame_no",
-        "finish",
-        "jockey",
-        "carried_weight",
-        "time_str",
-        "margin",
-        "passing",
-        "body_weight",
-        "prize",
+        "race_date", "venue", "race_name", "class_name", "weather", "ground",
+        "horse_no", "frame_no", "finish", "jockey", "carried_weight", "time_str",
+        "margin", "body_weight", "prize",
     ]:
         if col not in df.columns:
             df[col] = "" if col not in ["horse_no", "frame_no", "finish"] else np.nan
@@ -1029,41 +1039,48 @@ def normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["track_type"] = df["distance_raw"].astype(str).apply(detect_track_type)
 
     keep = [
-        "race_date",
-        "venue",
-        "race_name",
-        "class_name",
-        "track_type",
-        "distance",
-        "weather",
-        "ground",
-        "horse_no",
-        "frame_no",
-        "finish",
-        "jockey",
-        "carried_weight",
-        "time_str",
-        "margin",
-        "passing",
-        "last3f",
-        "odds",
-        "popularity",
-        "body_weight",
-        "prize",
+        "race_date", "venue", "race_name", "class_name", "track_type", "distance",
+        "weather", "ground", "horse_no", "frame_no", "finish", "jockey",
+        "carried_weight", "time_str", "margin", "passing", "last3f", "odds",
+        "popularity", "body_weight", "prize",
     ]
     return df[keep].copy()
+
+
+def score_history_table(ndf: pd.DataFrame) -> int:
+    finish_cnt = ndf["finish"].apply(to_int).notna().sum() if "finish" in ndf.columns else 0
+    dist_cnt = ndf["distance"].apply(to_int).notna().sum() if "distance" in ndf.columns else 0
+    last3f_cnt = ndf["last3f"].apply(to_float).notna().sum() if "last3f" in ndf.columns else 0
+    odds_cnt = ndf["odds"].apply(to_float).notna().sum() if "odds" in ndf.columns else 0
+    pop_cnt = ndf["popularity"].apply(to_int).notna().sum() if "popularity" in ndf.columns else 0
+    passing_cnt = ndf["passing"].astype(str).str.contains(r"\d+-\d+", regex=True, na=False).sum() if "passing" in ndf.columns else 0
+
+    bonus = 0
+    if passing_cnt >= max(2, len(ndf) // 3):
+        bonus += 120
+    if last3f_cnt >= max(2, len(ndf) // 3):
+        bonus += 60
+    if odds_cnt >= max(2, len(ndf) // 3):
+        bonus += 40
+    if pop_cnt >= max(2, len(ndf) // 3):
+        bonus += 40
+
+    return int(bonus + finish_cnt * 10 + dist_cnt * 5 + last3f_cnt * 7 + odds_cnt * 5 + pop_cnt * 5 + passing_cnt * 12)
 
 
 def parse_horse_history(scraper: Scraper, horse_name: str, horse_url: str, max_rows: int = 10) -> List[HorseHistoryRow]:
     if not horse_url:
         return []
     db_url = convert_to_db_horse_url(horse_url)
-    html = scraper.get_html(db_url)
+    try:
+        html = scraper._requests_html(db_url)
+    except Exception:
+        return []
 
     use_selenium = False
     if "<table" not in html.lower():
         use_selenium = True
-    elif ("上り" not in html and "上がり" not in html and "上り3F" not in html and "上がり3F" not in html):
+    elif ("通過" not in html and ("上り" not in html and "上がり" not in html and "上り3F" not in html and "上がり3F" not in html)):
         use_selenium = True
     if use_selenium and SELENIUM_AVAILABLE:
         html = scraper._selenium_html(db_url)
@@ -1078,13 +1095,7 @@ def parse_horse_history(scraper: Scraper, horse_name: str, horse_url: str, max_r
     for raw in tables:
         try:
             ndf = normalize_history_columns(raw).head(max_rows)
-            finish_cnt = ndf["finish"].apply(to_int).notna().sum() if "finish" in ndf.columns else 0
-            dist_cnt = ndf["distance"].apply(to_int).notna().sum() if "distance" in ndf.columns else 0
-            last3f_cnt = ndf["last3f"].apply(to_float).notna().sum() if "last3f" in ndf.columns else 0
-            odds_cnt = ndf["odds"].apply(to_float).notna().sum() if "odds" in ndf.columns else 0
-            pop_cnt = ndf["popularity"].apply(to_int).notna().sum() if "popularity" in ndf.columns else 0
-            passing_cnt = ndf["passing"].astype(str).str.contains(r"\d", regex=True, na=False).sum() if "passing" in ndf.columns else 0
-            score = finish_cnt * 10 + dist_cnt * 5 + last3f_cnt * 5 + odds_cnt * 3 + pop_cnt * 3 + passing_cnt * 4
+            score = score_history_table(ndf)
             if score > best_score:
                 best = ndf
                 best_score = score
@@ -1115,7 +1126,7 @@ def parse_horse_history(scraper: Scraper, horse_name: str, horse_url: str, max_r
                 carried_weight=clean_text(r.get("carried_weight")),
                 time_str=clean_text(r.get("time_str")),
                 margin=clean_text(r.get("margin")),
-                passing=clean_text(r.get("passing")),
+                passing=normalize_passing_text(r.get("passing")),
                 last3f=to_float(r.get("last3f")),
                 odds=to_float(r.get("odds")),
                 popularity=to_int(r.get("popularity")),
@@ -1135,7 +1146,10 @@ def fetch_race_and_history(race_url: str, max_horses: int, history_rows: int) ->
     total = min(len(race_rows), max_horses)
     prog = st.progress(0, text="過去成績を取得中...")
     for i, row in enumerate(race_rows[:total], start=1):
-        histories = parse_horse_history(scraper, row.horse_name, row.horse_url, history_rows)
+        try:
+            histories = parse_horse_history(scraper, row.horse_name, row.horse_url, history_rows)
+        except Exception:
+            histories = []
         history_rows_out.extend(histories)
         prog.progress(i / total if total else 1, text=f"過去成績を取得中... {i}/{total} {row.horse_name}")
     prog.empty()
@@ -1216,6 +1230,7 @@ def build_features(hist: pd.DataFrame, recent_n: int = 10) -> pd.DataFrame:
                 "median_finish": f_all.median() if len(f_all) else np.nan,
                 "last3f_avg": l3f3.mean() if len(l3f3) else np.nan,
                 "corner_avg": c3.mean() if len(c3) else np.nan,
+                "last_passing": normalize_passing_text(r3["passing"].iloc[0]) if "passing" in r3.columns and len(r3) else "",
                 "auto_running_style": infer_running_style_from_history(r3["passing"].tolist() if "passing" in r3.columns else [], 18),
                 "hist_odds_avg": o3.mean() if len(o3) else np.nan,
                 "hist_pop_avg": p3.mean() if len(p3) else np.nan,
@@ -1237,6 +1252,7 @@ def build_features(hist: pd.DataFrame, recent_n: int = 10) -> pd.DataFrame:
         "median_finish",
         "last3f_avg",
         "corner_avg",
+        "last_passing",
         "auto_running_style",
         "hist_odds_avg",
         "hist_pop_avg",
@@ -1246,7 +1262,7 @@ def build_features(hist: pd.DataFrame, recent_n: int = 10) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
-def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, bool]:
+def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10, use_jockey_score: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, bool]:
     if hist is None or len(hist) == 0:
         hist = pd.DataFrame({"horse_name": [], "finish": []})
     if "horse_name" not in hist.columns:
@@ -1279,13 +1295,30 @@ def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10) -> 
         feat = pd.DataFrame({"key": race["key"]}).drop_duplicates()
 
     df = race.merge(feat, on="key", how="left")
+    # 表示用に天候・馬場を保持
+    if "weather" not in df.columns:
+        df["weather"] = ""
+    if "ground" not in df.columns:
+        df["ground"] = ""
     df["odds_f"] = df["odds_num"].fillna(df["hist_odds_avg"] if "hist_odds_avg" in df.columns else np.nan)
     df["pop_f"] = df["pop_num"].fillna(df["hist_pop_avg"] if "hist_pop_avg" in df.columns else np.nan)
     field_size = max(len(df), 1)
     if "auto_running_style" in df.columns:
         df["running_style"] = df["auto_running_style"].fillna("不明")
     elif "corner_avg" in df.columns:
-        df["running_style"] = df["corner_avg"].apply(lambda x: infer_running_style(x, field_size))
+        def _corner_to_style(x: Any) -> str:
+            x = pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
+            if pd.isna(x):
+                return "不明"
+            ratio = float(x) / float(field_size)
+            if ratio <= 0.18:
+                return "逃げ"
+            if ratio <= 0.42:
+                return "先行"
+            if ratio <= 0.68:
+                return "中団"
+            return "差し"
+        df["running_style"] = df["corner_avg"].apply(_corner_to_style)
     else:
         df["running_style"] = "不明"
 
@@ -1301,23 +1334,44 @@ def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10) -> 
 
 
     top_jockeys = ["ルメール", "川田", "横山武", "戸崎", "武豊"]
-    fallback_jockey_score = df["jockey"].apply(lambda x: 1.0 if any(j in str(x) for j in top_jockeys) else 0.35)
+    fallback_jockey_score = df["jockey"].apply(
+        lambda x: 1.0 if any(j in str(x) for j in top_jockeys) else 0.35
+    )
+    df["jockey_score_source"] = "OFF"
 
-    try:
-        jockey_master = fetch_jra_jockey_scores()
-    except Exception:
-        jockey_master = pd.DataFrame(columns=["jockey_key", "jra_jockey_score"])
+    if use_jockey_score:
+        try:
+            jockey_master = fetch_jra_jockey_scores()
+        except Exception:
+            jockey_master = pd.DataFrame(columns=["jockey_key", "jra_jockey_score"])
 
-    if len(jockey_master):
         df["jockey_key"] = df["jockey"].map(normalize_jockey_name)
-        df = df.merge(
-            jockey_master[["jockey_key", "jra_jockey_score"]],
-            on="jockey_key",
-            how="left"
-        )
-        df["jockey_score"] = pd.to_numeric(df["jra_jockey_score"], errors="coerce").fillna(fallback_jockey_score)
+
+        if len(jockey_master):
+            df = df.merge(
+                jockey_master[["jockey_key", "jra_jockey_score"]],
+                on="jockey_key",
+                how="left"
+            )
+            raw_score = pd.to_numeric(df.get("jra_jockey_score"), errors="coerce")
+            matched = raw_score.notna()
+
+            df["jockey_score"] = raw_score.fillna(fallback_jockey_score)
+            df.loc[matched, "jockey_score_source"] = "JRA"
+            df.loc[~matched, "jockey_score_source"] = "fallback"
+        else:
+            df["jockey_score"] = fallback_jockey_score
+            df["jockey_score_source"] = "fallback"
     else:
-        df["jockey_score"] = fallback_jockey_score
+        df["jockey_score"] = 0.0
+        df["jockey_score_source"] = "OFF"
+
+    # 念のため: ONなのに全件0なら fallback を強制適用
+    if use_jockey_score:
+        js = pd.to_numeric(df.get("jockey_score"), errors="coerce")
+        if js.notna().sum() == 0 or float(js.fillna(0).max()) <= 0:
+            df["jockey_score"] = fallback_jockey_score
+            df["jockey_score_source"] = "fallback_forced"
 
     df["s_recent3"] = 1 - rank_score(df["recent3_avg"], True) if "recent3_avg" in df.columns else 0
     df["s_recent5"] = 1 - rank_score(df["recent5_avg"], True) if "recent5_avg" in df.columns else 0
@@ -1420,7 +1474,11 @@ def build_pair_table(top_df: pd.DataFrame, score_col: str, label: str) -> pd.Dat
                 "score": float(a[score_col]) * float(b[score_col]),
             }
         )
-    return pd.DataFrame(rows).sort_values("score", ascending=False) if rows else pd.DataFrame(columns=["券種", "組み合わせ", "馬1", "馬2", "score"])
+    if not rows:
+        return pd.DataFrame(columns=["券種", "組み合わせ", "馬1", "馬2", "score"])
+    out = pd.DataFrame(rows)
+    out["組み合わせ"] = out["組み合わせ"].apply(lambda x: normalize_combination_text(x, "-"))
+    return out.sort_values("score", ascending=False)
 
 
 def build_trio_table(top_df: pd.DataFrame, score_col: str, label: str) -> pd.DataFrame:
@@ -1437,7 +1495,11 @@ def build_trio_table(top_df: pd.DataFrame, score_col: str, label: str) -> pd.Dat
                 "score": float(a[score_col]) * float(b[score_col]) * float(c[score_col]),
             }
         )
-    return pd.DataFrame(rows).sort_values("score", ascending=False) if rows else pd.DataFrame(columns=["券種", "組み合わせ", "馬1", "馬2", "馬3", "score"])
+    if not rows:
+        return pd.DataFrame(columns=["券種", "組み合わせ", "馬1", "馬2", "馬3", "score"])
+    out = pd.DataFrame(rows)
+    out["組み合わせ"] = out["組み合わせ"].apply(lambda x: normalize_combination_text(x, "-"))
+    return out.sort_values("score", ascending=False)
 
 
 def build_trifecta_table(top_df: pd.DataFrame) -> pd.DataFrame:
@@ -1516,12 +1578,24 @@ def build_honmei_ana_tables(honmei: pd.DataFrame, ana: pd.DataFrame) -> Tuple[pd
                         }
                     )
 
-    return (
-        pd.DataFrame(umaren_rows).sort_values("score", ascending=False) if umaren_rows else pd.DataFrame(columns=["組み合わせ", "本命", "穴", "score"]),
-        pd.DataFrame(wide_rows).sort_values("score", ascending=False) if wide_rows else pd.DataFrame(columns=["組み合わせ", "本命", "穴", "score"]),
-        pd.DataFrame(trio_rows).sort_values("score", ascending=False) if trio_rows else pd.DataFrame(columns=["組み合わせ", "本命1", "本命2", "穴", "score"]),
-        pd.DataFrame(trifecta_rows).sort_values("score", ascending=False) if trifecta_rows else pd.DataFrame(columns=["組み合わせ", "1着", "2着", "3着", "score"]),
-    )
+    umaren_df = pd.DataFrame(umaren_rows) if umaren_rows else pd.DataFrame(columns=["組み合わせ", "本命", "穴", "score"])
+    wide_df = pd.DataFrame(wide_rows) if wide_rows else pd.DataFrame(columns=["組み合わせ", "本命", "穴", "score"])
+    trio_df = pd.DataFrame(trio_rows) if trio_rows else pd.DataFrame(columns=["組み合わせ", "本命1", "本命2", "穴", "score"])
+    trifecta_df = pd.DataFrame(trifecta_rows) if trifecta_rows else pd.DataFrame(columns=["組み合わせ", "1着", "2着", "3着", "score"])
+
+    if len(umaren_df):
+        umaren_df["組み合わせ"] = umaren_df["組み合わせ"].apply(lambda x: normalize_combination_text(x, "-"))
+        umaren_df = umaren_df.sort_values("score", ascending=False)
+    if len(wide_df):
+        wide_df["組み合わせ"] = wide_df["組み合わせ"].apply(lambda x: normalize_combination_text(x, "-"))
+        wide_df = wide_df.sort_values("score", ascending=False)
+    if len(trio_df):
+        trio_df["組み合わせ"] = trio_df["組み合わせ"].apply(lambda x: normalize_combination_text(x, "-"))
+        trio_df = trio_df.sort_values("score", ascending=False)
+    if len(trifecta_df):
+        trifecta_df = trifecta_df.sort_values("score", ascending=False)
+
+    return (umaren_df, wide_df, trio_df, trifecta_df)
 
 
 # ============================================================
@@ -1609,53 +1683,96 @@ def infer_result_url_from_race_url(race_url: str) -> str:
 
 def parse_result_table_from_html(html: str) -> pd.DataFrame:
     soup = BeautifulSoup(html, "lxml")
+
+    # まずHTMLテーブルのヘッダから「着順 / 馬番 / 馬名」を厳密に取る
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except Exception:
+        tables = []
+
+    for raw in tables:
+        try:
+            df = flatten_columns(raw).copy()
+            cols = [clean_text(c) for c in df.columns]
+
+            finish_col = None
+            horse_no_col = None
+            horse_name_col = None
+
+            for c in df.columns:
+                cc = clean_text(c)
+                if cc in ["着順", "着 順"]:
+                    finish_col = c
+                elif cc in ["馬番", "馬 番"]:
+                    horse_no_col = c
+                elif "馬名" in cc:
+                    horse_name_col = c
+
+            if finish_col is None or horse_no_col is None or horse_name_col is None:
+                continue
+
+            out = pd.DataFrame({
+                "着順": pd.to_numeric(df[finish_col], errors="coerce"),
+                "馬番": pd.to_numeric(df[horse_no_col], errors="coerce"),
+                "馬名": df[horse_name_col].astype(str).map(clean_text),
+            })
+            out = out.dropna(subset=["着順", "馬番"]).copy()
+            if len(out) == 0:
+                continue
+
+            out["着順"] = out["着順"].astype(int)
+            out["馬番"] = out["馬番"].astype(int)
+            out["馬名_norm"] = out["馬名"].map(normalize_horse_name)
+            out = out.sort_values(["着順", "馬番"], ascending=[True, True]).drop_duplicates(subset=["馬番"], keep="first")
+            return out[["着順", "馬番", "馬名", "馬名_norm"]]
+        except Exception:
+            continue
+
+    # fallback: result tableの列位置固定で読む
     table = None
-    for selector in ["table.RaceTable01", "table.race_table_01", "table.Shutuba_Table", "table"]:
+    for selector in ["table.RaceTable01", "table.race_table_01", "table[class*='RaceTable']", "table"]:
         cand = soup.select_one(selector)
         if cand is not None and cand.select("tr"):
             table = cand
             break
+
     if table is None:
-        return pd.DataFrame(columns=["着順", "馬番", "馬名"])
+        return pd.DataFrame(columns=["着順", "馬番", "馬名", "馬名_norm"])
 
     rows = []
     for tr in table.select("tr"):
-        cells = tr.find_all(["td", "th"])
-        if len(cells) < 5:
-            continue
-        txt = [clean_text(c.get_text(" ", strip=True)) for c in cells]
-        joined = " ".join(txt)
-        if "着順" in joined and "馬番" in joined:
+        tds = tr.find_all("td")
+        if len(tds) < 4:
             continue
 
-        horse_no = None
+        finish = to_int(clean_text(tds[0].get_text(" ", strip=True)))
+        horse_no = to_int(clean_text(tds[2].get_text(" ", strip=True)))  # 0:着順 1:枠番 2:馬番
         horse_name = ""
-        finish = None
+
+        # 馬名セル優先
+        if len(tds) >= 4:
+            horse_name = clean_text(tds[3].get_text(" ", strip=True))
 
         horse_a = tr.select_one('a[href*="/horse/"]')
         if horse_a is not None:
             horse_name = clean_text(horse_a.get_text())
 
-        numeric_cells = [to_int(x) for x in txt if to_int(x) is not None]
-        if numeric_cells:
-            finish = numeric_cells[0]
-        if len(numeric_cells) >= 2:
-            horse_no = numeric_cells[1]
+        if finish is None or horse_no is None or not horse_name:
+            continue
 
-        if not horse_name:
-            for x in txt:
-                if re.search(r"[ァ-ヶー一-龠A-Za-z]", x) and x not in ["取消", "除外", "中止", "失格"]:
-                    horse_name = x
-                    break
-
-        if finish is not None and (horse_no is not None or horse_name):
-            rows.append({"着順": finish, "馬番": horse_no, "馬名": horse_name})
+        rows.append({
+            "着順": int(finish),
+            "馬番": int(horse_no),
+            "馬名": horse_name,
+        })
 
     if not rows:
-        return pd.DataFrame(columns=["着順", "馬番", "馬名"])
+        return pd.DataFrame(columns=["着順", "馬番", "馬名", "馬名_norm"])
+
     out = pd.DataFrame(rows)
     out["馬名_norm"] = out["馬名"].map(normalize_horse_name)
-    return out
+    out = out.sort_values(["着順", "馬番"], ascending=[True, True]).drop_duplicates(subset=["馬番"], keep="first")
+    return out[["着順", "馬番", "馬名", "馬名_norm"]]
 
 
 def extract_payout_tables(result_url: str, html: Optional[str] = None) -> Dict[str, pd.DataFrame]:
@@ -1685,15 +1802,8 @@ def normalize_combo_text(value: Any) -> str:
     return "-".join(nums)
 
 
-def calc_recovery_rate(
-    payout_tables: Dict[str, pd.DataFrame],
-    ticket_tables: Dict[str, pd.DataFrame],
-    bet_per_ticket: int = 100,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    rows = []
-    total_bet = 0
-    total_return = 0
-
+def calc_recovery_rate(payout_tables: Dict[str, pd.DataFrame], ticket_tables: Dict[str, pd.DataFrame], bet_per_ticket: int = 100) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    # 赤表示で推している上位5件だけを「実際に買う前提」で回収率計算する
     payout_hits: Dict[str, Dict[str, int]] = {
         "ワイド": {},
         "馬連": {},
@@ -1705,13 +1815,17 @@ def calc_recovery_rate(
         "本命_本命穴": {},
     }
 
-    # 払戻テーブルから券種ごとの組み合わせ・払戻を拾う
-    for _, table in payout_tables.items():
-        try:
-            flat = flatten_columns(table)
-        except Exception:
-            flat = table.copy()
+    def normalize_combo_text_local(s: Any) -> str:
+        nums = [int(x) for x in re.findall(r"\d+", str(s))]
+        if not nums:
+            return clean_text(s)
+        if "→" in str(s):
+            return "→".join(str(n) for n in nums)
+        return "-".join(str(n) for n in sorted(nums))
 
+    for _, flat in payout_tables.items():
+        if flat is None or len(flat) == 0:
+            continue
         for _, row in flat.iterrows():
             vals = [clean_text(v) for v in row.tolist()]
             line = " ".join(vals)
@@ -1729,7 +1843,7 @@ def calc_recovery_rate(
             if payout_val is None:
                 continue
 
-            combo = normalize_combo_text(line)
+            combo = normalize_combo_text_local(line)
             if not combo:
                 continue
 
@@ -1746,21 +1860,33 @@ def calc_recovery_rate(
                 payout_hits["3連単"][combo] = payout_val
                 payout_hits["本命_本命穴"][combo] = payout_val
 
+    rows = []
+    total_bet = 0
+    total_return = 0
+
     for key, df in ticket_tables.items():
         if df is None or len(df) == 0:
-            rows.append({"券種": key, "購入額": 0, "払戻": 0, "回収率": 0.0})
+            rows.append({"券種": key, "購入点数": 0, "購入額": 0, "払戻": 0, "回収率": 0.0})
             continue
 
-        bet = len(df) * bet_per_ticket
+        buy_df = df.copy()
+        if "score" in buy_df.columns:
+            buy_df = buy_df.sort_values("score", ascending=False).head(min(5, len(buy_df)))
+        else:
+            buy_df = buy_df.head(min(5, len(buy_df)))
+
+        bet_count = len(buy_df)
+        bet = bet_count * bet_per_ticket
         ret = 0
-        for _, row in df.iterrows():
+
+        for _, row in buy_df.iterrows():
             comb = clean_text(row.get("組み合わせ", ""))
-            comb_norm = normalize_combo_text(comb)
+            comb_norm = normalize_combo_text_local(comb)
             if comb_norm in payout_hits.get(key, {}):
                 ret += int(payout_hits[key][comb_norm])
 
         recovery = (ret / bet * 100.0) if bet > 0 else 0.0
-        rows.append({"券種": key, "購入額": bet, "払戻": ret, "回収率": recovery})
+        rows.append({"券種": key, "購入点数": bet_count, "購入額": bet, "払戻": ret, "回収率": recovery})
         total_bet += bet
         total_return += ret
 
@@ -1772,10 +1898,17 @@ def calc_recovery_rate(
     return pd.DataFrame(rows), summary
 
 
-
 def validate_predictions(pred_df: pd.DataFrame, result_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     work = pred_df.copy()
     result2 = result_df.copy()
+
+    # 予想順を固定（これを壊すと上位3頭/5頭判定が狂う）
+    if "予想順位" in work.columns and pd.to_numeric(work["予想順位"], errors="coerce").notna().sum() > 0:
+        work["_pred_order"] = pd.to_numeric(work["予想順位"], errors="coerce")
+    else:
+        if "ai_score" in work.columns:
+            work = work.sort_values(["ai_score", "win_prob"] if "win_prob" in work.columns else ["ai_score"], ascending=False, na_position="last").reset_index(drop=True)
+        work["_pred_order"] = np.arange(1, len(work) + 1)
 
     # 正規化
     work["horse_name_norm"] = work["horse_name"].map(normalize_horse_name) if "horse_name" in work.columns else ""
@@ -1787,11 +1920,11 @@ def validate_predictions(pred_df: pd.DataFrame, result_df: pd.DataFrame) -> Tupl
         result2 = result2.sort_values(["着順", "馬番"], na_position="last").drop_duplicates(subset=["馬番"], keep="first")
     result2 = result2.sort_values(["着順", "horse_name_norm"], na_position="last").drop_duplicates(subset=["horse_name_norm"], keep="first")
 
-    # pred側の重複除去
+    # pred側の重複除去（予想順優先で残す）
     if "horse_no" in work.columns and pd.to_numeric(work["horse_no"], errors="coerce").notna().sum() > 0:
         work["horse_no"] = pd.to_numeric(work["horse_no"], errors="coerce")
-        work = work.sort_values(["horse_no", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_no"], keep="first")
-    work = work.sort_values(["horse_name_norm", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_name_norm"], keep="first")
+        work = work.sort_values(["_pred_order", "horse_no"], na_position="last").drop_duplicates(subset=["horse_no"], keep="first")
+    work = work.sort_values(["_pred_order", "horse_name_norm"], na_position="last").drop_duplicates(subset=["horse_name_norm"], keep="first")
 
     # まず馬番で結合
     merged = pd.DataFrame()
@@ -1811,7 +1944,7 @@ def validate_predictions(pred_df: pd.DataFrame, result_df: pd.DataFrame) -> Tupl
         merged["馬番"] = pd.NA
         merged["馬名"] = pd.NA
 
-    missing_mask = merged["着順"].isna() if "着順" in merged.columns else pd.Series([True] * len(merged))
+    missing_mask = merged["着順"].isna() if "着順" in merged.columns else pd.Series([True] * len(merged), index=merged.index)
     if missing_mask.any():
         fill_src = result2[["着順", "馬番", "馬名", "horse_name_norm"]].copy()
         fill_map = fill_src.set_index("horse_name_norm")[["着順", "馬番", "馬名"]]
@@ -1825,12 +1958,12 @@ def validate_predictions(pred_df: pd.DataFrame, result_df: pd.DataFrame) -> Tupl
                 merged.at[idx, "馬番"] = vals["馬番"]
                 merged.at[idx, "馬名"] = vals["馬名"]
 
-    # 最終重複除去
+    # 最終重複除去（ここでも予想順を絶対維持）
     if "horse_no" in merged.columns and pd.to_numeric(merged["horse_no"], errors="coerce").notna().sum() > 0:
-        merged = merged.sort_values(["予想順位" if "予想順位" in merged.columns else "ai_score"], na_position="last").drop_duplicates(subset=["horse_no"], keep="first")
-    merged = merged.sort_values(["horse_name_norm", "ai_score"], na_position="last", ascending=[True, False]).drop_duplicates(subset=["horse_name_norm"], keep="first")
+        merged = merged.sort_values(["_pred_order", "horse_no"], na_position="last").drop_duplicates(subset=["horse_no"], keep="first")
+    merged = merged.sort_values(["_pred_order", "horse_name_norm"], na_position="last").drop_duplicates(subset=["horse_name_norm"], keep="first")
 
-    merged = merged.reset_index(drop=True)
+    merged = merged.sort_values("_pred_order", na_position="last").reset_index(drop=True)
     merged["予想順位"] = np.arange(1, len(merged) + 1)
     merged["3着内"] = pd.to_numeric(merged["着順"], errors="coerce").le(3)
     merged["1着的中"] = pd.to_numeric(merged["着順"], errors="coerce").eq(1)
@@ -1845,7 +1978,6 @@ def validate_predictions(pred_df: pd.DataFrame, result_df: pd.DataFrame) -> Tupl
         "上位5頭中の3着内頭数": int(top5["3着内"].fillna(False).sum()) if len(top5) else 0,
     }
     return merged, summary
-
 
 def ticket_hit_summary(result_df: pd.DataFrame, ticket_tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     winners = result_df.sort_values("着順").head(3)
@@ -1879,7 +2011,7 @@ def ticket_hit_summary(result_df: pd.DataFrame, ticket_tables: Dict[str, pd.Data
                     hit = True
                     hit_row = comb
                     break
-        rows.append({"券種": key, "的中": hit, "該当": hit_row})
+        rows.append({"券種": key, "的中": "当" if hit else "", "該当": hit_row})
     return pd.DataFrame(rows)
 
 
@@ -1909,14 +2041,46 @@ with st.expander("詳細設定（脚質・天候・馬場）", expanded=False):
             horse = row["horse_name"]
             style = st.selectbox(
                 f"{horse}",
-                ["自動", "逃げ", "先行", "中団", "差し"],
+                ["自動", "逃げ", "先行", "差", "追込"],
                 key=f"style_{i}"
             )
             manual_styles[row["key"] if "key" in row else horse] = style
 
 
+
+def highlight_hit_cell(val: Any) -> str:
+    return "color: red; font-weight: bold;" if str(val) == "当" else ""
+
+
+
+def highlight_top5_recommended(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+    if df is None or len(df) == 0:
+        return df.style
+
+    work = df.copy()
+    work["推奨"] = ""
+    top_n = min(5, len(work))
+    work.iloc[:top_n, work.columns.get_loc("推奨")] = "★推奨"
+    cols = ["推奨"] + [c for c in work.columns if c != "推奨"]
+    work = work[cols]
+
+    def _row_style(row):
+        if str(row.get("推奨", "")) == "★推奨":
+            return ["color: red; font-weight: bold;" for _ in row]
+        return ["" for _ in row]
+
+    return work.style.apply(_row_style, axis=1)
+
+
 def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
-    df, top, honmei, ana, odds_valid = analyze_race(race, hist, recent_n=recent_n)
+    use_jockey_score = st.sidebar.checkbox("騎手スコアを使う", value=True)
+
+    df, top, honmei, ana, odds_valid = analyze_race(
+        race,
+        hist,
+        recent_n=recent_n,
+        use_jockey_score=use_jockey_score,
+    )
     df = dedupe_race_df(df)
 
     weather_override = st.session_state.get("weather_override", "自動")
@@ -1928,7 +2092,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
 
     df = apply_style_ground_pace_adjustments(df)
 
-    display_cols = ["mark", "horse_no", "frame_no", "horse_name", "running_style", "ai_score", "win_prob", "place_prob", "ana_score"]
+    display_cols = ["mark", "horse_no", "frame_no", "horse_name", "last_passing", "running_style", "jockey", "jockey_score", "ai_score", "win_prob", "place_prob", "ana_score"]
     if odds_valid:
         display_cols += ["odds_f", "ev_tansho"]
     if "pop_f" in df.columns:
@@ -1940,20 +2104,35 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
         jockey_master_count = len(fetch_jra_jockey_scores())
     except Exception:
         jockey_master_count = 0
-    jockey_source = f"JRA騎手データ {jockey_master_count}件" if jockey_master_count > 0 else "JRA騎手データ取得失敗 → 簡易騎手補正"
+
+    if "jockey_score_source" in df.columns:
+        if (df["jockey_score_source"] == "OFF").all():
+            jockey_source = "騎手スコアOFF"
+        elif (df["jockey_score_source"] == "JRA").any():
+            fallback_cnt = int((df["jockey_score_source"] == "fallback").sum())
+            jockey_source = f"JRA騎手データ {jockey_master_count}件 / fallback {fallback_cnt}件"
+        else:
+            jockey_source = "JRA騎手データ取得失敗 → 簡易騎手補正"
+    else:
+        jockey_source = f"JRA騎手データ {jockey_master_count}件" if jockey_master_count > 0 else "JRA騎手データ取得失敗 → 簡易騎手補正"
+
     st.caption(f"予想に使用した条件: 天候={used_weather} / 馬場={used_ground} / 騎手={jockey_source}")
 
     st.subheader("騎手スコア確認")
     if "jockey_score" in df.columns:
-        show_cols = [c for c in ["horse_name", "jockey", "jockey_score", "ai_score"] if c in df.columns]
+        show_cols = [c for c in ["horse_name", "jockey", "jockey_score", "jockey_score_source", "ai_score"] if c in df.columns]
+        show_df = df[show_cols].sort_values("ai_score", ascending=False) if "ai_score" in df.columns else df[show_cols]
+        if "jockey_score" in show_df.columns:
+            show_df["jockey_score"] = pd.to_numeric(show_df["jockey_score"], errors="coerce").round(3)
         st.dataframe(
-            df[show_cols].sort_values("ai_score", ascending=False) if "ai_score" in df.columns else df[show_cols],
+            show_df,
             use_container_width=True
         )
     else:
         st.warning("騎手スコアが存在しません（取得失敗 or 未反映）")
 
     st.subheader("総合ランキング")
+    st.caption("前走の通過(last_passing)と自動判定した脚質(running_style)を表示します。")
     editor_df = df[display_cols].copy()
     style_key = "manual_running_style_map"
     if style_key not in st.session_state:
@@ -1973,9 +2152,10 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
             "horse_no": st.column_config.NumberColumn("馬番", disabled=True),
             "frame_no": st.column_config.NumberColumn("枠番", disabled=True),
             "horse_name": st.column_config.TextColumn("馬名", disabled=True),
+            "last_passing": st.column_config.TextColumn("前走通過", disabled=True),
             "running_style": st.column_config.SelectboxColumn(
                 "running_style",
-                options=["先行", "中団", "差し", "不明"],
+                options=["逃げ", "先行", "差", "追込", "不明"],
                 required=True,
             ),
             "ai_score": st.column_config.NumberColumn("AIスコア", format="%.4f", disabled=True),
@@ -2046,21 +2226,21 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     ])
 
     with tabs[0]:
-        st.dataframe(wide_df.head(wide_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(wide_df.head(wide_count)))
     with tabs[1]:
-        st.dataframe(umaren_df.head(umaren_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(umaren_df.head(umaren_count)))
     with tabs[2]:
-        st.dataframe(trio_df.head(trio_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(trio_df.head(trio_count)))
     with tabs[3]:
-        st.dataframe(trifecta_df.head(trifecta_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(trifecta_df.head(trifecta_count)))
     with tabs[4]:
-        st.dataframe(honmei_ana_wide.head(wide_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(honmei_ana_wide.head(wide_count)))
     with tabs[5]:
-        st.dataframe(honmei_ana_umaren.head(umaren_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(honmei_ana_umaren.head(umaren_count)))
     with tabs[6]:
-        st.dataframe(honmei_ana_trio.head(trio_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(honmei_ana_trio.head(trio_count)))
     with tabs[7]:
-        st.dataframe(honmei_ana_trifecta.head(trifecta_count), use_container_width=True, hide_index=True)
+        st.write(highlight_top5_recommended(honmei_ana_trifecta.head(trifecta_count)))
 
     st.session_state["latest_prediction_df"] = df.copy()
     st.session_state["latest_ticket_tables"] = {
@@ -2090,15 +2270,14 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
             view_cols = [c for c in ["mark", "horse_no", "horse_name", "running_style", "予想順位", "着順", "3着内", "1着的中"] if c in merged_df.columns]
             st.dataframe(merged_df[view_cols], use_container_width=True, hide_index=True)
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("◎の着順", summary["◎の着順"] if summary["◎の着順"] is not None else "-")
-            c2.metric("上位3頭中の3着内", summary["上位3頭中の3着内頭数"])
-            c3.metric("上位5頭中の3着内", summary["上位5頭中の3着内頭数"])
-            c4.metric("勝ち馬を上位5頭に含む", "はい" if summary["勝ち馬を上位5頭に含む"] else "いいえ")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("上位3頭中の3着内", summary["上位3頭中の3着内頭数"])
+            c2.metric("上位5頭中の3着内", summary["上位5頭中の3着内頭数"])
+            c3.metric("勝ち馬を上位5頭に含む", "はい" if summary["勝ち馬を上位5頭に含む"] else "いいえ")
 
             st.write("### 券種別的中")
             hit_df = ticket_hit_summary(result_df, st.session_state["latest_ticket_tables"])
-            st.dataframe(hit_df, use_container_width=True, hide_index=True)
+            st.dataframe(hit_df.style.map(highlight_hit_cell, subset=["的中"]), use_container_width=True, hide_index=True)
 
             payout_tables = extract_payout_tables(result_url.strip(), result_html)
             recovery_df, recovery_summary = calc_recovery_rate(
@@ -2113,12 +2292,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
             c2.metric("払戻総額", f"{int(recovery_summary['払戻総額'])}円")
             c3.metric("総合回収率", f"{recovery_summary['総合回収率']:.1f}%")
             st.dataframe(recovery_df, use_container_width=True, hide_index=True)
-            if payout_tables:
-                st.write("### 払戻テーブル（文字化け対策版）")
-                for name, ptable in payout_tables.items():
-                    st.dataframe(ptable, use_container_width=True, hide_index=True)
-            else:
-                st.caption("払戻テーブルは取得できませんでした。")
+            # 払戻テーブル表示は不要のため非表示
         except Exception as e:
             st.error(f"検証エラー: {e}")
 

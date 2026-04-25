@@ -1,195 +1,118 @@
 from __future__ import annotations
 
 import io
-import re
-import time
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple, Any, Iterable
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-
 # =========================
-# iPad / Cloud 安定設定
+# 設定
 # =========================
-SELENIUM_AVAILABLE = False
+APP_TITLE = "にゃんこ競馬AI（完全版）"
 REQUEST_TIMEOUT = 8
-APP_TITLE = "にゃんこ競馬AI（iPad版）"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
 
 # =========================
-# Utility
+# Utility & Logic
 # =========================
-def decode_response_html(resp, url):
-    raw = resp.content
-    for enc in ["utf-8", "cp932", "shift_jis", "euc_jp"]:
-        try:
-            txt = raw.decode(enc, errors="replace")
-            if "馬名" in txt:
-                return txt
-        except:
-            pass
-    return resp.text
-
-def safe_read_html(html_text: str) -> List[pd.DataFrame]:
-    try:
-        if not html_text:
-            return []
-        return pd.read_html(io.StringIO(html_text))
-    except:
-        return []
-
 def safe_num(df, col, default=np.nan):
     if col not in df.columns:
         return pd.Series([default] * len(df))
-    return pd.to_numeric(df[col], errors="coerce").fillna(default)
+    return pd.to_numeric(df[col].astype(str).str.replace('---', ''), errors="coerce").fillna(default)
 
-def safe_text(df, col):
-    if col not in df.columns:
-        return pd.Series([""] * len(df))
-    return df[col].astype(str).fillna("")
-
-# =========================
-# Scraper
-# =========================
-class Scraper:
-    def __init__(self):
-        self.session = requests.Session()
-
-    def get_html(self, url):
-        try:
-            r = self.session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            return decode_response_html(r, url)
-        except Exception as e:
-            st.error(f"接続エラー: {e}")
-            return ""
-
-def pick_table(tables):
-    best = None
-    score_best = -999
-    for t in tables:
-        try:
-            txt = "".join(t.columns.astype(str))
-            score = 0
-            if "馬名" in txt: score += 50
-            if "馬番" in txt: score += 50
-            if "人気" in txt: score += 30
-            if "オッズ" in txt: score += 30
-            score += len(t)
-            if score > score_best:
-                best = t
-                score_best = score
-        except:
-            pass
-    return best
-
-# =========================
-# AIロジック
-# =========================
 def predict(df):
     df = df.copy()
+    # カラム名の空白削除
     df.columns = [str(c).strip() for c in df.columns]
 
+    # 必須カラムの補完
     if "馬番" not in df.columns:
         df["馬番"] = np.arange(1, len(df) + 1)
     if "馬名" not in df.columns:
-        df["馬名"] = ["馬" + str(i) for i in range(len(df))]
+        df["馬名"] = [f"馬{i+1}" for i in range(len(df))]
 
-    df["人気"] = safe_num(df, "人気", 10)
-    df["オッズ"] = safe_num(df, "オッズ", 50)
+    # 数値変換
+    pop = safe_num(df, "人気", 10)
+    odds = safe_num(df, "オッズ", 50)
 
-    # シンプルな計算式
-    score_pop = 1 / df["人気"]
-    score_odds = 1 / df["オッズ"]
-    df["score"] = score_pop * 0.6 + score_odds * 0.4
+    # --- 予想ロジック ---
+    # 人気とオッズの逆数でスコア化（ここをいじると予想が変わります）
+    df["score"] = (1 / pop * 0.6) + (1 / odds * 0.4)
 
+    # スコアが高い順に並び替え（ここで「12345...」の順序が崩れるはずです）
     df = df.sort_values("score", ascending=False).reset_index(drop=True)
+
+    # 印をつける（全頭分ループ）
     marks = ["◎", "○", "▲", "△", "☆"]
     df["印"] = ""
-    for i in range(min(len(df), len(marks))):
-        df.loc[i, "印"] = marks[i]
-    
+    for i in range(len(df)):
+        if i < len(marks):
+            df.loc[i, "印"] = marks[i]
+        else:
+            df.loc[i, "印"] = "-" # 6番手以降
+
     return df
 
 # =========================
-# UI (Streamlit Main)
+# UI (Streamlit)
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+st.title(f"🏆 {APP_TITLE}")
 
-# --- セッション状態の初期化 ---
 if "master_df" not in st.session_state:
     st.session_state.master_df = None
 
-scraper = Scraper()
-tab1, tab2 = st.tabs(["URLから取得", "CSVをアップロード"])
+tab1, tab2 = st.tabs(["URLから取得", "CSVから読み込み"])
 
-# -----------------
-# Tab 1: URL取得
-# -----------------
 with tab1:
-    url_input = st.text_input("netkeibaなどの出馬表URLを入力")
-    if st.button("データ取得実行"):
-        if url_input:
-            with st.spinner("スクレイピング中..."):
-                html = scraper.get_html(url_input)
-                if html:
-                    tables = safe_read_html(html)
-                    target_df = pick_table(tables)
-                    if target_df is not None:
-                        st.session_state.master_df = target_df
-                        st.success("データの取得に成功しました！")
-                    else:
-                        st.warning("競馬の出馬表テーブルが見つかりませんでした。")
-        else:
-            st.info("URLを入力してください。")
-
-# -----------------
-# Tab 2: CSV
-# -----------------
-with tab2:
-    uploaded_file = st.file_uploader("CSVファイルをドロップ", type=["csv"])
-    if uploaded_file:
+    url = st.text_input("出馬表URLを入力")
+    if st.button("データ取得"):
         try:
-            st.session_state.master_df = pd.read_csv(uploaded_file)
-            st.success("CSVを読み込みました。")
+            r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            # 文字コード自動判定
+            r.encoding = r.apparent_encoding
+            dfs = pd.read_html(io.StringIO(r.text))
+            
+            # 一番それっぽいテーブルを探す
+            best_df = None
+            max_score = -1
+            for d in dfs:
+                score = ("馬名" in d.columns) + ("馬番" in d.columns) + ("オッズ" in d.columns)
+                if score > max_score:
+                    max_score = score
+                    best_df = d
+            
+            if best_df is not None:
+                st.session_state.master_df = best_df
+                st.success("取得完了！")
+            else:
+                st.error("競馬のテーブルが見つかりません。")
         except Exception as e:
-            st.error(f"CSV読み込み失敗: {e}")
+            st.error(f"エラー: {e}")
 
-# -----------------
-# 共通表示 & 予想実行
-# -----------------
-st.divider()
+with tab2:
+    file = st.file_uploader("CSVファイルを選択", type="csv")
+    if file:
+        st.session_state.master_df = pd.read_csv(file)
 
+# --- 共通メインエリア ---
 if st.session_state.master_df is not None:
-    st.subheader("現在読み込んでいるデータ")
+    st.divider()
+    st.subheader("📋 読み込み中のデータ")
     st.dataframe(st.session_state.master_df, use_container_width=True)
 
-    if st.button("AI予想を開始する", type="primary"):
-        try:
-            with st.spinner("解析中..."):
-                result_df = predict(st.session_state.master_df)
-                
-                st.header("🏆 予想結果")
-                # 印を左側に持ってくる
-                cols = ["印", "馬番", "馬名", "人気", "オッズ"]
-                existing_cols = [c for c in cols if c in result_df.columns]
-                
-                st.dataframe(
-                    result_df[existing_cols].head(10).style.highlight_max(subset=["印"], color="#ffeb3b"),
-                    use_container_width=True
-                )
-                st.balloons()
-        except Exception as e:
-            st.error(f"予想プロセスでエラーが発生しました: {e}")
-else:
-    st.info("上のタブからデータを読み込んでください。")
+    if st.button("🚀 AI予想を実行！", type="primary"):
+        res = predict(st.session_state.master_df)
+        
+        st.divider()
+        st.header("✨ 予想結果")
+        
+        # 表示する列を絞り込む
+        display_cols = ["印", "馬番", "馬名", "人気", "オッズ"]
+        actual_cols = [c for c in display_cols if c in res.columns]
+        
+        # 全頭表示（headを外しました）
+        st.table(res[actual_cols]) 
+        
+        st.balloons()

@@ -468,6 +468,7 @@ def _sync_sidebar_quick_profile():
 def _sync_main_honmei():
     v = int(st.session_state.get("main_honmei_count", 6))
     st.session_state["rr_honmei_count"] = v
+    st.session_state["sidebar_honmei_count"] = v
 
 def _sync_sidebar_honmei():
     v = int(st.session_state.get("sidebar_honmei_count", 6))
@@ -477,6 +478,7 @@ def _sync_sidebar_honmei():
 def _sync_main_ana():
     v = int(st.session_state.get("main_ana_count_logic", 6))
     st.session_state["rr_ana_count_logic"] = v
+    st.session_state["sidebar_ana_count_logic"] = v
 
 def _sync_sidebar_ana():
     v = int(st.session_state.get("sidebar_ana_count_logic", 6))
@@ -498,8 +500,12 @@ def _ensure_ui_defaults():
     st.session_state.setdefault("rr_predict_mode", "バランス")
 
     st.session_state.setdefault("main_quick_profile", st.session_state["rr_quick_profile"])
+    st.session_state.setdefault("sidebar_quick_profile", st.session_state["rr_quick_profile"])
     st.session_state.setdefault("main_honmei_count", st.session_state["rr_honmei_count"])
     st.session_state.setdefault("main_ana_count_logic", st.session_state["rr_ana_count_logic"])
+    st.session_state.setdefault("sidebar_ana_pop_min", st.session_state.get("rr_ana_pop_min", globals().get("ANA_POP_MIN_DEFAULT", 4)))
+    st.session_state.setdefault("sidebar_ana_odds_min", st.session_state.get("rr_ana_odds_min", globals().get("ANA_ODDS_MIN_DEFAULT", 10.0)))
+    st.session_state.setdefault("sidebar_ana_gap_min", st.session_state.get("rr_ana_gap_min", globals().get("ANA_GAP_MIN_DEFAULT", 0.0)))
 
 _ensure_ui_defaults()
 
@@ -3166,61 +3172,7 @@ def estimate_topn_probs(df: pd.DataFrame, n_sim: int = 3000, top_n_list: List[in
     return out
 
 
-
-def render_enhanced_header(df_res):
-    # CSS定義（標準機能のみでカードを再現）
-    st.markdown("""
-        <style>
-        .stMetric {
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        }
-        .main-card {
-            background: linear-gradient(135deg, #1e90ff, #00bfff);
-            color: white;
-            padding: 20px;
-            border-radius: 15px;
-            margin-bottom: 20px;
-        }
-        .ana-card {
-            background: linear-gradient(135deg, #ff4500, #ff8c00);
-            color: white;
-            padding: 20px;
-            border-radius: 15px;
-            margin-bottom: 20px;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    st.header("🌟 AI予想エグゼクティブ・サマリー")
-    
-    # 期待値計算 (簡易版: スコアと勝率から算出)
-    df_res['expected_val'] = (df_res['win_prob'] * 10) + (df_res['score'] * 5)
-    top_horse = df_res.sort_values("score", ascending=False).iloc[0]
-    ana_horse = df_res.sort_values("expected_val", ascending=False).iloc[0]
-
-    col_h1, col_h2 = st.columns(2)
-    with col_h1:
-        st.markdown(f"""<div class='main-card'>
-            <small>◎ AI本命推奨</small>
-            <h2 style='color:white;margin:0;'>{top_horse['馬名']} ({top_horse['馬番']})</h2>
-            <p style='margin:0;'>AIスコア: {top_horse['score']:.3f} / 勝率: {top_horse['win_prob']*100:.1f}%</p>
-        </div>""", unsafe_allow_html=True)
-    
-    with col_h2:
-        st.markdown(f"""<div class='ana-card'>
-            <small>🔥 期待値NO.1 (穴馬)</small>
-            <h2 style='color:white;margin:0;'>{ana_horse['馬名']} ({ana_horse['馬番']})</h2>
-            <p style='margin:0;'>展開・妙味スコア: {ana_horse['expected_val']:.2f}</p>
-        </div>""", unsafe_allow_html=True)
-
-    # 脚質分布グラフ (Plotlyを使わず標準Bar Chartを使用)
-    st.subheader("📊 脚質別勢力図 (AIスコア合計)")
-    kyakushitsu_score = df_res.groupby('脚質')['score'].sum()
-    st.bar_chart(kyakushitsu_score)
-\n\ndef render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
+def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
     st.markdown("""
     <style>
     .nk-card{border:1px solid #dbe7f5;border-radius:16px;padding:16px 18px;background:#ffffff;}
@@ -3238,14 +3190,31 @@ def render_enhanced_header(df_res):
     model_bundle = None
     local_mode = st.session_state.get("rr_local_mode", st.session_state.get("sb_local_mode", "自動"))
     predict_mode = st.session_state.get("rr_predict_mode", st.session_state.get("sb_predict_mode", "バランス"))
-    # サイドバーの重複ウィジェットは作らない。
-    # 本命・穴候補数などはメイン画面の設定値だけを参照する。
+    st.sidebar.markdown("---")
+    st.sidebar.caption("本命・穴候補ロジック（変更は予想結果に反映）")
+    st.sidebar.caption("クイック設定は本命頭数・穴頭数・各しきい値・予想モードをまとめて変更します")
+    _qp_options = ["カスタム", "的中率", "バランス", "回収率", "爆穴", "三連複特化"]
+    st.sidebar.selectbox(
+        "クイック設定",
+        _qp_options,
+        index=_qp_options.index(st.session_state.get("rr_quick_profile", "カスタム")),
+        key="render_sidebar_quick_profile",
+        on_change=_sync_sidebar_quick_profile,
+    )
+    st.sidebar.slider("穴候補 人気下限(pop_f)", 2, 10, key="sidebar_ana_pop_min", on_change=_sync_sidebar_filters)
+    st.sidebar.slider("穴候補 オッズ下限", 1.0, 50.0, step=0.5, key="sidebar_ana_odds_min", on_change=_sync_sidebar_filters)
+    st.sidebar.slider("穴候補 gap下限", -0.05, 0.10, step=0.005, key="sidebar_ana_gap_min", on_change=_sync_sidebar_filters)
+
     honmei_count = int(st.session_state.get("rr_honmei_count", 6))
     ana_count_logic = int(st.session_state.get("rr_ana_count_logic", 6))
     ana_pop_min = int(st.session_state.get("rr_ana_pop_min", ANA_POP_MIN_DEFAULT))
     ana_odds_min = float(st.session_state.get("rr_ana_odds_min", ANA_ODDS_MIN_DEFAULT))
     ana_gap_min = float(st.session_state.get("rr_ana_gap_min", ANA_GAP_MIN_DEFAULT))
-
+    quick_profile = st.session_state.get("rr_quick_profile", "カスタム")
+    if quick_profile == "的中率":
+        predict_mode = "的中率重視"
+    elif quick_profile in ["回収率", "爆穴", "三連複特化"]:
+        predict_mode = "回収率重視"
 
     df, top, honmei, ana, odds_valid = analyze_race(
         race,
@@ -3655,16 +3624,27 @@ with st.sidebar:
     st.selectbox("予想モード", ["バランス", "的中率重視", "回収率重視"], index=0, key="sb_predict_mode")
 
     st.markdown('<div class="nk-side-card"><div class="nk-side-label">クイック設定</div><div class="nk-side-sub">本命・穴候補ロジック</div></div>', unsafe_allow_html=True)
-    _side_qp_options_main = ["カスタム", "的中率", "バランス", "回収率", "爆穴", "三連複特化"]
-    if "sidebar_quick_profile_main" not in st.session_state:
-        st.session_state["sidebar_quick_profile_main"] = st.session_state.get("rr_quick_profile", "カスタム")
     st.selectbox(
         "クイック設定",
-        _side_qp_options_main,
-        key="sidebar_quick_profile_main",
-        on_change=lambda: _apply_quick_profile(st.session_state.get("sidebar_quick_profile_main", "カスタム")),
+        ["カスタム", "的中率", "バランス", "回収率", "爆穴", "三連複特化"],
+        index=["カスタム", "的中率", "バランス", "回収率", "爆穴", "三連複特化"].index(st.session_state.get("rr_quick_profile", "カスタム")),
+        key="sidebar_quick_profile",
+        on_change=_sync_sidebar_quick_profile,
     )
+    st.slider("本命候補表示数", 3, 15, int(st.session_state.get("rr_honmei_count", 6)), key="sidebar_honmei_count", on_change=_sync_sidebar_honmei)
+    st.slider("穴候補表示数", 1, 15, int(st.session_state.get("rr_ana_count_logic", 6)), key="sidebar_ana_count_logic", on_change=_sync_sidebar_ana)
+    st.slider("穴候補 人気下限(pop_f)", 2, 10, int(st.session_state.get("rr_ana_pop_min", ANA_POP_MIN_DEFAULT)), key="sidebar_ana_pop_min", on_change=_sync_sidebar_filters)
+    st.slider("穴候補 オッズ下限", 1.0, 50.0, float(st.session_state.get("rr_ana_odds_min", ANA_ODDS_MIN_DEFAULT)), 0.5, key="sidebar_ana_odds_min", on_change=_sync_sidebar_filters)
+    st.slider("穴候補 gap下限", -0.05, 0.10, float(st.session_state.get("rr_ana_gap_min", ANA_GAP_MIN_DEFAULT)), 0.005, key="sidebar_ana_gap_min", on_change=_sync_sidebar_filters)
 
+    honmei_count = int(st.session_state.get("rr_honmei_count", 6))
+    ana_count_logic = int(st.session_state.get("rr_ana_count_logic", 6))
+    ana_pop_min = int(st.session_state.get("rr_ana_pop_min", ANA_POP_MIN_DEFAULT))
+    ana_odds_min = float(st.session_state.get("rr_ana_odds_min", ANA_ODDS_MIN_DEFAULT))
+    ana_gap_min = float(st.session_state.get("rr_ana_gap_min", ANA_GAP_MIN_DEFAULT))
+
+    st.markdown('<div class="nk-side-card"><div class="nk-side-label">現在の設定プリセット</div><div class="nk-side-sub">反映中: ' + str(st.session_state.get("rr_quick_profile", "カスタム")) + '</div></div>', unsafe_allow_html=True)
+    st.button("プリセットを保存", use_container_width=True, key="preset_save_dummy")
     st.caption(f"Selenium利用可能: {'はい' if SELENIUM_AVAILABLE else 'いいえ'}")
 
 use_jockey_score = st.session_state.get("sb_use_jockey_score", True)
@@ -3739,8 +3719,8 @@ with q3:
     st.metric("穴候補", f'{int(st.session_state.get("rr_ana_count_logic", 6))}頭')
 
 recent_n = st.slider("直近成績使用件数", 3, 20, 10, key="main_recent_n")
-honmei_count = st.slider("本命候補表示数", 3, 15, key="main_honmei_count", on_change=_sync_main_honmei)
-ana_count_logic = st.slider("穴候補表示数", 1, 15, key="main_ana_count_logic", on_change=_sync_main_ana)
+honmei_count = st.slider("本命候補表示数", 3, 15, int(st.session_state.get("rr_honmei_count", 6)), key="main_honmei_count", on_change=_sync_main_honmei)
+ana_count_logic = st.slider("穴候補表示数", 1, 15, int(st.session_state.get("rr_ana_count_logic", 6)), key="main_ana_count_logic", on_change=_sync_main_ana)
 ana_count = st.slider("穴馬候補の頭数（買い目用）", 1, 15, int(st.session_state.get("rr_ana_count_logic", 6)), key="main_ana_count")
 ticket_head_count = st.slider("買い目に使う上位頭数", 5, 15, TOP_FOR_TICKETS_DEFAULT, key="main_ticket_head_count")
 wide_count = st.slider("ワイド表示件数", 5, 50, 30, key="main_wide_count")
@@ -3834,9 +3814,4 @@ if st.session_state.get("prediction_ready") and st.session_state.get("race_df_st
 # 17. 単勝/複勝以外のEV推定
 # 18. API化
 # 19. Reactフロント連携
-# 20. モバイル最適化\nimport base64
-st.sidebar.markdown("---")
-if st.sidebar.button("最新版ソースを生成"):
-    b64 = base64.b64encode(open(__file__, "rb").read()).decode()
-    href = f'<a href="data:file/python;base64,{b64}" download="nyanko_keiba_ai_v3_final.py">ここをクリックしてダウンロード</a>'
-    st.sidebar.markdown(href, unsafe_allow_html=True)
+# 20. モバイル最適化

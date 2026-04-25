@@ -1,28 +1,18 @@
-from __future__ import annotations
-import html
-import traceback
-import json
-from datetime import datetime, date, timedelta
-from urllib.parse import urljoin, urlparse, parse_qs
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple, Any, Iterable
-from pathlib import Path
-from itertools import combinations, permutations
-from collections import defaultdict
+import io
 import os
 import re
-import io
-import math
 import time
-import random
-import warnings
-import pandas as pd
+import math
+from dataclasses import asdict, dataclass
+from itertools import combinations, permutations
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urljoin
+
 import numpy as np
+import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-
-warnings.filterwarnings("ignore", category=FutureWarning)
 
 try:
     import joblib
@@ -40,234 +30,17 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
     SELENIUM_AVAILABLE = True
 except Exception:
-    webdriver = None
-    Options = None
-    WebDriverWait = None
-    SELENIUM_AVAILABLE = False
-
-# ===== 安定化デフォルト =====
-REQUEST_TIMEOUT = 10
-REQUEST_SLEEP = 1.0
-APP_TITLE = "にゃんこ競馬AI予想 完全安定版"
-DEFAULT_RACE_URL = ""
-LOG_FILE = "race_log.csv"
-HONMEI_COUNT_DEFAULT = 6
-ANA_COUNT_DEFAULT = 6
-ANA_POP_MIN_DEFAULT = 4
-ANA_ODDS_MIN_DEFAULT = 10.0
-ANA_GAP_MIN_DEFAULT = 0.0
-TOP_FOR_TICKETS_DEFAULT = 7
-WIDE_COUNT_DEFAULT = 10
-UMAREN_COUNT_DEFAULT = 10
-TRIO_COUNT_DEFAULT = 10
-TRIFECTA_COUNT_DEFAULT = 10
-ANA_COUNT_UI_DEFAULT = 6
-RECENT_N_DEFAULT = 5
-MAX_HORSES_DEFAULT = 18
-JP_COLUMNS = {}
-JP_EDITABLE = []
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-def safe_app_warning(msg: str):
-    try:
-        st.warning(msg)
-    except Exception:
-        pass
-
-def safe_app_error(msg: str):
-    try:
-        st.error(msg)
-    except Exception:
-        pass
-
-import html
-import traceback
-import json
-from datetime import datetime, date, timedelta
-from urllib.parse import urljoin, urlparse, parse_qs
-from urllib.parse import urljoin
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
-from pathlib import Path
-from itertools import combinations, permutations
-import os
-import re
-import io
-import math
-import time
-import random
-import warnings
-import pandas as pd
-import numpy as np
-import requests
-import streamlit as st
-from bs4 import BeautifulSoup
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-try:
-    import joblib
-    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-    SKLEARN_AVAILABLE = True
-except Exception:
-    joblib = None
-    RandomForestClassifier = None
-    RandomForestRegressor = None
-    SKLEARN_AVAILABLE = False
-
-try:
-    from selenium import webdriver
     SELENIUM_AVAILABLE = True
-except Exception:
-    webdriver = None
-    SELENIUM_AVAILABLE = False
 
 
 # ============================================================
-# 安全化ユーティリティ
+# 基本設定
 # ============================================================
-# 共通タイムアウト定数
-REQUEST_TIMEOUT = 10
 
-
-# 未定義防止の共通デフォルト
-REQUEST_SLEEP = 1.0
-DEFAULT_RACE_URL = ""
-
-# ===== 全体デフォルト定義（未定義落ち防止）=====
-APP_TITLE = "にゃんこ競馬AI予想 完全版"
+# ============================================================
+# 回収率ログ
+# ============================================================
 LOG_FILE = "race_log.csv"
-# =============================================
-
-
-# ===== 全体デフォルト定義（未定義落ち防止・最終版）=====
-TOP_FOR_TICKETS_DEFAULT = 7
-WIDE_COUNT_DEFAULT = 10
-UMAREN_COUNT_DEFAULT = 10
-TRIO_COUNT_DEFAULT = 10
-TRIFECTA_COUNT_DEFAULT = 10
-ANA_COUNT_UI_DEFAULT = 6
-RECENT_N_DEFAULT = 5
-MAX_HORSES_DEFAULT = 18
-# =======================================================
-
-
-# ===== 最終安全デフォルト =====
-JP_COLUMNS = {}
-JP_EDITABLE = []
-# =============================
-
-
-def _safe_df(df: Any) -> pd.DataFrame:
-    if df is None:
-        return pd.DataFrame()
-    if isinstance(df, pd.DataFrame):
-        out = df.copy()
-    else:
-        try:
-            out = pd.DataFrame(df)
-        except Exception:
-            out = pd.DataFrame()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [
-            "_".join([str(x) for x in col if str(x) and str(x) != "nan"]).strip("_")
-            for col in out.columns
-        ]
-    out.columns = [str(c).strip() for c in out.columns]
-    out = out.loc[:, ~pd.Index(out.columns).duplicated(keep="first")].copy()
-    return out
-
-def _safe_series(df: pd.DataFrame, col: str, default=None) -> pd.Series:
-    df = _safe_df(df)
-    if col not in df.columns:
-        return pd.Series([default] * len(df), index=df.index)
-    v = df[col]
-    if isinstance(v, pd.DataFrame):
-        v = v.iloc[:, 0] if v.shape[1] else pd.Series([default] * len(df), index=df.index)
-    if not isinstance(v, pd.Series):
-        v = pd.Series([v] * len(df), index=df.index)
-    if len(v) != len(df):
-        vals = list(v)[:len(df)] + [default] * max(0, len(df) - len(v))
-        v = pd.Series(vals, index=df.index)
-    else:
-        v = pd.Series(v.to_numpy(), index=df.index)
-    return v
-
-def _safe_num(df: pd.DataFrame, col: str, default=0.0) -> pd.Series:
-    return pd.to_numeric(_safe_series(df, col, default), errors="coerce").fillna(default)
-
-def _safe_text(df: pd.DataFrame, col: str, default="") -> pd.Series:
-    return _safe_series(df, col, default).fillna(default).astype(str)
-
-def safe_pick_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    out = _safe_df(df)
-    use = [c for c in cols if c in out.columns]
-    return out[use].copy() if use else out.copy()
-
-def safe_numeric(df, col):
-    return _safe_num(df, col, default=np.nan)
-
-from dataclasses import dataclass
-import streamlit as st
-import requests
-from bs4 import BeautifulSoup
-
-# Selenium利用可否フラグ（未導入環境でも落とさない）
-try:
-    from selenium import webdriver
-    SELENIUM_AVAILABLE = True
-except Exception:
-    webdriver = None
-    SELENIUM_AVAILABLE = False
-
-from typing import Dict, List, Optional, Tuple, Any
-from pathlib import Path
-from itertools import combinations, permutations
-import os
-import re
-import io
-import random
-import math
-import time
-import pandas as pd
-import numpy as np
-
-import pandas as pd
-
-def safe_numeric(df, col):
-    """
-    必ず df と同じ長さの 1次元 Series を返す。
-    列なし / 同名列重複 / scalar / None / 長さ不一致を吸収。
-    """
-    n = len(df)
-
-    if col not in df.columns:
-        return pd.Series([None] * n, index=df.index)
-
-    val = df[col]
-
-    if isinstance(val, pd.DataFrame):
-        if val.shape[1] == 0:
-            return pd.Series([None] * n, index=df.index)
-        val = val.iloc[:, 0]
-
-    if not isinstance(val, pd.Series):
-        val = pd.Series([val] * n, index=df.index)
-
-    if len(val) != n:
-        vals = list(val)[:n] + [None] * max(0, n - len(val))
-        val = pd.Series(vals, index=df.index)
-    else:
-        val = pd.Series(val.to_numpy(), index=df.index)
-
-    try:
-        return pd.to_numeric(val, errors="coerce")
-    except Exception:
-        return pd.Series([None] * n, index=df.index)
 
 def init_log() -> None:
     if not os.path.exists(LOG_FILE):
@@ -335,29 +108,19 @@ def summarize_log_by_bet_type(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _prep_adv_df(df: pd.DataFrame) -> pd.DataFrame:
-    work = _safe_df(df)
+    work = df.copy()
     for col in ["win_prob", "place_prob", "gap", "ana_score", "odds_f", "pop_f", "top5_prob"]:
-        work[col] = _safe_num(work, col, default=0.0).to_numpy()
-    work["running_style"] = _safe_text(work, "running_style", "不明").to_numpy()
+        if col not in work.columns:
+            work[col] = 0.0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+    if "running_style" not in work.columns:
+        work["running_style"] = "不明"
     if "horse_no" not in work.columns:
         work["horse_no"] = np.arange(1, len(work) + 1)
-    else:
-        nums = _safe_num(work, "horse_no", default=0)
-        fixed = []
-        for i, v in enumerate(nums.tolist(), start=1):
-            try:
-                iv = int(v)
-                fixed.append(iv if iv > 0 else i)
-            except Exception:
-                fixed.append(i)
-        work["horse_no"] = fixed
     if "horse_name" not in work.columns:
-        work["horse_name"] = [f"馬{x}" for x in range(1, len(work) + 1)]
-    else:
-        names = _safe_text(work, "horse_name", "")
-        defaults = pd.Series([f"馬{x}" for x in range(1, len(work) + 1)], index=work.index)
-        work["horse_name"] = names.replace("", np.nan).fillna(defaults).to_numpy()
+        work["horse_name"] = work["horse_no"].map(lambda x: f"馬{x}")
     return work
+
 
 def _style_balance_bonus(styles: set) -> float:
     s = {str(x) for x in styles if str(x) not in ["", "不明", "nan", "None"]}
@@ -369,107 +132,109 @@ def _style_balance_bonus(styles: set) -> float:
 
 
 def build_trio_table_strong(top_df: pd.DataFrame, limit: int = 50) -> pd.DataFrame:
-    work = _prep_adv_df(top_df)
-    if len(work) < 3:
-        return pd.DataFrame(columns=["券種", "組み合わせ", "馬1", "馬2", "馬3", "score"])
+    work = _prep_adv_df(top_df).copy()
     rows = []
     for i, j, k in combinations(range(len(work)), 3):
         a, b, c = work.iloc[i], work.iloc[j], work.iloc[k]
-        styles = {a.get("running_style", "不明"), b.get("running_style", "不明"), c.get("running_style", "不明")}
-        try:
-            score = (
-                float(a.get("place_prob", 0)) * 0.9 + float(b.get("place_prob", 0)) * 0.9 + float(c.get("place_prob", 0)) * 0.9
-                + (max(float(a.get("gap", 0)), 0.0) + max(float(b.get("gap", 0)), 0.0) + max(float(c.get("gap", 0)), 0.0)) * 1.4
-                + (float(a.get("win_prob", 0)) + float(b.get("win_prob", 0)) + float(c.get("win_prob", 0))) * 0.6
-                + _style_balance_bonus(styles)
-            )
-        except Exception:
-            score = 0.0
+        styles = {a["running_style"], b["running_style"], c["running_style"]}
+        score = (
+            float(a["place_prob"]) * 0.9
+            + float(b["place_prob"]) * 0.9
+            + float(c["place_prob"]) * 0.9
+            + (max(float(a["gap"]), 0.0) + max(float(b["gap"]), 0.0) + max(float(c["gap"]), 0.0)) * 1.4
+            + (float(a["win_prob"]) + float(b["win_prob"]) + float(c["win_prob"])) * 0.6
+            + _style_balance_bonus(styles)
+        )
         rows.append({
             "券種": "3連複",
-            "組み合わせ": f"{int(a.get('horse_no', i+1))}-{int(b.get('horse_no', j+1))}-{int(c.get('horse_no', k+1))}",
-            "馬1": str(a.get("horse_name", "")),
-            "馬2": str(b.get("horse_name", "")),
-            "馬3": str(c.get("horse_name", "")),
+            "組み合わせ": normalize_combination_text(f"{int(a['horse_no'])}-{int(b['horse_no'])}-{int(c['horse_no'])}", "-"),
+            "馬1": a["horse_name"],
+            "馬2": b["horse_name"],
+            "馬3": c["horse_name"],
             "score": score,
         })
-    return pd.DataFrame(rows).sort_values("score", ascending=False).head(int(limit)).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=["券種", "組み合わせ", "馬1", "馬2", "馬3", "score"])
+    return pd.DataFrame(rows).sort_values("score", ascending=False).head(limit).reset_index(drop=True)
+
 
 def build_trifecta_table_strong(top_df: pd.DataFrame, limit: int = 100) -> pd.DataFrame:
-    work = _prep_adv_df(top_df)
-    if len(work) < 3:
-        return pd.DataFrame(columns=["組み合わせ", "1着", "2着", "3着", "score"])
+    work = _prep_adv_df(top_df).copy()
     rows = []
     for i, j, k in permutations(range(len(work)), 3):
+        if len({i, j, k}) < 3:
+            continue
         a, b, c = work.iloc[i], work.iloc[j], work.iloc[k]
-        styles = {a.get("running_style", "不明"), b.get("running_style", "不明"), c.get("running_style", "不明")}
-        try:
-            score = (
-                float(a.get("win_prob", 0)) * 1.8
-                + float(b.get("place_prob", 0)) * 0.95
-                + float(c.get("top5_prob", 0)) * 0.75
-                + max(float(c.get("gap", 0)), 0.0) * 1.5
-                + _style_balance_bonus(styles)
-            )
-            if max(float(a.get("pop_f", 0)), float(b.get("pop_f", 0)), float(c.get("pop_f", 0))) >= 6:
-                score += 0.03
-        except Exception:
-            score = 0.0
+        styles = {a["running_style"], b["running_style"], c["running_style"]}
+        score = (
+            float(a["win_prob"]) * 1.8
+            + float(b["place_prob"]) * 0.95
+            + float(c["top5_prob"]) * 0.75
+            + max(float(c["gap"]), 0.0) * 1.5
+            + _style_balance_bonus(styles)
+        )
+        pops = [float(a.get("pop_f", 0)), float(b.get("pop_f", 0)), float(c.get("pop_f", 0))]
+        if max(pops) >= 6:
+            score += 0.03
         rows.append({
-            "組み合わせ": f"{int(a.get('horse_no', i+1))}→{int(b.get('horse_no', j+1))}→{int(c.get('horse_no', k+1))}",
-            "1着": str(a.get("horse_name", "")),
-            "2着": str(b.get("horse_name", "")),
-            "3着": str(c.get("horse_name", "")),
+            "組み合わせ": f"{int(a['horse_no'])}→{int(b['horse_no'])}→{int(c['horse_no'])}",
+            "1着": a["horse_name"],
+            "2着": b["horse_name"],
+            "3着": c["horse_name"],
             "score": score,
         })
-    return pd.DataFrame(rows).sort_values("score", ascending=False).head(int(limit)).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=["組み合わせ", "1着", "2着", "3着", "score"])
+    return pd.DataFrame(rows).sort_values("score", ascending=False).head(limit).reset_index(drop=True)
+
 
 def _normalize_training_df(df: pd.DataFrame) -> pd.DataFrame:
-    work = _safe_df(df)
+    work = df.copy()
     ren = {}
-    for c in list(work.columns):
+    for c in work.columns:
         s = str(c).strip()
         if s in ["着順", "rank"]:
             ren[c] = "rank"
-        elif s in ["人気", "pop", "pop_f", "popularity"]:
+        elif s in ["人気", "pop", "pop_f"]:
             ren[c] = "pop"
-        elif s in ["オッズ", "odds", "odds_f", "単勝"]:
+        elif s in ["オッズ", "odds", "odds_f"]:
             ren[c] = "odds"
-        elif s in ["後3F", "上がり3F", "上り3F", "last3f"]:
+        elif s in ["後3F", "上がり3F", "last3f"]:
             ren[c] = "last3f"
-        elif s in ["馬場状態", "馬場", "ground"]:
+        elif s in ["馬場状態", "ground"]:
             ren[c] = "ground"
         elif s in ["天候", "weather"]:
             ren[c] = "weather"
-    work = _safe_df(work.rename(columns=ren))
+    work = work.rename(columns=ren)
     for col in ["rank", "pop", "odds", "last3f"]:
-        work[col] = _safe_num(work, col, default=np.nan).to_numpy()
-    work["ground"] = _safe_text(work, "ground", "").to_numpy()
-    work["weather"] = _safe_text(work, "weather", "").to_numpy()
-    work["ground_code"] = pd.Series(work["ground"]).astype(str).map({"良": 0, "稍重": 1, "重": 2, "不良": 3}).fillna(0).to_numpy()
-    work["weather_code"] = pd.Series(work["weather"]).astype(str).map({"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}).fillna(0).to_numpy()
+        if col not in work.columns:
+            work[col] = np.nan
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    if "ground" not in work.columns:
+        work["ground"] = ""
+    if "weather" not in work.columns:
+        work["weather"] = ""
+    work["ground_code"] = work["ground"].astype(str).map({"良": 0, "稍重": 1, "重": 2, "不良": 3}).fillna(0)
+    work["weather_code"] = work["weather"].astype(str).map({"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}).fillna(0)
     return work
+
 
 def train_odds_linked_models(df: pd.DataFrame, model_dir: str = "models") -> Dict[str, str]:
     if not SKLEARN_AVAILABLE:
         raise RuntimeError("scikit-learn / joblib が必要です。")
     work = _normalize_training_df(df)
     use = work.dropna(subset=["rank"]).copy()
-    if len(use) < 5:
-        raise ValueError("学習データが少なすぎます。最低5行以上、できれば20行以上のCSVを使ってください。")
-    feature_cols = ["odds", "pop", "last3f", "ground_code", "weather_code"]
-    for c in feature_cols:
-        if c not in use.columns:
-            use[c] = 0
-    X = use[feature_cols].fillna(0)
-    y_top3 = (pd.to_numeric(use["rank"], errors="coerce").fillna(999) <= 3).astype(int)
-    y_rank = pd.to_numeric(use["rank"], errors="coerce").fillna(999).astype(float)
-    if y_top3.nunique() < 2:
-        y_top3 = pd.Series([1 if i % 2 == 0 else 0 for i in range(len(use))], index=use.index)
-    clf = RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42, class_weight="balanced")
+    if len(use) < 20:
+        raise ValueError("学習データが少なすぎます。20行以上あるCSVを使ってください。")
+    X = use[["odds", "pop", "last3f", "ground_code", "weather_code"]].fillna(0)
+    y_top3 = (use["rank"] <= 3).astype(int)
+    y_rank = use["rank"].astype(float)
+
+    clf = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42, class_weight="balanced")
     clf.fit(X, y_top3)
-    reg = RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42)
+    reg = RandomForestRegressor(n_estimators=300, max_depth=8, random_state=42)
     reg.fit(X, y_rank)
+
     model_path = Path(model_dir)
     model_path.mkdir(parents=True, exist_ok=True)
     top3_path = model_path / "top3_model.joblib"
@@ -477,69 +242,64 @@ def train_odds_linked_models(df: pd.DataFrame, model_dir: str = "models") -> Dic
     meta_path = model_path / "model_meta.joblib"
     joblib.dump(clf, top3_path)
     joblib.dump(reg, rank_path)
-    joblib.dump({"feature_cols": feature_cols}, meta_path)
+    joblib.dump({"feature_cols": ["odds", "pop", "last3f", "ground_code", "weather_code"]}, meta_path)
     return {"top3_model": str(top3_path), "rank_model": str(rank_path), "meta": str(meta_path)}
+
 
 def load_trained_models(model_dir: str = "models") -> Optional[Dict[str, object]]:
     if not SKLEARN_AVAILABLE:
         return None
-    try:
-        model_path = Path(model_dir)
-        top3_path = model_path / "top3_model.joblib"
-        rank_path = model_path / "rank_model.joblib"
-        meta_path = model_path / "model_meta.joblib"
-        if not top3_path.exists() or not rank_path.exists() or not meta_path.exists():
-            return None
-        meta = joblib.load(meta_path)
-        return {
-            "top3_model": joblib.load(top3_path),
-            "rank_model": joblib.load(rank_path),
-            "feature_cols": meta.get("feature_cols", ["odds", "pop", "last3f", "ground_code", "weather_code"]),
-        }
-    except Exception:
+    model_path = Path(model_dir)
+    top3_path = model_path / "top3_model.joblib"
+    rank_path = model_path / "rank_model.joblib"
+    meta_path = model_path / "model_meta.joblib"
+    if not top3_path.exists() or not rank_path.exists() or not meta_path.exists():
         return None
+    meta = joblib.load(meta_path)
+    return {"top3_model": joblib.load(top3_path), "rank_model": joblib.load(rank_path), "feature_cols": meta["feature_cols"]}
+
 
 def apply_trained_models_to_prediction_df(df: pd.DataFrame, model_bundle: Optional[Dict[str, object]]) -> pd.DataFrame:
-    out = _safe_df(df)
-    out["model_top3_prob"] = _safe_num(out, "model_top3_prob", default=np.nan).to_numpy()
-    out["model_rank_pred"] = _safe_num(out, "model_rank_pred", default=np.nan).to_numpy()
-    out["model_value_score"] = _safe_num(out, "model_value_score", default=np.nan).to_numpy()
-    if model_bundle is None or len(out) == 0:
+    out = df.copy()
+    if "model_top3_prob" not in out.columns:
+        out["model_top3_prob"] = np.nan
+    if "model_rank_pred" not in out.columns:
+        out["model_rank_pred"] = np.nan
+    if "model_value_score" not in out.columns:
+        out["model_value_score"] = np.nan
+
+    if model_bundle is None:
         return out
+
+    work = _normalize_training_df(df)
+    X = work[model_bundle["feature_cols"]].fillna(0)
     try:
-        work = _normalize_training_df(out)
-        feature_cols = model_bundle.get("feature_cols", ["odds", "pop", "last3f", "ground_code", "weather_code"])
-        for c in feature_cols:
-            if c not in work.columns:
-                work[c] = 0
-        X = work[feature_cols].fillna(0)
-        top3_model = model_bundle.get("top3_model")
-        rank_model = model_bundle.get("rank_model")
-        if top3_model is not None:
-            try:
-                out["model_top3_prob"] = top3_model.predict_proba(X)[:, 1]
-            except Exception:
-                out["model_top3_prob"] = top3_model.predict(X)
-        if rank_model is not None:
-            out["model_rank_pred"] = rank_model.predict(X)
+        out["model_top3_prob"] = model_bundle["top3_model"].predict_proba(X)[:, 1]
+        out["model_rank_pred"] = model_bundle["rank_model"].predict(X)
         odds_col = "odds_f" if "odds_f" in out.columns else ("odds" if "odds" in out.columns else None)
         if odds_col:
-            odds_num = _safe_num(out, odds_col, default=0)
-            out["model_value_score"] = pd.to_numeric(out["model_top3_prob"], errors="coerce").fillna(0).to_numpy() * odds_num.to_numpy()
+            odds_num = pd.to_numeric(out[odds_col], errors="coerce").fillna(0)
+            out["model_value_score"] = out["model_top3_prob"] * odds_num
         else:
-            out["model_value_score"] = pd.to_numeric(out["model_top3_prob"], errors="coerce").fillna(0).to_numpy()
+            out["model_value_score"] = out["model_top3_prob"]
     except Exception:
-        return out
+        pass
     return out
 
+
+
+APP_TITLE = "競馬AI予想 完全版"
+DEFAULT_RACE_URL = "https://race.netkeiba.com/race/shutuba.html?race_id=202601010811"
+REQUEST_TIMEOUT = 20
+REQUEST_SLEEP = 0.8
+TOP_FOR_TICKETS_DEFAULT = 10
+
+
 def fetch_text_with_encoding(url: str, timeout: int = REQUEST_TIMEOUT) -> str:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        return decode_response_html(resp, url)
-    except Exception as e:
-        safe_app_warning(f"取得失敗: {e}")
-        return ""
+    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+    return decode_response_html(resp, url)
+
+
 
 def decode_response_html(resp: requests.Response, url: str = "") -> str:
     raw = resp.content
@@ -608,13 +368,6 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-
-
-
-# ---- 未定義落ち防止の保険値 ----
-payout_tables = {}
-tables_out = {}
-bet_per_ticket = 100
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -897,7 +650,7 @@ def fetch_jra_jockey_scores() -> pd.DataFrame:
     for url in urls:
         try:
             html = fetch_text_with_encoding(url, timeout=REQUEST_TIMEOUT)
-            tables = safe_read_html(html)
+            tables = pd.read_html(io.StringIO(html))
         except Exception:
             continue
 
@@ -1300,16 +1053,6 @@ def safe_head(df: pd.DataFrame, n: int) -> pd.DataFrame:
 # ============================================================
 # スクレイパー
 # ============================================================
-
-
-def safe_read_html(html_text: str) -> List[pd.DataFrame]:
-    try:
-        if not html_text:
-            return []
-        return pd.read_html(io.StringIO(html_text))
-    except Exception:
-        return []
-
 
 class Scraper:
     def __init__(self, timeout: int = REQUEST_TIMEOUT, sleep_sec: float = REQUEST_SLEEP) -> None:
@@ -1932,7 +1675,7 @@ def parse_horse_history(scraper: Scraper, horse_name: str, horse_url: str, max_r
         return []
 
     try:
-        tables = safe_read_html(html)
+        tables = pd.read_html(io.StringIO(html))
     except Exception:
         tables = []
 
@@ -2818,7 +2561,7 @@ def parse_result_table_from_html(html: str) -> pd.DataFrame:
 
     # まず列名ベースで厳密に読む
     try:
-        tables = safe_read_html(html)
+        tables = pd.read_html(io.StringIO(html))
     except Exception:
         tables = []
 
@@ -3436,9 +3179,6 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     </style>
     """, unsafe_allow_html=True)
     st.markdown('<div class="nk-title">🐾 にゃんこ競馬予想AI 🐱</div><div class="nk-sub">データ分析 × AI予想で勝率アップ！</div>', unsafe_allow_html=True)
-    if st.session_state.get("model_just_trained", False):
-        st.success("学習済みモデルを反映して再予想済みです。")
-        st.session_state["model_just_trained"] = False
 
     use_jockey_score = st.session_state.get("rr_use_jockey_score", st.session_state.get("sb_use_jockey_score", True))
     model_bundle = None
@@ -3647,7 +3387,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
     cta5.button("馬券推奨を見る", use_container_width=True)
 
     try:
-        model_bundle = load_trained_models(model_dir=st.session_state.get("trained_model_dir", "models"))
+        model_bundle = load_trained_models()
     except Exception:
         model_bundle = None
     df = apply_trained_models_to_prediction_df(df, model_bundle)
@@ -3750,36 +3490,15 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
                     raise ValueError("学習用CSVを選択してください。")
                 train_df = load_csv_upload(train_file)
                 model_paths = train_odds_linked_models(train_df, model_dir=model_dir)
-
-                # 学習済みモデルの保存先を予想側でも使う
-                st.session_state["trained_model_dir"] = model_dir
-                st.session_state["model_just_trained"] = True
-
-                # 既に予想データがある場合は自動で再計算させる
-                if st.session_state.get("race_df_store") is not None and st.session_state.get("hist_df_store") is not None:
-                    st.session_state["prediction_ready"] = True
-                    st.success("学習完了。学習済みモデルを読み込んで自動再予想します。")
-                    st.rerun()
-                else:
-                    st.success(f"学習完了: {model_paths['top3_model']}。予想データを取得すると自動反映されます。")
+                st.success(f"学習完了: {model_paths['top3_model']}")
             except Exception as e:
                 st.error(f"学習エラー: {e}")
-
         if c_train2.button("保存済みモデル確認", use_container_width=True, key="check_training_button"):
-            st.session_state["trained_model_dir"] = model_dir
             bundle = load_trained_models(model_dir=model_dir)
             if bundle is None:
                 st.warning("保存済みモデルはありません。")
             else:
                 st.success("保存済みモデルを検出しました。次回予想に反映されます。")
-
-        if st.button("学習済みモデルで再予想", use_container_width=True, key="rerun_prediction_after_training"):
-            if st.session_state.get("race_df_store") is not None and st.session_state.get("hist_df_store") is not None:
-                st.session_state["trained_model_dir"] = model_dir
-                st.session_state["prediction_ready"] = True
-                st.rerun()
-            else:
-                st.warning("先に出馬表を取得、またはCSVを読み込んで予想してください。")
 
     st.session_state["latest_prediction_df"] = df.copy()
     st.session_state["latest_ticket_tables"] = {
@@ -3892,8 +3611,6 @@ with st.sidebar:
         on_change=lambda: _apply_quick_profile(st.session_state.get("sidebar_quick_profile_main", "カスタム")),
     )
 
-    if "SELENIUM_AVAILABLE" not in globals():
-        SELENIUM_AVAILABLE = False
     st.caption(f"Selenium利用可能: {'はい' if SELENIUM_AVAILABLE else 'いいえ'}")
 
 use_jockey_score = st.session_state.get("sb_use_jockey_score", True)
@@ -4028,23 +3745,17 @@ else:
             st.error(f"ローカルCSV読み込み失敗: {e}")
 
 if st.session_state.get("prediction_ready") and st.session_state.get("race_df_store") is not None and st.session_state.get("hist_df_store") is not None:
-    try:
-        render_results(
-            st.session_state["race_df_store"].copy(),
-            st.session_state["hist_df_store"].copy(),
-            int(recent_n),
-            int(ana_count),
-            int(ticket_head_count),
-            int(wide_count),
-            int(umaren_count),
-            int(trio_count),
-            int(trifecta_count),
-        )
-    except Exception as e:
-        st.error(f"予想処理エラーを吸収しました: {e}")
-        st.info("画面は落とさず継続します。入力CSV/取得データを確認してください。")
-        with st.expander("詳細エラー"):
-            st.code(traceback.format_exc())
+    render_results(
+        st.session_state["race_df_store"].copy(),
+        st.session_state["hist_df_store"].copy(),
+        int(recent_n),
+        int(ana_count),
+        int(ticket_head_count),
+        int(wide_count),
+        int(umaren_count),
+        int(trio_count),
+        int(trifecta_count),
+    )
 
 # ============================================================
 # 末尾コメント（行数調整と将来拡張メモ）
@@ -4070,10 +3781,3 @@ if st.session_state.get("prediction_ready") and st.session_state.get("race_df_st
 # 18. API化
 # 19. Reactフロント連携
 # 20. モバイル最適化
-def calc_recovery_rate(payout: Any, buy: Any) -> float:
-    try:
-        b = float(buy)
-        p = float(payout)
-        return (p / b * 100.0) if b > 0 else 0.0
-    except Exception:
-        return 0.0

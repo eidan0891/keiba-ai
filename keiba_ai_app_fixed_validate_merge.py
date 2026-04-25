@@ -3166,7 +3166,61 @@ def estimate_topn_probs(df: pd.DataFrame, n_sim: int = 3000, top_n_list: List[in
     return out
 
 
-def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
+
+def render_enhanced_header(df_res):
+    # CSS定義（標準機能のみでカードを再現）
+    st.markdown("""
+        <style>
+        .stMetric {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .main-card {
+            background: linear-gradient(135deg, #1e90ff, #00bfff);
+            color: white;
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 20px;
+        }
+        .ana-card {
+            background: linear-gradient(135deg, #ff4500, #ff8c00);
+            color: white;
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 20px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.header("🌟 AI予想エグゼクティブ・サマリー")
+    
+    # 期待値計算 (簡易版: スコアと勝率から算出)
+    df_res['expected_val'] = (df_res['win_prob'] * 10) + (df_res['score'] * 5)
+    top_horse = df_res.sort_values("score", ascending=False).iloc[0]
+    ana_horse = df_res.sort_values("expected_val", ascending=False).iloc[0]
+
+    col_h1, col_h2 = st.columns(2)
+    with col_h1:
+        st.markdown(f"""<div class='main-card'>
+            <small>◎ AI本命推奨</small>
+            <h2 style='color:white;margin:0;'>{top_horse['馬名']} ({top_horse['馬番']})</h2>
+            <p style='margin:0;'>AIスコア: {top_horse['score']:.3f} / 勝率: {top_horse['win_prob']*100:.1f}%</p>
+        </div>""", unsafe_allow_html=True)
+    
+    with col_h2:
+        st.markdown(f"""<div class='ana-card'>
+            <small>🔥 期待値NO.1 (穴馬)</small>
+            <h2 style='color:white;margin:0;'>{ana_horse['馬名']} ({ana_horse['馬番']})</h2>
+            <p style='margin:0;'>展開・妙味スコア: {ana_horse['expected_val']:.2f}</p>
+        </div>""", unsafe_allow_html=True)
+
+    # 脚質分布グラフ (Plotlyを使わず標準Bar Chartを使用)
+    st.subheader("📊 脚質別勢力図 (AIスコア合計)")
+    kyakushitsu_score = df_res.groupby('脚質')['score'].sum()
+    st.bar_chart(kyakushitsu_score)
+\n\ndef render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
     st.markdown("""
     <style>
     .nk-card{border:1px solid #dbe7f5;border-radius:16px;padding:16px 18px;background:#ffffff;}
@@ -3780,4 +3834,9 @@ if st.session_state.get("prediction_ready") and st.session_state.get("race_df_st
 # 17. 単勝/複勝以外のEV推定
 # 18. API化
 # 19. Reactフロント連携
-# 20. モバイル最適化
+# 20. モバイル最適化\nimport base64
+st.sidebar.markdown("---")
+if st.sidebar.button("最新版ソースを生成"):
+    b64 = base64.b64encode(open(__file__, "rb").read()).decode()
+    href = f'<a href="data:file/python;base64,{b64}" download="nyanko_keiba_ai_v3_final.py">ここをクリックしてダウンロード</a>'
+    st.sidebar.markdown(href, unsafe_allow_html=True)

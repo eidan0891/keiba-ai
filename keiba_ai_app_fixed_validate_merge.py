@@ -13,13 +13,10 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.support.ui import WebDriverWait
-    SELENIUM_AVAILABLE = True
-except Exception:
-    SELENIUM_AVAILABLE = False
+SELENIUM_AVAILABLE = False
+webdriver = None
+Options = None
+WebDriverWait = None
 
 
 # ============================================================
@@ -310,23 +307,18 @@ def last_corner(x: Any) -> float:
 def infer_running_style_from_history(passings: Iterable[Any], field_size: Any) -> str:
     if pd.isna(field_size) or field_size is None or field_size <= 0:
         return "不明"
-
-    ratios: List[float] = []
+    last_positions: List[float] = []
     for p in passings:
-        nums = parse_passing_positions(p)
-        if nums:
-            eff_field = max(float(field_size), float(max(nums)))
-            ratios.append(float(nums[-1]) / eff_field)
-
-    if not ratios:
+        pos = last_corner(p)
+        if not pd.isna(pos):
+            last_positions.append(float(pos))
+    if not last_positions:
         return "不明"
-
-    avg_ratio = float(np.mean(ratios))
-    if avg_ratio <= 0.18:
-        return "逃げ"
-    if avg_ratio <= 0.42:
+    avg_last = float(np.mean(last_positions))
+    rate = avg_last / float(field_size)
+    if rate <= 0.33:
         return "先行"
-    if avg_ratio <= 0.68:
+    if rate <= 0.66:
         return "中団"
     return "差し"
 
@@ -584,8 +576,7 @@ class Scraper:
         return resp.text
 
     def _selenium_html(self, url: str) -> str:
-        if not SELENIUM_AVAILABLE:
-            raise RuntimeError("Seleniumが利用できません")
+        raise RuntimeError("Seleniumは強制的に無効化されています")
         options = Options()
         options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
@@ -619,13 +610,10 @@ class Scraper:
             driver.quit()
 
     def _try_requests_then_selenium(self, url: str) -> str:
-        try:
-            html = self._requests_html(url)
-            if "<table" in html.lower():
-                return html
-        except Exception:
-            pass
-        return self._selenium_html(url)
+        html = self._requests_html(url)
+        if "<table" in html.lower():
+            return html
+        raise RuntimeError("Seleniumは無効です。requestsでテーブルを取得できませんでした。")
 
 
 # ============================================================
@@ -1088,21 +1076,8 @@ def parse_horse_history(scraper: Scraper, horse_name: str, horse_url: str, max_r
             last3f_cnt = ndf["last3f"].apply(to_float).notna().sum() if "last3f" in ndf.columns else 0
             odds_cnt = ndf["odds"].apply(to_float).notna().sum() if "odds" in ndf.columns else 0
             pop_cnt = ndf["popularity"].apply(to_int).notna().sum() if "popularity" in ndf.columns else 0
-            passing_cnt = ndf["passing"].astype(str).str.contains(r"\d+-\d+|\d+", regex=True, na=False).sum() if "passing" in ndf.columns else 0
-
-            bonus = 0
-            if finish_cnt >= 5:
-                bonus += 40
-            if passing_cnt >= 5:
-                bonus += 30
-            if last3f_cnt >= 5:
-                bonus += 20
-            if odds_cnt >= 5:
-                bonus += 10
-            if pop_cnt >= 5:
-                bonus += 10
-
-            score = bonus + finish_cnt * 6 + dist_cnt * 2 + last3f_cnt * 3 + odds_cnt * 2 + pop_cnt * 2 + passing_cnt * 5
+            passing_cnt = ndf["passing"].astype(str).str.contains(r"\d", regex=True, na=False).sum() if "passing" in ndf.columns else 0
+            score = finish_cnt * 10 + dist_cnt * 5 + last3f_cnt * 5 + odds_cnt * 3 + pop_cnt * 3 + passing_cnt * 4
             if score > best_score:
                 best = ndf
                 best_score = score
@@ -1234,7 +1209,6 @@ def build_features(hist: pd.DataFrame, recent_n: int = 10) -> pd.DataFrame:
                 "median_finish": f_all.median() if len(f_all) else np.nan,
                 "last3f_avg": l3f3.mean() if len(l3f3) else np.nan,
                 "corner_avg": c3.mean() if len(c3) else np.nan,
-                "last_passing": clean_text(r3["passing"].iloc[0]) if "passing" in r3.columns and len(r3) else "",
                 "auto_running_style": infer_running_style_from_history(r3["passing"].tolist() if "passing" in r3.columns else [], 18),
                 "hist_odds_avg": o3.mean() if len(o3) else np.nan,
                 "hist_pop_avg": p3.mean() if len(p3) else np.nan,
@@ -1256,7 +1230,6 @@ def build_features(hist: pd.DataFrame, recent_n: int = 10) -> pd.DataFrame:
         "median_finish",
         "last3f_avg",
         "corner_avg",
-        "last_passing",
         "auto_running_style",
         "hist_odds_avg",
         "hist_pop_avg",
@@ -1410,7 +1383,18 @@ def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10) -> 
     else:
         df["ana_score"] = df["gap"]
 
-    df = df.sort_values(["ai_score", "win_prob"], ascending=False).reset_index(drop=True)
+    df["ai_rank_score"] = pd.to_numeric(df["ai_score"], errors="coerce").rank(pct=True).fillna(0)
+    market_base = pd.to_numeric(df["market_prob"], errors="coerce")
+    if market_base.notna().sum() == 0:
+        market_base = pd.to_numeric(df["win_prob"], errors="coerce")
+
+    df["stable_score"] = (
+        df["ai_rank_score"] * 0.78
+        + pd.to_numeric(df["win_prob"], errors="coerce").fillna(0) * 0.12
+        + market_base.fillna(0) * 0.10
+    )
+
+    df = df.sort_values(["stable_score", "ai_score", "win_prob"], ascending=False).reset_index(drop=True)
     marks = ["◎", "○", "▲", "△", "☆"]
     df["mark"] = ""
     for i, m in enumerate(marks):
@@ -1418,7 +1402,7 @@ def analyze_race(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int = 10) -> 
             df.loc[i, "mark"] = m
 
     top = df.head(min(12, len(df))).copy()
-    honmei = df.sort_values(["win_prob", "ai_score"], ascending=False).head(3).copy()
+    honmei = df.sort_values(["stable_score", "ai_score", "win_prob"], ascending=False).head(3).copy()
     ana = df.sort_values(["ana_score", "gap"], ascending=False).head(8).copy()
     return df, top, honmei, ana, odds_valid
 
@@ -1948,7 +1932,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
 
     df = apply_style_ground_pace_adjustments(df)
 
-    display_cols = ["mark", "horse_no", "frame_no", "horse_name", "last_passing", "running_style", "ai_score", "win_prob", "place_prob", "ana_score"]
+    display_cols = ["mark", "horse_no", "frame_no", "horse_name", "running_style", "ai_score", "win_prob", "place_prob", "ana_score"]
     if odds_valid:
         display_cols += ["odds_f", "ev_tansho"]
     if "pop_f" in df.columns:
@@ -1974,7 +1958,6 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
         st.warning("騎手スコアが存在しません（取得失敗 or 未反映）")
 
     st.subheader("総合ランキング")
-    st.caption("前走通過(last_passing)と自動判定した脚質(running_style)を表示")
     editor_df = df[display_cols].copy()
     style_key = "manual_running_style_map"
     if style_key not in st.session_state:
@@ -2030,7 +2013,7 @@ def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_co
 
     top = df.head(min(ticket_head_count, len(df))).copy()
     ana = df.sort_values(["ana_score", "gap"], ascending=False).head(ana_count).copy()
-    honmei = df.sort_values(["win_prob", "ai_score"], ascending=False).head(3).copy()
+    honmei = df.sort_values(["stable_score", "ai_score", "win_prob"], ascending=False).head(3).copy()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("出走頭数", len(race))

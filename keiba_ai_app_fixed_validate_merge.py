@@ -5,7 +5,7 @@ import json
 from datetime import datetime, date, timedelta
 from urllib.parse import urljoin, urlparse, parse_qs
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple, Any, Iterable
+from typing import Dict, List, Optional, Tuple, Any, Iterable, Iterable
 from pathlib import Path
 from itertools import combinations, permutations
 from collections import defaultdict
@@ -38,13 +38,19 @@ try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.support.ui import WebDriverWait
-    SELENIUM_AVAILABLE = False
+    SELENIUM_AVAILABLE = True
 except Exception:
     webdriver = None
     Options = None
     WebDriverWait = None
     SELENIUM_AVAILABLE = False
 
+
+# iPad / Streamlit Cloud 安定化: Seleniumは使わない
+webdriver = None
+Options = None
+WebDriverWait = None
+SELENIUM_AVAILABLE = False
 # ===== 安定化デフォルト =====
 REQUEST_TIMEOUT = 10
 REQUEST_SLEEP = 1.0
@@ -1319,13 +1325,14 @@ class Scraper:
         self.sleep_sec = sleep_sec
 
     def get_html(self, url: str) -> str:
-        # 地方競馬(NAR)は requests 側で文字化け・壊れHTMLになりやすいので常に Selenium で取得
+        # iPad / Streamlit Cloudでは Selenium を使わない。NARもrequestsで取得を試す。
         if "nar.netkeiba.com" in url:
-            if SELENIUM_AVAILABLE:
-                html = self._selenium_html(url)
+            try:
+                html = self._requests_html(url)
                 time.sleep(self.sleep_sec)
                 return html
-            raise RuntimeError("地方競馬ページは Selenium が必要です")
+            except Exception:
+                return ""
 
         try:
             html = self._requests_html(url)
@@ -1345,45 +1352,17 @@ class Scraper:
 
 
     def _requests_html(self, url: str) -> str:
-        resp = self.session.get(url, timeout=self.timeout)
-        resp.raise_for_status()
-        return decode_response_html(resp, url)
+        try:
+            resp = self.session.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            return decode_response_html(resp, url)
+        except Exception:
+            return ""
 
 
     def _selenium_html(self, url: str) -> str:
-        if not SELENIUM_AVAILABLE:
-            raise RuntimeError("Seleniumが利用できません")
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1600,2600")
-        options.add_argument(
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        driver = webdriver.Chrome(options=options)
-        try:
-            driver.get(url)
+        return ""
 
-            def ready(d):
-                html = d.page_source
-                return (
-                    "<table" in html.lower()
-                    and (
-                        "/horse/" in html
-                        or "着順" in html
-                        or "上り" in html
-                        or "上がり" in html
-                        or "馬番" in html
-                    )
-                )
-
-            WebDriverWait(driver, self.timeout).until(ready)
-            return driver.page_source
-        finally:
-            driver.quit()
 
     def _try_requests_then_selenium(self, url: str) -> str:
         try:
@@ -1485,6 +1464,8 @@ def dedupe_race_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_race_card_jra(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
     html = scraper.get_html(race_url)
+    if not html:
+        return []
     soup = BeautifulSoup(html, "lxml")
     meta = parse_race_meta(soup, race_url)
 
@@ -1596,6 +1577,8 @@ def parse_race_card_jra(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
 
 def parse_race_card_nar(scraper: Scraper, race_url: str) -> List[RaceCardRow]:
     html = scraper.get_html(race_url)
+    if not html:
+        return []
     soup = BeautifulSoup(html, "lxml")
     meta = parse_race_meta(soup, race_url)
 

@@ -38,7 +38,7 @@ try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.support.ui import WebDriverWait
-    SELENIUM_AVAILABLE = True
+    SELENIUM_AVAILABLE = False
 except Exception:
     webdriver = None
     Options = None

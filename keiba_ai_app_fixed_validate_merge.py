@@ -1,3 +1,42 @@
+
+def safe_numeric(df, col):
+    """
+    必ず df と同じ長さの 1次元 Series を返す。
+    - 列なし
+    - 同名列重複で DataFrame になる
+    - scalar / None
+    - 長さ不一致
+    を全部吸収する。
+    """
+    n = len(df)
+
+    if col not in df.columns:
+        return pd.Series([None] * n, index=df.index)
+
+    val = df[col]
+
+    # 同名列が重複して df[col] がDataFrameになる場合は先頭列だけ使う
+    if isinstance(val, pd.DataFrame):
+        if val.shape[1] == 0:
+            return pd.Series([None] * n, index=df.index)
+        val = val.iloc[:, 0]
+
+    # Series以外なら同じ長さに拡張
+    if not isinstance(val, pd.Series):
+        val = pd.Series([val] * n, index=df.index)
+
+    # indexと長さを必ず合わせる
+    if len(val) != n:
+        val = pd.Series(list(val)[:n] + [None] * max(0, n - len(val)), index=df.index)
+    else:
+        val = pd.Series(val.to_numpy(), index=df.index)
+
+    try:
+        return pd.to_numeric(val, errors="coerce")
+    except Exception:
+        return pd.Series([None] * n, index=df.index)
+
+from pathlib import Path
 import io
 import os
 import re
@@ -112,7 +151,7 @@ def _prep_adv_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["win_prob", "place_prob", "gap", "ana_score", "odds_f", "pop_f", "top5_prob"]:
         if col not in work.columns:
             work[col] = 0.0
-        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+        work[col] = safe_numeric(work, col).to_numpy().fillna(0.0)
     if "running_style" not in work.columns:
         work["running_style"] = "不明"
     if "horse_no" not in work.columns:
@@ -190,12 +229,25 @@ def build_trifecta_table_strong(top_df: pd.DataFrame, limit: int = 100) -> pd.Da
 
 def _normalize_training_df(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
+
+    # MultiIndex / 重複列対策
+    if isinstance(work.columns, pd.MultiIndex):
+        work.columns = [
+            "_".join([str(x) for x in col if str(x) and str(x) != "nan"]).strip("_")
+            for col in work.columns
+        ]
+
+    work.columns = [str(c).strip() for c in work.columns]
+
+    # 列名変換前に完全重複を落とす
+    work = work.loc[:, ~pd.Index(work.columns).duplicated(keep="first")].copy()
+
     ren = {}
-    for c in work.columns:
+    for c in list(work.columns):
         s = str(c).strip()
         if s in ["着順", "rank"]:
             ren[c] = "rank"
-        elif s in ["人気", "pop", "pop_f"]:
+        elif s in ["人気", "pop", "pop_f", "popularity"]:
             ren[c] = "pop"
         elif s in ["オッズ", "odds", "odds_f"]:
             ren[c] = "odds"
@@ -205,17 +257,36 @@ def _normalize_training_df(df: pd.DataFrame) -> pd.DataFrame:
             ren[c] = "ground"
         elif s in ["天候", "weather"]:
             ren[c] = "weather"
+
     work = work.rename(columns=ren)
+
+    # rename後に odds と odds_f 等が同名化して重複するケースを潰す
+    work = work.loc[:, ~pd.Index(work.columns).duplicated(keep="first")].copy()
+
+    # ここが今回の本丸：必ず1次元配列で代入する
     for col in ["rank", "pop", "odds", "last3f"]:
-        if col not in work.columns:
-            work[col] = np.nan
-        work[col] = pd.to_numeric(work[col], errors="coerce")
+        s = safe_numeric(work, col)
+        work[col] = s.to_numpy()
+
     if "ground" not in work.columns:
         work["ground"] = ""
     if "weather" not in work.columns:
         work["weather"] = ""
-    work["ground_code"] = work["ground"].astype(str).map({"良": 0, "稍重": 1, "重": 2, "不良": 3}).fillna(0)
-    work["weather_code"] = work["weather"].astype(str).map({"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}).fillna(0)
+
+    # 念のため、ここもDataFrame化を吸収
+    if isinstance(work["ground"], pd.DataFrame):
+        work["ground"] = work["ground"].iloc[:, 0].to_numpy()
+    if isinstance(work["weather"], pd.DataFrame):
+        work["weather"] = work["weather"].iloc[:, 0].to_numpy()
+
+    work["ground_code"] = work["ground"].astype(str).map(
+        {"良": 0, "稍重": 1, "重": 2, "不良": 3}
+    ).fillna(0)
+
+    work["weather_code"] = work["weather"].astype(str).map(
+        {"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}
+    ).fillna(0)
+
     return work
 
 
@@ -3166,61 +3237,7 @@ def estimate_topn_probs(df: pd.DataFrame, n_sim: int = 3000, top_n_list: List[in
     return out
 
 
-
-def render_enhanced_header(df_res):
-    # CSS定義（標準機能のみでカードを再現）
-    st.markdown("""
-        <style>
-        .stMetric {
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        }
-        .main-card {
-            background: linear-gradient(135deg, #1e90ff, #00bfff);
-            color: white;
-            padding: 20px;
-            border-radius: 15px;
-            margin-bottom: 20px;
-        }
-        .ana-card {
-            background: linear-gradient(135deg, #ff4500, #ff8c00);
-            color: white;
-            padding: 20px;
-            border-radius: 15px;
-            margin-bottom: 20px;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    st.header("🌟 AI予想エグゼクティブ・サマリー")
-    
-    # 期待値計算 (簡易版: スコアと勝率から算出)
-    df_res['expected_val'] = (df_res['win_prob'] * 10) + (df_res['score'] * 5)
-    top_horse = df_res.sort_values("score", ascending=False).iloc[0]
-    ana_horse = df_res.sort_values("expected_val", ascending=False).iloc[0]
-
-    col_h1, col_h2 = st.columns(2)
-    with col_h1:
-        st.markdown(f"""<div class='main-card'>
-            <small>◎ AI本命推奨</small>
-            <h2 style='color:white;margin:0;'>{top_horse['馬名']} ({top_horse['馬番']})</h2>
-            <p style='margin:0;'>AIスコア: {top_horse['score']:.3f} / 勝率: {top_horse['win_prob']*100:.1f}%</p>
-        </div>""", unsafe_allow_html=True)
-    
-    with col_h2:
-        st.markdown(f"""<div class='ana-card'>
-            <small>🔥 期待値NO.1 (穴馬)</small>
-            <h2 style='color:white;margin:0;'>{ana_horse['馬名']} ({ana_horse['馬番']})</h2>
-            <p style='margin:0;'>展開・妙味スコア: {ana_horse['expected_val']:.2f}</p>
-        </div>""", unsafe_allow_html=True)
-
-    # 脚質分布グラフ (Plotlyを使わず標準Bar Chartを使用)
-    st.subheader("📊 脚質別勢力図 (AIスコア合計)")
-    kyakushitsu_score = df_res.groupby('脚質')['score'].sum()
-    st.bar_chart(kyakushitsu_score)
-\n\ndef render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
+def render_results(race: pd.DataFrame, hist: pd.DataFrame, recent_n: int, ana_count: int, ticket_head_count: int, wide_count: int, umaren_count: int, trio_count: int, trifecta_count: int) -> None:
     st.markdown("""
     <style>
     .nk-card{border:1px solid #dbe7f5;border-radius:16px;padding:16px 18px;background:#ffffff;}
@@ -3233,6 +3250,9 @@ def render_enhanced_header(df_res):
     </style>
     """, unsafe_allow_html=True)
     st.markdown('<div class="nk-title">🐾 にゃんこ競馬予想AI 🐱</div><div class="nk-sub">データ分析 × AI予想で勝率アップ！</div>', unsafe_allow_html=True)
+    if st.session_state.get("model_just_trained", False):
+        st.success("学習済みモデルを反映して再予想済みです。")
+        st.session_state["model_just_trained"] = False
 
     use_jockey_score = st.session_state.get("rr_use_jockey_score", st.session_state.get("sb_use_jockey_score", True))
     model_bundle = None
@@ -3441,7 +3461,7 @@ def render_enhanced_header(df_res):
     cta5.button("馬券推奨を見る", use_container_width=True)
 
     try:
-        model_bundle = load_trained_models()
+        model_bundle = load_trained_models(model_dir=st.session_state.get("trained_model_dir", "models"))
     except Exception:
         model_bundle = None
     df = apply_trained_models_to_prediction_df(df, model_bundle)
@@ -3544,15 +3564,36 @@ def render_enhanced_header(df_res):
                     raise ValueError("学習用CSVを選択してください。")
                 train_df = load_csv_upload(train_file)
                 model_paths = train_odds_linked_models(train_df, model_dir=model_dir)
-                st.success(f"学習完了: {model_paths['top3_model']}")
+
+                # 学習済みモデルの保存先を予想側でも使う
+                st.session_state["trained_model_dir"] = model_dir
+                st.session_state["model_just_trained"] = True
+
+                # 既に予想データがある場合は自動で再計算させる
+                if st.session_state.get("race_df_store") is not None and st.session_state.get("hist_df_store") is not None:
+                    st.session_state["prediction_ready"] = True
+                    st.success("学習完了。学習済みモデルを読み込んで自動再予想します。")
+                    st.rerun()
+                else:
+                    st.success(f"学習完了: {model_paths['top3_model']}。予想データを取得すると自動反映されます。")
             except Exception as e:
                 st.error(f"学習エラー: {e}")
+
         if c_train2.button("保存済みモデル確認", use_container_width=True, key="check_training_button"):
+            st.session_state["trained_model_dir"] = model_dir
             bundle = load_trained_models(model_dir=model_dir)
             if bundle is None:
                 st.warning("保存済みモデルはありません。")
             else:
                 st.success("保存済みモデルを検出しました。次回予想に反映されます。")
+
+        if st.button("学習済みモデルで再予想", use_container_width=True, key="rerun_prediction_after_training"):
+            if st.session_state.get("race_df_store") is not None and st.session_state.get("hist_df_store") is not None:
+                st.session_state["trained_model_dir"] = model_dir
+                st.session_state["prediction_ready"] = True
+                st.rerun()
+            else:
+                st.warning("先に出馬表を取得、またはCSVを読み込んで予想してください。")
 
     st.session_state["latest_prediction_df"] = df.copy()
     st.session_state["latest_ticket_tables"] = {
@@ -3834,9 +3875,4 @@ if st.session_state.get("prediction_ready") and st.session_state.get("race_df_st
 # 17. 単勝/複勝以外のEV推定
 # 18. API化
 # 19. Reactフロント連携
-# 20. モバイル最適化\nimport base64
-st.sidebar.markdown("---")
-if st.sidebar.button("最新版ソースを生成"):
-    b64 = base64.b64encode(open(__file__, "rb").read()).decode()
-    href = f'<a href="data:file/python;base64,{b64}" download="nyanko_keiba_ai_v3_final.py">ここをクリックしてダウンロード</a>'
-    st.sidebar.markdown(href, unsafe_allow_html=True)
+# 20. モバイル最適化

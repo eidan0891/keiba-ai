@@ -10,7 +10,7 @@
 # - 簡易CSVテンプレから実在馬名を削除
 #
 # 実行:
-#   python -m streamlit run nyanko_keiba_ipad_cloud_20260428.py
+#   python -m streamlit run nyanko_keiba_ipad_cloud_20260428_target_pkl_fixed.py
 # ------------------------------------------------------------
 
 import io
@@ -322,6 +322,151 @@ def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.Dat
     return clean_types(df)
 
 
+
+# ------------------------------------------------------------
+# PKL内TARGETデータから事前成績を復元する補修
+# ------------------------------------------------------------
+def normalize_text_key(x):
+    if pd.isna(x):
+        return ""
+    return str(x).replace("\u3000", " ").strip().replace(" ", "")
+
+
+def flatten_bundle_dataframes(obj, prefix="pkl", seen=None):
+    if seen is None:
+        seen = set()
+    out = []
+    if obj is None:
+        return out
+    oid = id(obj)
+    if oid in seen:
+        return out
+    seen.add(oid)
+    if isinstance(obj, pd.DataFrame):
+        return [(prefix, obj)]
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.extend(flatten_bundle_dataframes(v, f"{prefix}.{k}", seen))
+        return out
+    if isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            out.extend(flatten_bundle_dataframes(v, f"{prefix}[{i}]", seen))
+        return out
+    if hasattr(obj, "__dict__"):
+        for k, v in obj.__dict__.items():
+            if isinstance(v, pd.DataFrame):
+                out.append((f"{prefix}.{k}", v))
+            elif isinstance(v, dict):
+                for kk, vv in v.items():
+                    if isinstance(vv, pd.DataFrame):
+                        out.append((f"{prefix}.{k}.{kk}", vv))
+    return out
+
+
+def normalize_history_df_for_priors(src: pd.DataFrame) -> pd.DataFrame:
+    df = src.copy()
+    if df.shape[1] >= 52 and not any(c in df.columns for c in ["horse_name", "馬名"]):
+        df = df.iloc[:, :52].copy()
+        df.columns = COLS_52
+    rename = {
+        "馬名": "horse_name", "騎手": "jockey", "調教師": "trainer", "種牡馬": "sire",
+        "母": "dam", "母父": "broodmare_sire", "距離": "distance", "芝ダ": "track_type",
+        "馬場": "going", "競馬場": "place", "着順": "finish", "人気": "popularity",
+        "オッズ": "odds", "年": "year", "月": "month", "日": "day", "R": "race_no",
+        "レース番号": "race_no", "馬番": "horse_no", "枠番": "frame_no", "頭数": "field_size",
+        "通過1": "pass1", "通過2": "pass2", "通過3": "pass3", "通過4": "pass4",
+        "上がり3F": "last3f", "horse": "horse_name", "jockey_name": "jockey",
+        "trainer_name": "trainer", "sire_name": "sire",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    if "finish" not in df.columns:
+        return pd.DataFrame()
+    if not any(c in df.columns for c in ["horse_name", "jockey", "trainer", "sire"]):
+        return pd.DataFrame()
+    for c in ["year", "month", "day", "race_no", "distance", "finish", "horse_no", "frame_no", "field_size", "odds", "popularity", "pass1", "pass2", "pass3", "pass4", "last3f"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "date_int" not in df.columns:
+        if all(c in df.columns for c in ["year", "month", "day"]):
+            y = pd.to_numeric(df["year"], errors="coerce").fillna(0)
+            y = y.apply(lambda x: int(x) + 2000 if int(x) < 100 and int(x) > 0 else int(x))
+            df["date_int"] = y * 10000 + pd.to_numeric(df["month"], errors="coerce").fillna(0).astype(int) * 100 + pd.to_numeric(df["day"], errors="coerce").fillna(0).astype(int)
+        else:
+            df["date_int"] = 0
+    for c in ["horse_name", "jockey", "trainer", "sire", "track_type", "place"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c + "_key"] = df[c].map(normalize_text_key)
+    df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
+    df = df[df["finish"].notna()].copy()
+    df = df[df["finish"] > 0].copy()
+    df["is_win"] = df["finish"].eq(1)
+    df["is_top3"] = df["finish"].between(1, 3)
+    return df
+
+
+def build_rate_table(hist: pd.DataFrame, key_cols, prefix: str) -> pd.DataFrame:
+    if hist.empty or any(c not in hist.columns for c in key_cols):
+        return pd.DataFrame()
+    g = hist.groupby(key_cols, dropna=False).agg(runs=("finish", "count"), wins=("is_win", "sum"), top3=("is_top3", "sum")).reset_index()
+    g[f"{prefix}_runs_prior"] = g["runs"].astype(float)
+    g[f"{prefix}_win_rate_prior"] = (g["wins"] / g["runs"]).fillna(0.0)
+    g[f"{prefix}_top3_rate_prior"] = (g["top3"] / g["runs"]).fillna(0.0)
+    return g.drop(columns=["runs", "wins", "top3"])
+
+
+def add_target_priors_from_pkl(bundle, df: pd.DataFrame):
+    base = df.copy()
+    debug = []
+    for c in ["horse_name", "jockey", "trainer", "sire", "track_type", "place"]:
+        if c not in base.columns:
+            base[c] = ""
+        base[c + "_key"] = base[c].map(normalize_text_key)
+    if "distance" not in base.columns:
+        base["distance"] = 0
+    base["distance"] = pd.to_numeric(base["distance"], errors="coerce").fillna(0)
+
+    frames = flatten_bundle_dataframes(bundle)
+    hist_list = []
+    for name, f in frames:
+        h = normalize_history_df_for_priors(f)
+        if not h.empty and len(h) >= 10:
+            hist_list.append(h)
+            debug.append(f"{name}: {len(h)}行")
+
+    if not hist_list:
+        base.attrs["pkl_prior_debug"] = "PKL内にTARGET過去成績DataFrameを検出できず。0%表示のまま。"
+        return add_prior_stats_for_prediction(base)
+
+    hist = pd.concat(hist_list, ignore_index=True, sort=False).drop_duplicates()
+    if "date_int" in base.columns and base["date_int"].notna().any():
+        min_pred_date = pd.to_numeric(base["date_int"], errors="coerce").min()
+        if pd.notna(min_pred_date) and min_pred_date > 0:
+            old = hist[pd.to_numeric(hist["date_int"], errors="coerce").fillna(0) < min_pred_date].copy()
+            if not old.empty:
+                hist = old
+
+    for keys, prefix in [
+        (["jockey_key"], "jockey"),
+        (["trainer_key"], "trainer"),
+        (["sire_key"], "sire"),
+        (["horse_name_key"], "horse"),
+        (["horse_name_key", "distance"], "horse_distance"),
+        (["horse_name_key", "track_type_key"], "horse_track"),
+    ]:
+        tbl = build_rate_table(hist, keys, prefix)
+        if not tbl.empty:
+            base = base.merge(tbl, on=keys, how="left")
+
+    base = add_prior_stats_for_prediction(base)
+    nonzero = {}
+    for c in ["jockey_top3_rate_prior", "trainer_top3_rate_prior", "sire_top3_rate_prior", "horse_distance_top3_rate_prior"]:
+        if c in base.columns:
+            nonzero[c] = int((pd.to_numeric(base[c], errors="coerce").fillna(0) > 0).sum())
+    base.attrs["pkl_prior_debug"] = " / ".join(debug[:5]) + f" / 非ゼロ件数: {nonzero}"
+    return base
+
+
 def add_prior_stats_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -387,7 +532,7 @@ def get_pipeline_and_features(bundle):
 
 
 def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
-    df = add_prior_stats_for_prediction(df)
+    df = add_target_priors_from_pkl(bundle, df)
     df = add_running_style(df)
     pipe, feature_cols = get_pipeline_and_features(bundle)
 
@@ -1163,6 +1308,9 @@ def app_main():
                 pred_src = read_simple_csv_to_52(raw, uploaded_csv.name)
 
             pred_df = predict(bundle, pred_src)
+            prior_debug = pred_df.attrs.get("pkl_prior_debug", "")
+            if prior_debug:
+                st.info(f"PKL/TARGETデータ連携: {prior_debug}")
 
             st.subheader("予想結果")
             race_options = (

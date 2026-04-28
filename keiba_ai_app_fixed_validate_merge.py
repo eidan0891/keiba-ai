@@ -22,6 +22,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import joblib  # ←これ追加
+
+model = joblib.load("models/nyanko_keiba_top3_model.pkl")
 
 st.set_page_config(
     page_title="にゃんこ競馬AI",

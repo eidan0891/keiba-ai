@@ -16,15 +16,12 @@
 # ------------------------------------------------------------
 
 import io
-import pickle
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import joblib  # ←これ追加
-
-model = joblib.load("models/nyanko_keiba_top3_model.pkl")
+import joblib
 
 st.set_page_config(
     page_title="にゃんこ競馬AI",
@@ -32,7 +29,7 @@ st.set_page_config(
     layout="wide"
 )
 
-MODEL_PATH = Path("models/nyanko_keiba_top3_model.pkl")
+MODEL_PATH = Path(__file__).parent / "models" / "nyanko_keiba_top3_model.pkl"
 
 COLS_52 = [
     "year", "month", "day", "kai", "place", "nichiji", "race_no", "race_name",
@@ -109,6 +106,77 @@ CAT_FEATURES = [
     "place", "race_name", "track_type", "going", "sex", "jockey", "trainer",
     "belonging", "sire", "dam", "broodmare_sire"
 ]
+
+
+
+def repair_simple_imputer(obj):
+    """
+    scikit-learnのバージョン差で出る
+    'SimpleImputer' object has no attribute '_fill_dtype'
+    を回避するため、モデル内のSimpleImputerを再帰的に補修する。
+    """
+    seen = set()
+
+    def walk(x):
+        if x is None:
+            return
+        obj_id = id(x)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        if x.__class__.__name__ == "SimpleImputer":
+            if not hasattr(x, "_fill_dtype"):
+                stat = getattr(x, "statistics_", None)
+                if stat is not None:
+                    try:
+                        x._fill_dtype = stat.dtype
+                    except Exception:
+                        x._fill_dtype = np.dtype("float64")
+                else:
+                    x._fill_dtype = np.dtype("float64")
+
+        # Pipeline / ColumnTransformer / Voting / Stacking系
+        for attr in ("steps", "transformers", "transformers_", "estimators", "estimators_"):
+            if hasattr(x, attr):
+                try:
+                    for item in getattr(x, attr):
+                        if isinstance(item, tuple):
+                            for v in item:
+                                if hasattr(v, "__dict__"):
+                                    walk(v)
+                        elif hasattr(item, "__dict__"):
+                            walk(item)
+                except Exception:
+                    pass
+
+        # その他の内部属性も一応見る
+        if hasattr(x, "__dict__"):
+            for v in x.__dict__.values():
+                if hasattr(v, "__dict__"):
+                    walk(v)
+                elif isinstance(v, (list, tuple, set)):
+                    for i in v:
+                        if hasattr(i, "__dict__"):
+                            walk(i)
+                elif isinstance(v, dict):
+                    for i in v.values():
+                        if hasattr(i, "__dict__"):
+                            walk(i)
+
+    walk(obj)
+    return obj
+
+
+@st.cache_resource(show_spinner=False)
+def load_pkl_from_path(path: Path):
+    loaded = joblib.load(path)
+    return repair_simple_imputer(loaded)
+
+
+def load_pkl_from_upload(uploaded_file):
+    loaded = joblib.load(uploaded_file)
+    return repair_simple_imputer(loaded)
 
 
 def read_csv_bytes(raw: bytes) -> pd.DataFrame:
@@ -231,7 +299,14 @@ def read_simple_csv_to_52(raw: bytes) -> pd.DataFrame:
         rows.append([row[c] for c in COLS_52])
 
     df = pd.DataFrame(rows, columns=COLS_52)
-    df["source_file"] = "simple_csv"
+    # 簡易CSVは1ファイル内のレース番号・競馬場で分ける。
+    # 全部 simple_csv 固定だと、同じ日付/競馬場/R番号のデータが混ざる可能性があるため。
+    df["source_file"] = (
+        "simple_"
+        + df["place"].astype(str) + "_"
+        + df["race_no"].astype(str) + "_"
+        + df["race_name"].astype(str)
+    )
     return clean_types(df)
 
 
@@ -251,10 +326,17 @@ def clean_types(df: pd.DataFrame) -> pd.DataFrame:
         + df["day"].fillna(0).astype(int)
     )
 
+    # レース識別キー。
+    # 同じ日付・競馬場・R番号のCSVを複数読むと混ざるため、source_fileも含める。
+    # source_fileが無い場合は空で補完。
+    if "source_file" not in df.columns:
+        df["source_file"] = ""
+
     df["race_key"] = (
         df["date_int"].astype(str) + "_"
         + df["place"].astype(str) + "_"
-        + df["race_no"].fillna(0).astype(int).astype(str).str.zfill(2)
+        + df["race_no"].fillna(0).astype(int).astype(str).str.zfill(2) + "_"
+        + df["source_file"].astype(str).replace({"": "no_source"})
     )
 
     return df
@@ -303,21 +385,37 @@ def add_prior_stats_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_model(uploaded_model):
-    if uploaded_model is not None:
-        return pickle.loads(uploaded_model.read()), "アップロードPKL"
+    """PKLを安全に読み込む。Git同梱PKL優先、画面アップロードにも対応。"""
+    try:
+        if uploaded_model is not None:
+            return load_pkl_from_upload(uploaded_model), "アップロードPKL"
 
-    if MODEL_PATH.exists():
-        with open(MODEL_PATH, "rb") as f:
-            return pickle.load(f), "同梱PKL"
+        if MODEL_PATH.exists():
+            return load_pkl_from_path(MODEL_PATH), "同梱PKL"
 
-    return None, "未設定"
+        return None, "未設定"
+    except Exception as e:
+        st.error(f"モデル読込エラー: {e}")
+        return None, "読込失敗"
 
 
 def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
     df = add_prior_stats_for_prediction(df)
 
-    feature_cols = bundle.get("feature_cols", BASE_NUM_FEATURES + CAT_FEATURES)
-    pipe = bundle["pipeline"]
+    # PKLが {"pipeline": ..., "feature_cols": ...} 形式でも、pipeline単体でも動くようにする
+    if isinstance(bundle, dict):
+        feature_cols = bundle.get("feature_cols", BASE_NUM_FEATURES + CAT_FEATURES)
+        pipe = bundle.get("pipeline") or bundle.get("model")
+    else:
+        feature_cols = BASE_NUM_FEATURES + CAT_FEATURES
+        pipe = bundle
+
+    if pipe is None:
+        raise ValueError("PKL内に pipeline / model が見つかりません。")
+
+    missing_features = [c for c in feature_cols if c not in df.columns]
+    if missing_features:
+        raise ValueError(f"特徴量列が不足しています: {missing_features}")
 
     prob = pipe.predict_proba(df[feature_cols])[:, 1]
     df["ml_top3_prob"] = prob
@@ -345,6 +443,27 @@ def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
         if c in out.columns:
             out[c] = (out[c] * 100).round(1).astype(str) + "%"
     return out.rename(columns=JP_COLUMNS)
+
+
+def race_label(df: pd.DataFrame, key: str) -> str:
+    """selectbox表示用。race_keyそのままだと長いので日本語っぽく表示。"""
+    r = df[df["race_key"] == key]
+    if r.empty:
+        return str(key)
+    x = r.iloc[0]
+    try:
+        date_txt = f"{int(x.get('year_full', 0))}/{int(x.get('month', 0))}/{int(x.get('day', 0))}"
+    except Exception:
+        date_txt = str(x.get("date_int", ""))
+    place = str(x.get("place", ""))
+    race_no = x.get("race_no", "")
+    race_name = str(x.get("race_name", ""))
+    source = str(x.get("source_file", ""))
+    try:
+        race_no = int(race_no)
+    except Exception:
+        pass
+    return f"{date_txt} {place} {race_no}R {race_name} / {source}"
 
 
 def make_tickets(race_df: pd.DataFrame) -> dict:
@@ -403,7 +522,11 @@ if uploaded_csv is not None and bundle is not None:
 
         st.subheader("予想結果")
         races = pred_df["race_key"].drop_duplicates().tolist()
-        selected_race = st.selectbox("レース選択", races)
+        selected_race = st.selectbox(
+            "レース選択",
+            races,
+            format_func=lambda k: race_label(pred_df, k)
+        )
 
         race_df = pred_df[pred_df["race_key"] == selected_race].sort_values("ml_rank")
         st.dataframe(jp_view(race_df), use_container_width=True, hide_index=True)
@@ -435,7 +558,8 @@ if uploaded_csv is not None and bundle is not None:
 
 st.divider()
 with st.expander("簡易CSVテンプレ"):
+    st.caption("※これは入力例です。実在馬名は入れていません。実際の出走馬CSVをアップロードしてください。")
     st.code("""馬番,馬名,性別,年齢,騎手,斤量,オッズ,人気,競馬場,レース番号,レース名,距離,馬場,頭数,芝ダ
-1,アドマイヤテラ,牡,5,武豊,58.0,2.8,1,東京,11,天皇賞(春),3200,良,18,芝
-2,クロワデュノール,牡,4,北村友,58.0,2.8,2,東京,11,天皇賞(春),3200,良,18,芝
+1,サンプルホースA,牡,5,サンプル騎手A,58.0,2.8,1,東京,11,サンプルレース,2000,良,18,芝
+2,サンプルホースB,牝,4,サンプル騎手B,56.0,8.5,5,東京,11,サンプルレース,2000,良,18,芝
 """, language="csv")

@@ -78,6 +78,11 @@ JP_COLUMNS = {
     "trainer_top3_rate_prior": "調教師実績",
     "sire_top3_rate_prior": "血統実績",
     "horse_distance_top3_rate_prior": "距離適性",
+    "running_style": "脚質",
+    "style_note": "脚質メモ",
+    "value_score": "回収率スコア",
+    "buy_flag": "判定",
+    "buy_reason": "理由",
     "race_key": "レースID",
     "race_label": "レース"
 }
@@ -85,7 +90,7 @@ JP_COLUMNS = {
 DISPLAY_COLUMNS = [
     "mark", "ml_rank", "horse_no", "horse_name", "sex", "age", "jockey",
     "carried_weight", "odds", "popularity", "ml_top3_prob",
-    "expected_value", "danger_popular", "value_horse",
+    "expected_value", "danger_popular", "value_horse", "running_style", "style_note",
     "jockey_top3_rate_prior", "trainer_top3_rate_prior",
     "sire_top3_rate_prior", "horse_distance_top3_rate_prior"
 ]
@@ -383,6 +388,7 @@ def get_pipeline_and_features(bundle):
 
 def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
     df = add_prior_stats_for_prediction(df)
+    df = add_running_style(df)
     pipe, feature_cols = get_pipeline_and_features(bundle)
 
     missing_features = [c for c in feature_cols if c not in df.columns]
@@ -402,6 +408,8 @@ def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
     df["expected_value"] = df["ml_top3_prob"] * df["odds"].fillna(0)
     df["danger_popular"] = ((df["popularity"].fillna(99) <= 3) & (df["ml_rank"] >= 5)).map({True: "危険", False: ""})
     df["value_horse"] = ((df["popularity"].fillna(0) >= 6) & (df["ml_rank"] <= 4)).map({True: "穴候補", False: ""})
+
+    df = add_value_strategy(df)
 
     return df
 
@@ -425,6 +433,448 @@ def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
 
     return out.rename(columns=JP_COLUMNS)
 
+
+
+def add_running_style(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    pass1〜pass4から脚質を推定する。
+    目安:
+      逃げ: 序盤で1〜2番手
+      先行: 序盤で前目
+      差し: 中団
+      追込: 後方
+    pass列が無い/空の場合は「不明」。
+    """
+    df = df.copy()
+
+    for c in ["pass1", "pass2", "pass3", "pass4", "field_size", "finish"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    def judge(row):
+        passes = []
+        for c in ["pass1", "pass2", "pass3", "pass4"]:
+            v = row.get(c, np.nan)
+            if pd.notna(v) and v > 0:
+                passes.append(float(v))
+
+        if not passes:
+            return "不明", "通過順なし"
+
+        field_size = row.get("field_size", np.nan)
+        if pd.isna(field_size) or field_size <= 0:
+            field_size = max(18, max(passes))
+
+        early = passes[0]
+        avg_pos = float(np.mean(passes))
+        early_ratio = early / field_size
+        avg_ratio = avg_pos / field_size
+
+        # 逃げ: 最初の通過がかなり前
+        if early <= 1.5 or early_ratio <= 0.12:
+            return "逃げ", f"序盤{early:.0f}番手"
+
+        # 先行: 前3〜4割
+        if early_ratio <= 0.38 or avg_ratio <= 0.40:
+            return "先行", f"前目 avg{avg_pos:.1f}"
+
+        # 差し: 中団
+        if avg_ratio <= 0.70:
+            return "差し", f"中団 avg{avg_pos:.1f}"
+
+        # 追込: 後方
+        return "追込", f"後方 avg{avg_pos:.1f}"
+
+    result = df.apply(judge, axis=1)
+    df["running_style"] = [x[0] for x in result]
+    df["style_note"] = [x[1] for x in result]
+    return df
+
+
+def make_style_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    finishがあるデータなら脚質別に勝率/3着内率を出す。
+    予想用CSVでfinishが空なら件数だけ出る。
+    """
+    if "running_style" not in df.columns:
+        df = add_running_style(df)
+
+    tmp = df.copy()
+    tmp["finish"] = pd.to_numeric(tmp.get("finish", np.nan), errors="coerce")
+    tmp["is_win"] = tmp["finish"].eq(1)
+    tmp["is_top3"] = tmp["finish"].between(1, 3)
+
+    rows = []
+    for style, g in tmp.groupby("running_style", dropna=False):
+        runs = len(g)
+        wins = int(g["is_win"].sum())
+        top3 = int(g["is_top3"].sum())
+        rows.append({
+            "脚質": style,
+            "件数": runs,
+            "勝利数": wins,
+            "3着内数": top3,
+            "勝率": f"{(wins / runs * 100):.1f}%" if runs else "0.0%",
+            "3着内率": f"{(top3 / runs * 100):.1f}%" if runs else "0.0%",
+        })
+
+    order = {"逃げ": 1, "先行": 2, "差し": 3, "追込": 4, "不明": 5}
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["脚質", "件数", "勝利数", "3着内数", "勝率", "3着内率"])
+    out["_order"] = out["脚質"].map(order).fillna(99)
+    return out.sort_values("_order").drop(columns=["_order"])
+
+
+def show_style_tabs(pred_df: pd.DataFrame, race_df: pd.DataFrame):
+    st.subheader("脚質分析")
+
+    tab1, tab2, tab3 = st.tabs(["このレースの脚質", "脚質別成績", "脚質別AI順位"])
+
+    with tab1:
+        view_cols = ["mark", "ml_rank", "horse_no", "horse_name", "running_style", "style_note", "pass1", "pass2", "pass3", "pass4", "ml_top3_prob"]
+        view_cols = [c for c in view_cols if c in race_df.columns]
+        out = race_df.sort_values("ml_rank")[view_cols].copy()
+        if "ml_top3_prob" in out.columns:
+            out["ml_top3_prob"] = (out["ml_top3_prob"] * 100).round(1).astype(str) + "%"
+        st.dataframe(out.rename(columns=JP_COLUMNS), use_container_width=True, hide_index=True)
+
+    with tab2:
+        summary = make_style_summary(pred_df)
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        if "finish" not in pred_df.columns or pred_df["finish"].isna().all():
+            st.caption("※予想CSVに着順finishが無い場合、勝率/3着内率は出ません。過去結果CSVを入れると集計できます。")
+
+    with tab3:
+        style_rank = (
+            race_df.groupby("running_style", dropna=False)
+            .agg(
+                頭数=("horse_name", "count"),
+                平均AI順位=("ml_rank", "mean"),
+                平均3着内確率=("ml_top3_prob", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"running_style": "脚質"})
+        )
+        if not style_rank.empty:
+            style_rank["平均AI順位"] = style_rank["平均AI順位"].round(2)
+            style_rank["平均3着内確率"] = (style_rank["平均3着内確率"] * 100).round(1).astype(str) + "%"
+        st.dataframe(style_rank, use_container_width=True, hide_index=True)
+
+
+
+def add_value_strategy(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    的中率ではなく回収率寄りにするための補正。
+    - value_score: 確率×オッズを中心にした期待値スコア
+    - buy_flag: 買い/見送り
+    - buy_reason: 理由
+    """
+    df = df.copy()
+
+    df["odds"] = pd.to_numeric(df.get("odds", 0), errors="coerce").fillna(0)
+    df["popularity"] = pd.to_numeric(df.get("popularity", 99), errors="coerce").fillna(99)
+    df["ml_top3_prob"] = pd.to_numeric(df.get("ml_top3_prob", 0), errors="coerce").fillna(0)
+
+    # 複勝・ワイド・三連複向けの基本期待値
+    df["expected_value"] = (df["ml_top3_prob"] * df["odds"]).round(3)
+
+    # 騎手補正: 3着内率が入っていれば加点。無ければ0扱い。
+    jockey_rate = pd.to_numeric(df.get("jockey_top3_rate_prior", 0), errors="coerce").fillna(0)
+    trainer_rate = pd.to_numeric(df.get("trainer_top3_rate_prior", 0), errors="coerce").fillna(0)
+    sire_rate = pd.to_numeric(df.get("sire_top3_rate_prior", 0), errors="coerce").fillna(0)
+
+    df["jockey_bonus"] = (jockey_rate - 0.25).clip(-0.10, 0.20)
+    df["trainer_bonus"] = (trainer_rate - 0.25).clip(-0.05, 0.12)
+    df["sire_bonus"] = (sire_rate - 0.25).clip(-0.05, 0.10)
+
+    # 脚質補正: 極端に後ろすぎる追込は少しリスク、逃げ/先行は安定寄り
+    style_bonus_map = {
+        "逃げ": 0.04,
+        "先行": 0.03,
+        "差し": 0.00,
+        "追込": -0.03,
+        "不明": -0.01,
+    }
+    df["style_bonus"] = df.get("running_style", "不明").map(style_bonus_map).fillna(0)
+
+    # 人気補正: 低人気でAI上位なら穴加点。人気馬でAI下位なら減点。
+    df["ana_bonus"] = np.where((df["popularity"] >= 6) & (df["ml_rank"] <= 5), 0.12, 0.0)
+    df["danger_penalty"] = np.where((df["popularity"] <= 3) & (df["ml_rank"] >= 5), -0.18, 0.0)
+
+    # 最終スコア。1.0超えが一応買い候補。
+    df["value_score"] = (
+        df["expected_value"]
+        * (1 + df["jockey_bonus"] + df["trainer_bonus"] + df["sire_bonus"] + df["style_bonus"] + df["ana_bonus"] + df["danger_penalty"])
+    ).round(3)
+
+    def judge(row):
+        if row["ml_rank"] <= 3 and row["ml_top3_prob"] >= 0.22:
+            return "買い", "AI上位・3着内確率高め"
+        if row["value_score"] >= 1.10 and row["ml_rank"] <= 6:
+            return "買い", "期待値高め"
+        if row["value_score"] >= 0.95 and row["popularity"] >= 6 and row["ml_rank"] <= 5:
+            return "買い", "穴期待"
+        return "見送り", "期待値不足"
+
+    judged = df.apply(judge, axis=1)
+    df["buy_flag"] = [x[0] for x in judged]
+    df["buy_reason"] = [x[1] for x in judged]
+
+    return df
+
+
+def make_value_summary(race_df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "mark", "ml_rank", "horse_no", "horse_name", "running_style",
+        "odds", "popularity", "ml_top3_prob", "expected_value", "value_score",
+        "buy_flag", "buy_reason", "danger_popular", "value_horse",
+    ]
+    cols = [c for c in cols if c in race_df.columns]
+    out = race_df.sort_values(["buy_flag", "value_score", "ml_rank"], ascending=[True, False, True])[cols].copy()
+    if "ml_top3_prob" in out.columns:
+        out["ml_top3_prob"] = (out["ml_top3_prob"] * 100).round(1).astype(str) + "%"
+    return out.rename(columns={
+        **JP_COLUMNS,
+        "value_score": "回収率スコア",
+        "buy_flag": "判定",
+        "buy_reason": "理由",
+    })
+
+
+def get_buy_candidates(race_df: pd.DataFrame, max_horses: int = 8) -> pd.DataFrame:
+    """
+    買い候補を返す。
+    買い判定が少なすぎる場合は、value_score上位で補完。
+    """
+    r = race_df.sort_values(["value_score", "ml_top3_prob"], ascending=False).copy()
+    buy = r[r["buy_flag"] == "買い"].copy()
+
+    if len(buy) < 3:
+        buy = r.head(max(3, min(max_horses, len(r)))).copy()
+
+    # 重複除外して最大max_horses
+    buy = buy.drop_duplicates(subset=["horse_no"]).head(max_horses)
+    return buy
+
+
+def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10) -> dict:
+    """
+    回収率寄りの買い目を最大10通り作る。
+    AI順位だけではなく value_score と穴候補を使う。
+    """
+    r = race_df.sort_values(["value_score", "ml_top3_prob"], ascending=False).copy()
+    buy = get_buy_candidates(race_df, max_horses=8)
+
+    def no(row):
+        try:
+            return str(int(row["horse_no"]))
+        except Exception:
+            return str(row.get("horse_no", ""))
+
+    def label(row):
+        try:
+            return f"{int(row['horse_no'])} {row['horse_name']}"
+        except Exception:
+            return str(row.get("horse_name", ""))
+
+    nums = [no(row) for _, row in buy.iterrows() if no(row)]
+    if not nums:
+        return {}
+
+    # 本命はAI順位1位、ただしvalue_scoreが低すぎる場合はvalue_score1位
+    ai_top = race_df.sort_values("ml_rank").head(1)
+    value_top = race_df.sort_values("value_score", ascending=False).head(1)
+    if len(ai_top) and len(value_top):
+        main = ai_top.iloc[0]
+        if float(value_top.iloc[0]["value_score"]) > float(main.get("value_score", 0)) * 1.25:
+            main = value_top.iloc[0]
+    else:
+        main = buy.iloc[0]
+
+    main_no = no(main)
+
+    # 穴候補
+    ana = race_df[
+        ((race_df["popularity"].fillna(0) >= 6) & (race_df["ml_rank"] <= 7))
+        | (race_df["value_horse"] == "穴候補")
+    ].sort_values("value_score", ascending=False)
+    ana_nums = [no(row) for _, row in ana.head(5).iterrows() if no(row) and no(row) != main_no]
+
+    combos = {}
+
+    # 単勝: value_score上位。ただし単勝はAI1位も入れる
+    tansho_rows = []
+    for _, row in pd.concat([ai_top, r]).drop_duplicates(subset=["horse_no"]).head(max_count).iterrows():
+        tansho_rows.append({"買い目": no(row), "馬名": label(row), "回収率スコア": row.get("value_score", 0), "理由": row.get("buy_reason", "")})
+    combos["単勝"] = tansho_rows
+
+    # 複勝: 3着内確率×期待値
+    fukusho = []
+    for _, row in r.head(max_count).iterrows():
+        fukusho.append({"買い目": no(row), "馬名": label(row), "回収率スコア": row.get("value_score", 0), "理由": row.get("buy_reason", "")})
+    combos["複勝"] = fukusho
+
+    # 馬連: 本命軸 + value/穴
+    umaren = []
+    others = [n for n in nums if n != main_no]
+    for n in others[:max_count]:
+        umaren.append({"買い目": f"{main_no}-{n}", "狙い": "本命軸×期待値"})
+    # 足りなければBOX
+    for i in range(len(nums)):
+        for j in range(i + 1, len(nums)):
+            pair = f"{nums[i]}-{nums[j]}"
+            if pair not in [x["買い目"] for x in umaren]:
+                umaren.append({"買い目": pair, "狙い": "期待値BOX"})
+            if len(umaren) >= max_count:
+                break
+        if len(umaren) >= max_count:
+            break
+    combos["馬連"] = umaren[:max_count]
+
+    # 枠連
+    wakuren = []
+    if "frame_no" in race_df.columns and race_df["frame_no"].notna().any():
+        frames = []
+        for _, row in buy.iterrows():
+            try:
+                f = str(int(row["frame_no"]))
+                if f:
+                    frames.append(f)
+            except Exception:
+                pass
+        for i in range(len(frames)):
+            for j in range(i, len(frames)):
+                pair = "-".join(sorted([frames[i], frames[j]]))
+                if pair not in [x["買い目"] for x in wakuren]:
+                    wakuren.append({"買い目": pair, "狙い": "枠連期待値"})
+                if len(wakuren) >= max_count:
+                    break
+            if len(wakuren) >= max_count:
+                break
+    combos["枠連"] = wakuren or [{"買い目": "枠番データ不足", "狙い": "CSVに枠番が必要"}]
+
+    # ワイド: 本命＋穴を厚め
+    wide = []
+    for n in (ana_nums + others):
+        if n != main_no:
+            wide.append({"買い目": f"{main_no}-{n}", "狙い": "本命×穴/期待値"})
+        if len(wide) >= max_count:
+            break
+    for i in range(len(nums)):
+        for j in range(i + 1, len(nums)):
+            pair = f"{nums[i]}-{nums[j]}"
+            if pair not in [x["買い目"] for x in wide]:
+                wide.append({"買い目": pair, "狙い": "期待値ワイド"})
+            if len(wide) >= max_count:
+                break
+        if len(wide) >= max_count:
+            break
+    combos["ワイド"] = wide[:max_count]
+
+    # 馬単
+    umatan = []
+    for n in others[:max_count]:
+        umatan.append({"買い目": f"{main_no}→{n}", "狙い": "本命頭固定"})
+        if len(umatan) >= max_count:
+            break
+    # 穴頭も少し
+    for a in ana_nums[:3]:
+        if a != main_no:
+            umatan.append({"買い目": f"{a}→{main_no}", "狙い": "穴頭リターン狙い"})
+        if len(umatan) >= max_count:
+            break
+    combos["馬単"] = umatan[:max_count]
+
+    # 三連複: 本命1頭軸 + 相手
+    sanrenpuku = []
+    partners = [n for n in nums if n != main_no]
+    for i in range(len(partners)):
+        for j in range(i + 1, len(partners)):
+            sanrenpuku.append({"買い目": f"{main_no}-{partners[i]}-{partners[j]}", "狙い": "本命1頭軸"})
+            if len(sanrenpuku) >= max_count:
+                break
+        if len(sanrenpuku) >= max_count:
+            break
+    combos["三連複"] = sanrenpuku[:max_count]
+
+    # 三連単: 本命頭 + value相手 + 穴3着
+    sanrentan = []
+    seconds = partners[:5]
+    thirds = list(dict.fromkeys(partners[:6] + ana_nums[:4]))
+    for b in seconds:
+        for c in thirds:
+            if len({main_no, b, c}) == 3:
+                sanrentan.append({"買い目": f"{main_no}→{b}→{c}", "狙い": "本命頭＋穴3着"})
+            if len(sanrentan) >= max_count:
+                break
+        if len(sanrentan) >= max_count:
+            break
+    combos["三連単"] = sanrentan[:max_count]
+
+    # 本命2頭＋穴
+    honmei2_ana = []
+    sorted_ai = race_df.sort_values("ml_rank")
+    if len(sorted_ai) >= 2:
+        h1 = no(sorted_ai.iloc[0])
+        h2 = no(sorted_ai.iloc[1])
+        use_ana = ana_nums or [n for n in nums if n not in [h1, h2]][:5]
+        for a in use_ana:
+            if a not in [h1, h2]:
+                honmei2_ana.append({"買い目": f"{h1}-{h2}-{a}", "狙い": "本命2頭＋穴"})
+            if len(honmei2_ana) >= max_count:
+                break
+    combos["本命2頭＋穴"] = honmei2_ana or [{"買い目": "穴候補なし", "狙い": "見送り推奨"}]
+
+    # 本命1頭＋穴
+    honmei1_ana = []
+    use_ana = ana_nums or partners[:6]
+    for a in use_ana:
+        if a != main_no:
+            honmei1_ana.append({"買い目": f"{main_no}-{a}", "狙い": "本命1頭＋穴"})
+        if len(honmei1_ana) >= max_count:
+            break
+    combos["本命1頭＋穴"] = honmei1_ana or [{"買い目": "穴候補なし", "狙い": "見送り推奨"}]
+
+    return combos
+
+
+def show_roi_strategy(race_df: pd.DataFrame):
+    st.subheader("回収率重視の買い/見送り判定")
+    st.dataframe(make_value_summary(race_df), use_container_width=True, hide_index=True)
+
+    buy_count = int((race_df["buy_flag"] == "買い").sum()) if "buy_flag" in race_df.columns else 0
+    total = len(race_df)
+    if buy_count == 0:
+        st.warning("このレースは見送り寄りです。無理に買わない判定。")
+    elif buy_count <= 3:
+        st.info(f"買い候補は{buy_count}/{total}頭。絞れているので回収率重視向き。")
+    else:
+        st.info(f"買い候補は{buy_count}/{total}頭。BOXより軸流し推奨。")
+
+
+def show_roi_ticket_tabs(race_df: pd.DataFrame):
+    st.subheader("回収率重視TAB（各10通り）")
+    combos = generate_roi_bet_combinations(race_df, max_count=10)
+    order = ["単勝", "複勝", "馬連", "枠連", "ワイド", "馬単", "三連複", "三連単", "本命2頭＋穴", "本命1頭＋穴"]
+    tabs = st.tabs(order)
+
+    for tab, bet_type in zip(tabs, order):
+        with tab:
+            rows = combos.get(bet_type, [])
+            if not rows:
+                st.info("候補なし")
+                continue
+            df_show = pd.DataFrame(rows)
+            df_show.insert(0, "No", range(1, len(df_show) + 1))
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+            if bet_type in ["単勝", "複勝"]:
+                st.caption("※回収率スコア上位。人気馬だけでなく妙味馬を含めます。")
+            elif bet_type in ["ワイド", "三連複", "本命1頭＋穴", "本命2頭＋穴"]:
+                st.caption("※本命＋穴を優先。複勝圏狙い。")
+            elif bet_type in ["馬単", "三連単"]:
+                st.caption("※順序あり。リターン重視なので点数を絞って使う想定。")
 
 def make_tickets(race_df: pd.DataFrame) -> dict:
     """画面上部の簡易サマリー用"""
@@ -735,6 +1185,11 @@ def app_main():
             c3.metric("複勝", tickets["複勝"])
 
             show_ticket_tabs(race_df)
+
+            show_roi_strategy(race_df)
+            show_roi_ticket_tabs(race_df)
+
+            show_style_tabs(pred_df, race_df)
 
             c4, c5 = st.columns(2)
             c4.info(f"危険人気馬: {tickets.get('危険人気馬', 'なし')}")

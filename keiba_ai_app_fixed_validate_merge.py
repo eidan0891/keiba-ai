@@ -427,120 +427,254 @@ def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
 
 
 def make_tickets(race_df: pd.DataFrame) -> dict:
+    """画面上部の簡易サマリー用"""
     r = race_df.sort_values("ml_rank").copy()
 
     def horse_label(row):
-        if pd.notna(row.get("horse_no", np.nan)):
-            try:
-                return f"{int(row['horse_no'])} {row['horse_name']}"
-            except Exception:
-                return f"{row.get('horse_no', '')} {row.get('horse_name', '')}"
-        return str(row.get("horse_name", ""))
-
-    def horse_no(row):
         try:
-            return str(int(row["horse_no"]))
+            return f"{int(row['horse_no'])} {row['horse_name']}"
         except Exception:
-            return str(row.get("horse_no", ""))
+            return str(row.get("horse_name", ""))
 
     top = r.head(6)
-    top1 = top.iloc[0] if len(top) >= 1 else None
-    top2 = top.iloc[1] if len(top) >= 2 else None
-    top3 = top.iloc[2] if len(top) >= 3 else None
-
-    main_nums = [horse_no(row) for _, row in r.head(5).iterrows() if horse_no(row)]
-    top4_nums = main_nums[:4]
-    top5_nums = main_nums[:5]
-
     danger = r[r["danger_popular"] == "危険"]
     value = r[r["value_horse"] == "穴候補"].copy()
 
-    # 穴候補が空なら、人気6番人気以下かつAI順位6位以内を穴として拾う
     if value.empty:
-        value = r[(r["popularity"].fillna(0) >= 6) & (r["ml_rank"] <= 6)].copy()
-
-    ana_nums = [horse_no(row) for _, row in value.head(3).iterrows() if horse_no(row)]
-    ana_labels = [horse_label(row) for _, row in value.head(3).iterrows()]
-
-    honmei1 = horse_label(top1) if top1 is not None else ""
-    honmei2 = " - ".join([horse_no(row) for _, row in r.head(2).iterrows()]) if len(r) >= 2 else ""
-    honmei1_num = horse_no(top1) if top1 is not None else ""
-    honmei2_nums = [horse_no(row) for _, row in r.head(2).iterrows()]
-
-    # 単勝・複勝はAI1位を基本
-    tansho = honmei1
-    fukusho = " / ".join([horse_label(row) for _, row in r.head(3).iterrows()])
-
-    # 枠連は枠番があれば使う。無ければ馬番で代替表示
-    if "frame_no" in r.columns and r["frame_no"].notna().any():
-        frame_top = []
-        for _, row in r.head(4).iterrows():
-            try:
-                f = str(int(row["frame_no"]))
-                if f not in frame_top:
-                    frame_top.append(f)
-            except Exception:
-                pass
-        wakuren = " - ".join(frame_top[:3]) if frame_top else "枠番データ不足"
-    else:
-        wakuren = "枠番データ不足"
-
-    umaren = " - ".join(top4_nums)
-    wide = " - ".join(top5_nums)
-    umatan = f"{honmei1_num} → {' / '.join([n for n in top4_nums if n != honmei1_num])}" if honmei1_num else ""
-    sanrenpuku = " - ".join(top5_nums)
-    sanrentan = ""
-    if len(top5_nums) >= 5:
-        sanrentan = f"1着 {top5_nums[0]} / 2着 {top5_nums[1]}, {top5_nums[2]} / 3着 {top5_nums[1]}, {top5_nums[2]}, {top5_nums[3]}, {top5_nums[4]}"
-
-    honmei2_plus_ana = ""
-    if len(honmei2_nums) >= 2 and ana_nums:
-        honmei2_plus_ana = f"{' - '.join(honmei2_nums)} + 穴 {' / '.join(ana_nums)}"
-
-    honmei1_plus_ana = ""
-    if honmei1_num and ana_nums:
-        honmei1_plus_ana = f"{honmei1_num} + 穴 {' / '.join(ana_nums)}"
+        value = r[(r["popularity"].fillna(0) >= 6) & (r["ml_rank"] <= 8)].copy()
 
     return {
-        "本命": honmei1,
-        "単勝": tansho,
-        "複勝": fukusho,
-        "馬連": umaren,
-        "枠連": wakuren,
-        "ワイド": wide,
-        "馬単": umatan,
-        "三連複": sanrenpuku,
-        "三連単": sanrentan,
-        "本命2頭＋穴": honmei2_plus_ana or "穴候補なし",
-        "本命1頭＋穴": honmei1_plus_ana or "穴候補なし",
+        "本命": horse_label(top.iloc[0]) if len(top) else "",
+        "単勝": horse_label(top.iloc[0]) if len(top) else "",
+        "複勝": " / ".join([horse_label(row) for _, row in top.head(3).iterrows()]),
         "危険人気馬": " / ".join([horse_label(row) for _, row in danger.iterrows()]) or "なし",
-        "穴候補": " / ".join(ana_labels) or "なし",
+        "穴候補": " / ".join([horse_label(row) for _, row in value.head(5).iterrows()]) or "なし",
     }
 
 
-def show_ticket_recommendations(tickets: dict):
-    st.subheader("馬券種別ごとの推奨")
+def _horse_no(row) -> str:
+    try:
+        return str(int(row["horse_no"]))
+    except Exception:
+        return str(row.get("horse_no", ""))
 
-    rows = [
-        ("単勝", tickets.get("単勝", "")),
-        ("複勝", tickets.get("複勝", "")),
-        ("馬連", tickets.get("馬連", "")),
-        ("枠連", tickets.get("枠連", "")),
-        ("ワイド", tickets.get("ワイド", "")),
-        ("馬単", tickets.get("馬単", "")),
-        ("三連複", tickets.get("三連複", "")),
-        ("三連単", tickets.get("三連単", "")),
-        ("本命2頭＋穴", tickets.get("本命2頭＋穴", "")),
-        ("本命1頭＋穴", tickets.get("本命1頭＋穴", "")),
+
+def _horse_label(row) -> str:
+    try:
+        return f"{int(row['horse_no'])} {row['horse_name']}"
+    except Exception:
+        return str(row.get("horse_name", ""))
+
+
+def _frame_no(row) -> str:
+    try:
+        if pd.notna(row.get("frame_no", np.nan)):
+            return str(int(row["frame_no"]))
+    except Exception:
+        pass
+    return ""
+
+
+def generate_bet_combinations(race_df: pd.DataFrame, max_count: int = 10) -> dict:
+    """
+    馬券種別ごとにおすすめ買い目を最大10通り作る。
+    AI順位を基本に、穴候補も一部混ぜる。
+    """
+    r = race_df.sort_values(["ml_rank", "popularity"]).copy()
+    r = r[pd.notna(r["horse_no"])].copy()
+
+    if r.empty:
+        return {}
+
+    top = r.head(8).copy()
+    top_nums = [_horse_no(row) for _, row in top.iterrows() if _horse_no(row)]
+
+    # 穴候補: value_horse優先。無ければ人気6番人気以下かつAI順位8位以内
+    ana = r[r["value_horse"] == "穴候補"].copy()
+    if ana.empty:
+        ana = r[(r["popularity"].fillna(0) >= 6) & (r["ml_rank"] <= 8)].copy()
+    ana_nums = [_horse_no(row) for _, row in ana.head(5).iterrows() if _horse_no(row)]
+
+    # 上位だけだと堅すぎるので、穴を末尾に混ぜた候補リスト
+    candidate_nums = []
+    for n in top_nums + ana_nums:
+        if n and n not in candidate_nums:
+            candidate_nums.append(n)
+
+    candidate_nums = candidate_nums[:8]
+
+    def name_of(num):
+        hit = r[r["horse_no"].astype("Int64", errors="ignore").astype(str) == str(num)]
+        if len(hit):
+            return _horse_label(hit.iloc[0])
+        return str(num)
+
+    combos = {}
+
+    # 単勝: AI順位上位10
+    combos["単勝"] = [
+        {"買い目": _horse_no(row), "馬名": _horse_label(row), "狙い": "AI上位"}
+        for _, row in r.head(max_count).iterrows()
     ]
 
-    ticket_df = pd.DataFrame(rows, columns=["馬券種別", "買い目候補"])
-    st.dataframe(ticket_df, use_container_width=True, hide_index=True)
+    # 複勝: AI順位上位10
+    combos["複勝"] = [
+        {"買い目": _horse_no(row), "馬名": _horse_label(row), "狙い": "3着内狙い"}
+        for _, row in r.head(max_count).iterrows()
+    ]
 
-    c1, c2 = st.columns(2)
-    c1.info(f"危険人気馬: {tickets.get('危険人気馬', 'なし')}")
-    c2.success(f"穴候補: {tickets.get('穴候補', 'なし')}")
+    # 馬連: 上位5頭BOX中心 + 穴絡み
+    umaren = []
+    base = candidate_nums[:6]
+    for i in range(len(base)):
+        for j in range(i + 1, len(base)):
+            umaren.append({"買い目": f"{base[i]}-{base[j]}", "狙い": "上位BOX/穴絡み"})
+            if len(umaren) >= max_count:
+                break
+        if len(umaren) >= max_count:
+            break
+    combos["馬連"] = umaren
 
+    # 枠連: 枠番がある場合のみ
+    wakuren = []
+    frame_pairs = []
+    if "frame_no" in r.columns and r["frame_no"].notna().any():
+        tmp = top.head(8).copy()
+        frames = []
+        for _, row in tmp.iterrows():
+            f = _frame_no(row)
+            if f:
+                frames.append(f)
+        for i in range(len(frames)):
+            for j in range(i, len(frames)):
+                pair = "-".join(sorted([frames[i], frames[j]]))
+                if pair not in frame_pairs:
+                    frame_pairs.append(pair)
+                    wakuren.append({"買い目": pair, "狙い": "枠番上位"})
+                if len(wakuren) >= max_count:
+                    break
+            if len(wakuren) >= max_count:
+                break
+    if not wakuren:
+        wakuren = [{"買い目": "枠番データ不足", "狙い": "CSVにframe_no/枠番が必要"}]
+    combos["枠連"] = wakuren
+
+    # ワイド: 馬連より広め。上位+穴
+    wide = []
+    wide_base = candidate_nums[:7]
+    for i in range(len(wide_base)):
+        for j in range(i + 1, len(wide_base)):
+            wide.append({"買い目": f"{wide_base[i]}-{wide_base[j]}", "狙い": "3着内2頭狙い"})
+            if len(wide) >= max_count:
+                break
+        if len(wide) >= max_count:
+            break
+    combos["ワイド"] = wide
+
+    # 馬単: 1〜3位を頭にして流す
+    umatan = []
+    heads = candidate_nums[:3]
+    tails = candidate_nums[:7]
+    for h in heads:
+        for t in tails:
+            if h != t:
+                umatan.append({"買い目": f"{h}→{t}", "狙い": "AI上位頭固定"})
+            if len(umatan) >= max_count:
+                break
+        if len(umatan) >= max_count:
+            break
+    combos["馬単"] = umatan
+
+    # 三連複: 上位+穴BOX
+    sanrenpuku = []
+    tri_base = candidate_nums[:7]
+    for i in range(len(tri_base)):
+        for j in range(i + 1, len(tri_base)):
+            for k in range(j + 1, len(tri_base)):
+                sanrenpuku.append({"買い目": f"{tri_base[i]}-{tri_base[j]}-{tri_base[k]}", "狙い": "上位+穴BOX"})
+                if len(sanrenpuku) >= max_count:
+                    break
+            if len(sanrenpuku) >= max_count:
+                break
+        if len(sanrenpuku) >= max_count:
+            break
+    combos["三連複"] = sanrenpuku
+
+    # 三連単: 1〜3位を中心に順序付き
+    sanrentan = []
+    firsts = candidate_nums[:3]
+    seconds = candidate_nums[:5]
+    thirds = candidate_nums[:6]
+    for a in firsts:
+        for b in seconds:
+            for c in thirds:
+                if len({a, b, c}) == 3:
+                    sanrentan.append({"買い目": f"{a}→{b}→{c}", "狙い": "AI上位順序"})
+                if len(sanrentan) >= max_count:
+                    break
+            if len(sanrentan) >= max_count:
+                break
+        if len(sanrentan) >= max_count:
+            break
+    combos["三連単"] = sanrentan
+
+    # 本命2頭＋穴
+    honmei2_ana = []
+    if len(candidate_nums) >= 2:
+        h1, h2 = candidate_nums[0], candidate_nums[1]
+        ana_use = ana_nums if ana_nums else candidate_nums[2:7]
+        for a in ana_use:
+            if a not in [h1, h2]:
+                honmei2_ana.append({"買い目": f"{h1}-{h2}-{a}", "狙い": "本命2頭＋穴"})
+            if len(honmei2_ana) >= max_count:
+                break
+    combos["本命2頭＋穴"] = honmei2_ana or [{"買い目": "穴候補なし", "狙い": "人気/AI順位から穴が拾えません"}]
+
+    # 本命1頭＋穴
+    honmei1_ana = []
+    if candidate_nums:
+        h1 = candidate_nums[0]
+        ana_use = ana_nums if ana_nums else candidate_nums[1:8]
+        for a in ana_use:
+            if a != h1:
+                honmei1_ana.append({"買い目": f"{h1}-{a}", "狙い": "本命1頭＋穴"})
+            if len(honmei1_ana) >= max_count:
+                break
+    combos["本命1頭＋穴"] = honmei1_ana or [{"買い目": "穴候補なし", "狙い": "人気/AI順位から穴が拾えません"}]
+
+    return combos
+
+
+def show_ticket_tabs(race_df: pd.DataFrame):
+    st.subheader("馬券おすすめ（TAB別・各10通り）")
+
+    combos = generate_bet_combinations(race_df, max_count=10)
+    order = ["単勝", "複勝", "馬連", "枠連", "ワイド", "馬単", "三連複", "三連単", "本命2頭＋穴", "本命1頭＋穴"]
+
+    tabs = st.tabs(order)
+
+    for tab, bet_type in zip(tabs, order):
+        with tab:
+            rows = combos.get(bet_type, [])
+            if not rows:
+                st.info("候補なし")
+                continue
+
+            df_show = pd.DataFrame(rows)
+
+            # 見やすくする
+            if "買い目" not in df_show.columns:
+                df_show["買い目"] = ""
+            if "狙い" not in df_show.columns:
+                df_show["狙い"] = ""
+
+            df_show.insert(0, "No", range(1, len(df_show) + 1))
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+            if bet_type in ["三連単", "馬単"]:
+                st.caption("※順序あり。左から着順指定。")
+            elif bet_type in ["馬連", "ワイド", "三連複", "枠連"]:
+                st.caption("※順序なし。BOX/流し候補。")
 
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
@@ -600,7 +734,11 @@ def app_main():
             c2.metric("単勝", tickets["単勝"])
             c3.metric("複勝", tickets["複勝"])
 
-            show_ticket_recommendations(tickets)
+            show_ticket_tabs(race_df)
+
+            c4, c5 = st.columns(2)
+            c4.info(f"危険人気馬: {tickets.get('危険人気馬', 'なし')}")
+            c5.success(f"穴候補: {tickets.get('穴候補', 'なし')}")
 
             st.subheader("全レース")
             all_jp = jp_view(pred_df.sort_values(["race_key", "ml_rank"]), include_race_key=True)

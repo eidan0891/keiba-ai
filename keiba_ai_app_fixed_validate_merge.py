@@ -1,15 +1,13 @@
-# nyanko_keiba_ipad_cloud_20260428.py
+# nyanko_keiba_ipad_cloud_20260428_safe_full.py
 # ------------------------------------------------------------
-# にゃんこ競馬AI iPad / Streamlit Cloud版
+# にゃんこ競馬AI iPad / Streamlit Cloud版 安全起動フル版
 #
-# 目的:
-#   iPadのSafariからURLを開いて競馬予想する
-#
-# 使い方:
-#   1. 学習済みモデルPKLを models/nyanko_keiba_top3_model.pkl に置く
-#      または画面からPKLをアップロード
-#   2. 予想CSVをアップロード
-#   3. 日本語表示で◎○▲△☆を見る
+# 修正内容:
+# - 起動直後にPKLを読まない。予想実行時だけ読む
+# - Streamlit Cloudで Oh no になりにくいよう、main全体をtry/except
+# - SimpleImputer _fill_dtype 補修
+# - race_keyにsource_fileを混ぜて別レース混入を防止
+# - 簡易CSVテンプレから実在馬名を削除
 #
 # 実行:
 #   python -m streamlit run nyanko_keiba_ipad_cloud_20260428.py
@@ -18,10 +16,11 @@
 import io
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import joblib
+
 
 st.set_page_config(
     page_title="にゃんこ競馬AI",
@@ -29,7 +28,8 @@ st.set_page_config(
     layout="wide"
 )
 
-MODEL_PATH = Path(__file__).parent / "models" / "nyanko_keiba_top3_model.pkl"
+APP_DIR = Path(__file__).parent
+MODEL_PATH = APP_DIR / "models" / "nyanko_keiba_top3_model.pkl"
 
 COLS_52 = [
     "year", "month", "day", "kai", "place", "nichiji", "race_no", "race_name",
@@ -78,7 +78,8 @@ JP_COLUMNS = {
     "trainer_top3_rate_prior": "調教師実績",
     "sire_top3_rate_prior": "血統実績",
     "horse_distance_top3_rate_prior": "距離適性",
-    "race_key": "レースID"
+    "race_key": "レースID",
+    "race_label": "レース"
 }
 
 DISPLAY_COLUMNS = [
@@ -108,35 +109,25 @@ CAT_FEATURES = [
 ]
 
 
-
 def repair_simple_imputer(obj):
-    """
-    scikit-learnのバージョン差で出る
-    'SimpleImputer' object has no attribute '_fill_dtype'
-    を回避するため、モデル内のSimpleImputerを再帰的に補修する。
-    """
     seen = set()
 
     def walk(x):
         if x is None:
             return
+
         obj_id = id(x)
         if obj_id in seen:
             return
         seen.add(obj_id)
 
-        if x.__class__.__name__ == "SimpleImputer":
-            if not hasattr(x, "_fill_dtype"):
-                stat = getattr(x, "statistics_", None)
-                if stat is not None:
-                    try:
-                        x._fill_dtype = stat.dtype
-                    except Exception:
-                        x._fill_dtype = np.dtype("float64")
-                else:
-                    x._fill_dtype = np.dtype("float64")
+        if x.__class__.__name__ == "SimpleImputer" and not hasattr(x, "_fill_dtype"):
+            stat = getattr(x, "statistics_", None)
+            try:
+                x._fill_dtype = stat.dtype if stat is not None else np.dtype("float64")
+            except Exception:
+                x._fill_dtype = np.dtype("float64")
 
-        # Pipeline / ColumnTransformer / Voting / Stacking系
         for attr in ("steps", "transformers", "transformers_", "estimators", "estimators_"):
             if hasattr(x, attr):
                 try:
@@ -150,7 +141,6 @@ def repair_simple_imputer(obj):
                 except Exception:
                     pass
 
-        # その他の内部属性も一応見る
         if hasattr(x, "__dict__"):
             for v in x.__dict__.values():
                 if hasattr(v, "__dict__"):
@@ -168,17 +158,6 @@ def repair_simple_imputer(obj):
     return obj
 
 
-@st.cache_resource(show_spinner=False)
-def load_pkl_from_path(path: Path):
-    loaded = joblib.load(path)
-    return repair_simple_imputer(loaded)
-
-
-def load_pkl_from_upload(uploaded_file):
-    loaded = joblib.load(uploaded_file)
-    return repair_simple_imputer(loaded)
-
-
 def read_csv_bytes(raw: bytes) -> pd.DataFrame:
     last_error = None
     for enc in ["utf-8-sig", "utf-8", "cp932", "shift_jis"]:
@@ -189,16 +168,58 @@ def read_csv_bytes(raw: bytes) -> pd.DataFrame:
     raise ValueError(f"CSVを読めませんでした: {last_error}")
 
 
+def clean_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    for c in df.select_dtypes(include=["object"]).columns:
+        df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].replace({"nan": "", "None": "", "<NA>": ""})
+
+    for c in NUMERIC_COLUMNS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["year"] = pd.to_numeric(df.get("year", 25), errors="coerce").fillna(25)
+    df["month"] = pd.to_numeric(df.get("month", 4), errors="coerce").fillna(4)
+    df["day"] = pd.to_numeric(df.get("day", 1), errors="coerce").fillna(1)
+    df["race_no"] = pd.to_numeric(df.get("race_no", 11), errors="coerce").fillna(11)
+
+    df["year_full"] = df["year"].apply(lambda x: int(x) + 2000 if pd.notna(x) and int(x) < 100 else int(x))
+    df["date_int"] = (
+        df["year_full"].fillna(0).astype(int) * 10000
+        + df["month"].fillna(0).astype(int) * 100
+        + df["day"].fillna(0).astype(int)
+    )
+
+    if "source_file" not in df.columns:
+        df["source_file"] = ""
+
+    # 別ファイル/別CSV由来の同一日・同一競馬場・同一R混入を防ぐ
+    df["race_key"] = (
+        df["date_int"].astype(str) + "_"
+        + df.get("place", "").astype(str) + "_"
+        + df["race_no"].fillna(0).astype(int).astype(str).str.zfill(2) + "_"
+        + df["source_file"].astype(str)
+    )
+
+    df["race_label"] = (
+        df["date_int"].astype(str) + " "
+        + df.get("place", "").astype(str) + " "
+        + df["race_no"].fillna(0).astype(int).astype(str) + "R "
+        + df.get("race_name", "").astype(str)
+    )
+
+    return df
+
+
 def normalize_52cols(df: pd.DataFrame, source_name: str = "") -> pd.DataFrame:
     need_cols = len(COLS_52)
 
-    # ヘッダー行が混ざった場合だけ削除。空列は絶対に削らない。
     if len(df) > 0:
         first_row = df.iloc[0].astype(str).str.lower().tolist()
         if any(x in first_row for x in ["year", "horse_name", "source_file", "馬名"]):
             df = df.iloc[1:].reset_index(drop=True)
 
-    # 先頭index列混入対策
     if df.shape[1] > need_cols:
         first_col = pd.to_numeric(df.iloc[:, 0], errors="coerce")
         second_col = pd.to_numeric(df.iloc[:, 1], errors="coerce")
@@ -223,14 +244,7 @@ def normalize_52cols(df: pd.DataFrame, source_name: str = "") -> pd.DataFrame:
     return clean_types(df)
 
 
-def read_simple_csv_to_52(raw: bytes) -> pd.DataFrame:
-    """
-    簡易CSVも受け付ける。
-    必須列:
-      馬名, 性別, 年齢, 騎手, 斤量, オッズ, 人気
-    任意列:
-      年, 月, 日, 競馬場, レース番号, レース名, 距離, 馬場, 馬番, 頭数
-    """
+def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.DataFrame:
     last_error = None
     src = None
     for enc in ["utf-8-sig", "utf-8", "cp932", "shift_jis"]:
@@ -276,7 +290,7 @@ def read_simple_csv_to_52(raw: bytes) -> pd.DataFrame:
         row = {c: "" for c in COLS_52}
         row["year"] = r.get("year", "25")
         row["month"] = r.get("month", "4")
-        row["day"] = r.get("day", "27")
+        row["day"] = r.get("day", "1")
         row["kai"] = "1"
         row["place"] = r.get("place", "東京")
         row["nichiji"] = "1"
@@ -299,61 +313,13 @@ def read_simple_csv_to_52(raw: bytes) -> pd.DataFrame:
         rows.append([row[c] for c in COLS_52])
 
     df = pd.DataFrame(rows, columns=COLS_52)
-    # 簡易CSVは1ファイル内のレース番号・競馬場で分ける。
-    # 全部 simple_csv 固定だと、同じ日付/競馬場/R番号のデータが混ざる可能性があるため。
-    df["source_file"] = (
-        "simple_"
-        + df["place"].astype(str) + "_"
-        + df["race_no"].astype(str) + "_"
-        + df["race_name"].astype(str)
-    )
+    df["source_file"] = source_name
     return clean_types(df)
 
 
-def clean_types(df: pd.DataFrame) -> pd.DataFrame:
-    for c in df.select_dtypes(include=["object"]).columns:
-        df[c] = df[c].astype(str).str.strip()
-        df[c] = df[c].replace({"nan": "", "None": ""})
-
-    for c in NUMERIC_COLUMNS:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["year_full"] = df["year"].apply(lambda x: int(x) + 2000 if pd.notna(x) and int(x) < 100 else x)
-    df["date_int"] = (
-        df["year_full"].fillna(0).astype(int) * 10000
-        + df["month"].fillna(0).astype(int) * 100
-        + df["day"].fillna(0).astype(int)
-    )
-
-    # レース識別キー。
-    # 同じ日付・競馬場・R番号のCSVを複数読むと混ざるため、source_fileも含める。
-    # source_fileが無い場合は空で補完。
-    if "source_file" not in df.columns:
-        df["source_file"] = ""
-
-    df["race_key"] = (
-        df["date_int"].astype(str) + "_"
-        + df["place"].astype(str) + "_"
-        + df["race_no"].fillna(0).astype(int).astype(str).str.zfill(2) + "_"
-        + df["source_file"].astype(str).replace({"": "no_source"})
-    )
-
-    return df
-
-
-def safe_div(a, b):
-    if b is None or b == 0 or pd.isna(b):
-        return 0.0
-    return float(a) / float(b)
-
-
 def add_prior_stats_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    予想CSV単体では過去成績がないので0埋め。
-    学習済みモデルの特徴量を満たすために必要。
-    """
     df = df.copy()
+
     for c in [
         "jockey_runs_prior", "jockey_win_rate_prior", "jockey_top3_rate_prior",
         "trainer_runs_prior", "trainer_win_rate_prior", "trainer_top3_rate_prior",
@@ -362,8 +328,11 @@ def add_prior_stats_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
         "horse_distance_runs_prior", "horse_distance_top3_rate_prior",
         "horse_track_runs_prior", "horse_track_top3_rate_prior",
     ]:
-        df[c] = 0.0
+        if c not in df.columns:
+            df[c] = 0.0
 
+    df["odds"] = pd.to_numeric(df.get("odds", 0), errors="coerce")
+    df["popularity"] = pd.to_numeric(df.get("popularity", 99), errors="coerce")
     df["field_odds_rank"] = df.groupby("race_key")["odds"].rank(method="min", ascending=True)
     df["field_pop_rank"] = df.groupby("race_key")["popularity"].rank(method="min", ascending=True)
 
@@ -376,33 +345,29 @@ def add_prior_stats_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
     for c in BASE_NUM_FEATURES:
         if c not in df.columns:
             df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
     for c in CAT_FEATURES:
         if c not in df.columns:
             df[c] = ""
+        df[c] = df[c].astype(str).fillna("")
 
     return df
 
 
-def load_model(uploaded_model):
-    """PKLを安全に読み込む。Git同梱PKL優先、画面アップロードにも対応。"""
-    try:
-        if uploaded_model is not None:
-            return load_pkl_from_upload(uploaded_model), "アップロードPKL"
+def load_model_safely(uploaded_model):
+    if uploaded_model is not None:
+        model_obj = joblib.load(uploaded_model)
+        return repair_simple_imputer(model_obj), "アップロードPKL"
 
-        if MODEL_PATH.exists():
-            return load_pkl_from_path(MODEL_PATH), "同梱PKL"
+    if MODEL_PATH.exists():
+        model_obj = joblib.load(MODEL_PATH)
+        return repair_simple_imputer(model_obj), "同梱PKL"
 
-        return None, "未設定"
-    except Exception as e:
-        st.error(f"モデル読込エラー: {e}")
-        return None, "読込失敗"
+    return None, "未設定"
 
 
-def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
-    df = add_prior_stats_for_prediction(df)
-
-    # PKLが {"pipeline": ..., "feature_cols": ...} 形式でも、pipeline単体でも動くようにする
+def get_pipeline_and_features(bundle):
     if isinstance(bundle, dict):
         feature_cols = bundle.get("feature_cols", BASE_NUM_FEATURES + CAT_FEATURES)
         pipe = bundle.get("pipeline") or bundle.get("model")
@@ -413,11 +378,23 @@ def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
     if pipe is None:
         raise ValueError("PKL内に pipeline / model が見つかりません。")
 
+    return pipe, feature_cols
+
+
+def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
+    df = add_prior_stats_for_prediction(df)
+    pipe, feature_cols = get_pipeline_and_features(bundle)
+
     missing_features = [c for c in feature_cols if c not in df.columns]
     if missing_features:
         raise ValueError(f"特徴量列が不足しています: {missing_features}")
 
-    prob = pipe.predict_proba(df[feature_cols])[:, 1]
+    if hasattr(pipe, "predict_proba"):
+        prob = pipe.predict_proba(df[feature_cols])[:, 1]
+    else:
+        pred = pipe.predict(df[feature_cols])
+        prob = np.asarray(pred, dtype=float)
+
     df["ml_top3_prob"] = prob
     df["ml_rank"] = df.groupby("race_key")["ml_top3_prob"].rank(ascending=False, method="first").astype(int)
 
@@ -432,38 +409,21 @@ def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
 def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
     cols = DISPLAY_COLUMNS.copy()
     if include_race_key:
-        cols = ["race_key"] + cols
+        cols = ["race_label", "race_key"] + cols
+
     cols = [c for c in cols if c in df.columns]
     out = df[cols].copy()
+
     if "ml_top3_prob" in out.columns:
         out["ml_top3_prob"] = (out["ml_top3_prob"] * 100).round(1).astype(str) + "%"
     if "expected_value" in out.columns:
-        out["expected_value"] = out["expected_value"].round(2)
+        out["expected_value"] = pd.to_numeric(out["expected_value"], errors="coerce").round(2)
+
     for c in ["jockey_top3_rate_prior", "trainer_top3_rate_prior", "sire_top3_rate_prior", "horse_distance_top3_rate_prior"]:
         if c in out.columns:
-            out[c] = (out[c] * 100).round(1).astype(str) + "%"
+            out[c] = (pd.to_numeric(out[c], errors="coerce").fillna(0) * 100).round(1).astype(str) + "%"
+
     return out.rename(columns=JP_COLUMNS)
-
-
-def race_label(df: pd.DataFrame, key: str) -> str:
-    """selectbox表示用。race_keyそのままだと長いので日本語っぽく表示。"""
-    r = df[df["race_key"] == key]
-    if r.empty:
-        return str(key)
-    x = r.iloc[0]
-    try:
-        date_txt = f"{int(x.get('year_full', 0))}/{int(x.get('month', 0))}/{int(x.get('day', 0))}"
-    except Exception:
-        date_txt = str(x.get("date_int", ""))
-    place = str(x.get("place", ""))
-    race_no = x.get("race_no", "")
-    race_name = str(x.get("race_name", ""))
-    source = str(x.get("source_file", ""))
-    try:
-        race_no = int(race_no)
-    except Exception:
-        pass
-    return f"{date_txt} {place} {race_no}R {race_name} / {source}"
 
 
 def make_tickets(race_df: pd.DataFrame) -> dict:
@@ -490,76 +450,94 @@ def make_tickets(race_df: pd.DataFrame) -> dict:
     }
 
 
-st.title("🐾 にゃんこ競馬AI")
-st.caption("iPad / Streamlit Cloud対応版。URLを開いて予想CSVを入れるだけ。")
+def app_main():
+    st.title("🐾 にゃんこ競馬AI")
+    st.caption("iPad / Streamlit Cloud対応版。URLを開いて予想CSVを入れるだけ。")
 
-with st.sidebar:
-    st.header("設定")
-    uploaded_model = st.file_uploader("学習済みモデルPKL", type=["pkl"])
-    csv_mode = st.radio("予想CSV形式", ["52列TARGET形式", "簡易CSV形式"], index=0)
-    st.info("PKLをGitHubの models/nyanko_keiba_top3_model.pkl に置けば、iPadではPKLアップロード不要です。")
-
-bundle, model_status = load_model(uploaded_model)
-
-if bundle is None:
-    st.warning("学習済みモデルPKLがありません。サイドバーからPKLをアップロードしてください。")
-else:
-    st.success(f"モデル読込: {model_status}")
-
-uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
-
-if uploaded_csv is not None and bundle is not None:
-    try:
-        raw = uploaded_csv.read()
-
-        if csv_mode == "52列TARGET形式":
-            df0 = read_csv_bytes(raw)
-            pred_src = normalize_52cols(df0, uploaded_csv.name)
+    with st.sidebar:
+        st.header("設定")
+        uploaded_model = st.file_uploader("学習済みモデルPKL", type=["pkl"])
+        csv_mode = st.radio("予想CSV形式", ["52列TARGET形式", "簡易CSV形式"], index=0)
+        st.info("GitHubの models/nyanko_keiba_top3_model.pkl にPKLがあれば、iPadではPKLアップロード不要です。")
+        if MODEL_PATH.exists():
+            st.success(f"同梱PKLあり: {MODEL_PATH.name}")
         else:
-            pred_src = read_simple_csv_to_52(raw)
+            st.warning("同梱PKLなし。画面からPKLをアップロードしてください。")
 
-        pred_df = predict(bundle, pred_src)
+    uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
 
-        st.subheader("予想結果")
-        races = pred_df["race_key"].drop_duplicates().tolist()
-        selected_race = st.selectbox(
-            "レース選択",
-            races,
-            format_func=lambda k: race_label(pred_df, k)
-        )
+    if uploaded_csv is None:
+        st.info("予想CSVをアップロードしてください。")
+        return
 
-        race_df = pred_df[pred_df["race_key"] == selected_race].sort_values("ml_rank")
-        st.dataframe(jp_view(race_df), use_container_width=True, hide_index=True)
+    if st.button("予想する", type="primary"):
+        try:
+            bundle, model_status = load_model_safely(uploaded_model)
+            if bundle is None:
+                st.error("学習済みモデルPKLがありません。modelsフォルダに置くか、サイドバーからアップロードしてください。")
+                return
 
-        tickets = make_tickets(race_df)
+            st.success(f"モデル読込: {model_status}")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("本命", tickets["本命"])
-        c2.metric("馬連BOX", tickets["馬連BOX"])
-        c3.metric("三連複BOX", tickets["三連複BOX"])
+            raw = uploaded_csv.read()
+            if csv_mode == "52列TARGET形式":
+                df0 = read_csv_bytes(raw)
+                pred_src = normalize_52cols(df0, uploaded_csv.name)
+            else:
+                pred_src = read_simple_csv_to_52(raw, uploaded_csv.name)
 
-        st.write(f"**危険人気馬:** {tickets['危険人気馬']}")
-        st.write(f"**穴候補:** {tickets['穴候補']}")
+            pred_df = predict(bundle, pred_src)
 
-        st.subheader("全レース")
-        all_jp = jp_view(pred_df.sort_values(["race_key", "ml_rank"]), include_race_key=True)
-        st.dataframe(all_jp, use_container_width=True, hide_index=True)
+            st.subheader("予想結果")
+            race_options = (
+                pred_df[["race_key", "race_label"]]
+                .drop_duplicates()
+                .sort_values("race_label")
+            )
+            label_map = dict(zip(race_options["race_label"], race_options["race_key"]))
+            selected_label = st.selectbox("レース選択", list(label_map.keys()))
+            selected_race = label_map[selected_label]
 
-        csv_bytes = all_jp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button(
-            "日本語CSVダウンロード",
-            data=csv_bytes,
-            file_name="nyanko_keiba_prediction_jp.csv",
-            mime="text/csv"
-        )
+            race_df = pred_df[pred_df["race_key"] == selected_race].sort_values("ml_rank")
+            st.dataframe(jp_view(race_df), use_container_width=True, hide_index=True)
 
-    except Exception as e:
-        st.error(f"予想できませんでした: {e}")
+            tickets = make_tickets(race_df)
 
-st.divider()
-with st.expander("簡易CSVテンプレ"):
-    st.caption("※これは入力例です。実在馬名は入れていません。実際の出走馬CSVをアップロードしてください。")
-    st.code("""馬番,馬名,性別,年齢,騎手,斤量,オッズ,人気,競馬場,レース番号,レース名,距離,馬場,頭数,芝ダ
+            c1, c2, c3 = st.columns(3)
+            c1.metric("本命", tickets["本命"])
+            c2.metric("馬連BOX", tickets["馬連BOX"])
+            c3.metric("三連複BOX", tickets["三連複BOX"])
+
+            st.write(f"**危険人気馬:** {tickets['危険人気馬']}")
+            st.write(f"**穴候補:** {tickets['穴候補']}")
+
+            st.subheader("全レース")
+            all_jp = jp_view(pred_df.sort_values(["race_key", "ml_rank"]), include_race_key=True)
+            st.dataframe(all_jp, use_container_width=True, hide_index=True)
+
+            csv_bytes = all_jp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "日本語CSVダウンロード",
+                data=csv_bytes,
+                file_name="nyanko_keiba_prediction_jp.csv",
+                mime="text/csv"
+            )
+
+        except Exception as e:
+            st.error(f"予想できませんでした: {e}")
+            st.exception(e)
+
+    st.divider()
+    with st.expander("簡易CSVテンプレ"):
+        st.caption("※これは入力例です。実在馬名は入れていません。実際の出走馬CSVをアップロードしてください。")
+        st.code("""馬番,馬名,性別,年齢,騎手,斤量,オッズ,人気,競馬場,レース番号,レース名,距離,馬場,頭数,芝ダ
 1,サンプルホースA,牡,5,サンプル騎手A,58.0,2.8,1,東京,11,サンプルレース,2000,良,18,芝
 2,サンプルホースB,牝,4,サンプル騎手B,56.0,8.5,5,東京,11,サンプルレース,2000,良,18,芝
 """, language="csv")
+
+
+try:
+    app_main()
+except Exception as e:
+    st.error("アプリ起動時エラーです。下の詳細を確認してください。")
+    st.exception(e)

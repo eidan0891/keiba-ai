@@ -427,32 +427,124 @@ def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
 
 
 def make_tickets(race_df: pd.DataFrame) -> dict:
-    r = race_df.sort_values("ml_rank")
+    r = race_df.sort_values("ml_rank").copy()
 
-    nums = []
-    for _, row in r.head(5).iterrows():
-        if pd.notna(row["horse_no"]):
-            nums.append(str(int(row["horse_no"])))
+    def horse_label(row):
+        if pd.notna(row.get("horse_no", np.nan)):
+            try:
+                return f"{int(row['horse_no'])} {row['horse_name']}"
+            except Exception:
+                return f"{row.get('horse_no', '')} {row.get('horse_name', '')}"
+        return str(row.get("horse_name", ""))
 
-    def n(row):
-        return f"{int(row['horse_no'])} {row['horse_name']}" if pd.notna(row["horse_no"]) else str(row["horse_name"])
+    def horse_no(row):
+        try:
+            return str(int(row["horse_no"]))
+        except Exception:
+            return str(row.get("horse_no", ""))
 
-    top = r.head(5)
+    top = r.head(6)
+    top1 = top.iloc[0] if len(top) >= 1 else None
+    top2 = top.iloc[1] if len(top) >= 2 else None
+    top3 = top.iloc[2] if len(top) >= 3 else None
+
+    main_nums = [horse_no(row) for _, row in r.head(5).iterrows() if horse_no(row)]
+    top4_nums = main_nums[:4]
+    top5_nums = main_nums[:5]
+
     danger = r[r["danger_popular"] == "危険"]
-    value = r[r["value_horse"] == "穴候補"]
+    value = r[r["value_horse"] == "穴候補"].copy()
+
+    # 穴候補が空なら、人気6番人気以下かつAI順位6位以内を穴として拾う
+    if value.empty:
+        value = r[(r["popularity"].fillna(0) >= 6) & (r["ml_rank"] <= 6)].copy()
+
+    ana_nums = [horse_no(row) for _, row in value.head(3).iterrows() if horse_no(row)]
+    ana_labels = [horse_label(row) for _, row in value.head(3).iterrows()]
+
+    honmei1 = horse_label(top1) if top1 is not None else ""
+    honmei2 = " - ".join([horse_no(row) for _, row in r.head(2).iterrows()]) if len(r) >= 2 else ""
+    honmei1_num = horse_no(top1) if top1 is not None else ""
+    honmei2_nums = [horse_no(row) for _, row in r.head(2).iterrows()]
+
+    # 単勝・複勝はAI1位を基本
+    tansho = honmei1
+    fukusho = " / ".join([horse_label(row) for _, row in r.head(3).iterrows()])
+
+    # 枠連は枠番があれば使う。無ければ馬番で代替表示
+    if "frame_no" in r.columns and r["frame_no"].notna().any():
+        frame_top = []
+        for _, row in r.head(4).iterrows():
+            try:
+                f = str(int(row["frame_no"]))
+                if f not in frame_top:
+                    frame_top.append(f)
+            except Exception:
+                pass
+        wakuren = " - ".join(frame_top[:3]) if frame_top else "枠番データ不足"
+    else:
+        wakuren = "枠番データ不足"
+
+    umaren = " - ".join(top4_nums)
+    wide = " - ".join(top5_nums)
+    umatan = f"{honmei1_num} → {' / '.join([n for n in top4_nums if n != honmei1_num])}" if honmei1_num else ""
+    sanrenpuku = " - ".join(top5_nums)
+    sanrentan = ""
+    if len(top5_nums) >= 5:
+        sanrentan = f"1着 {top5_nums[0]} / 2着 {top5_nums[1]}, {top5_nums[2]} / 3着 {top5_nums[1]}, {top5_nums[2]}, {top5_nums[3]}, {top5_nums[4]}"
+
+    honmei2_plus_ana = ""
+    if len(honmei2_nums) >= 2 and ana_nums:
+        honmei2_plus_ana = f"{' - '.join(honmei2_nums)} + 穴 {' / '.join(ana_nums)}"
+
+    honmei1_plus_ana = ""
+    if honmei1_num and ana_nums:
+        honmei1_plus_ana = f"{honmei1_num} + 穴 {' / '.join(ana_nums)}"
 
     return {
-        "本命": n(top.iloc[0]) if len(top) else "",
-        "馬連BOX": " - ".join(nums[:4]),
-        "三連複BOX": " - ".join(nums[:5]),
-        "危険人気馬": " / ".join([n(row) for _, row in danger.iterrows()]) or "なし",
-        "穴候補": " / ".join([n(row) for _, row in value.iterrows()]) or "なし",
+        "本命": honmei1,
+        "単勝": tansho,
+        "複勝": fukusho,
+        "馬連": umaren,
+        "枠連": wakuren,
+        "ワイド": wide,
+        "馬単": umatan,
+        "三連複": sanrenpuku,
+        "三連単": sanrentan,
+        "本命2頭＋穴": honmei2_plus_ana or "穴候補なし",
+        "本命1頭＋穴": honmei1_plus_ana or "穴候補なし",
+        "危険人気馬": " / ".join([horse_label(row) for _, row in danger.iterrows()]) or "なし",
+        "穴候補": " / ".join(ana_labels) or "なし",
     }
+
+
+def show_ticket_recommendations(tickets: dict):
+    st.subheader("馬券種別ごとの推奨")
+
+    rows = [
+        ("単勝", tickets.get("単勝", "")),
+        ("複勝", tickets.get("複勝", "")),
+        ("馬連", tickets.get("馬連", "")),
+        ("枠連", tickets.get("枠連", "")),
+        ("ワイド", tickets.get("ワイド", "")),
+        ("馬単", tickets.get("馬単", "")),
+        ("三連複", tickets.get("三連複", "")),
+        ("三連単", tickets.get("三連単", "")),
+        ("本命2頭＋穴", tickets.get("本命2頭＋穴", "")),
+        ("本命1頭＋穴", tickets.get("本命1頭＋穴", "")),
+    ]
+
+    ticket_df = pd.DataFrame(rows, columns=["馬券種別", "買い目候補"])
+    st.dataframe(ticket_df, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    c1.info(f"危険人気馬: {tickets.get('危険人気馬', 'なし')}")
+    c2.success(f"穴候補: {tickets.get('穴候補', 'なし')}")
 
 
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
-    st.caption("iPad / Streamlit Cloud対応版。URLを開いて予想CSVを入れるだけ。")
+    st.caption("iPad / Streamlit Cloud対応版。単勝・複勝・馬連・枠連・ワイド・馬単・三連複・三連単・本命＋穴まで出します。")
 
     with st.sidebar:
         st.header("設定")
@@ -505,11 +597,10 @@ def app_main():
 
             c1, c2, c3 = st.columns(3)
             c1.metric("本命", tickets["本命"])
-            c2.metric("馬連BOX", tickets["馬連BOX"])
-            c3.metric("三連複BOX", tickets["三連複BOX"])
+            c2.metric("単勝", tickets["単勝"])
+            c3.metric("複勝", tickets["複勝"])
 
-            st.write(f"**危険人気馬:** {tickets['危険人気馬']}")
-            st.write(f"**穴候補:** {tickets['穴候補']}")
+            show_ticket_recommendations(tickets)
 
             st.subheader("全レース")
             all_jp = jp_view(pred_df.sort_values(["race_key", "ml_rank"]), include_race_key=True)

@@ -524,8 +524,10 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
 
     df = target_df.copy()
 
+    # yosou.csv が「今週の予想用CSV」の場合、着順が無いのは正常。
+    # その場合はTARGET補正をスキップして、出馬表単体で予想を続行する。
     if "finish" not in df.columns:
-        raise ValueError("TARGET過去CSVに 確定着順/着順 がありません。")
+        return {}
 
     df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
     df = df[df["finish"].notna()].copy()
@@ -1723,7 +1725,14 @@ def app_main():
             pred_src = merge_target_features(pred_src)
 
             if TARGET_CSV_PATH.exists():
-                st.success("TARGET過去CSV（yosou.csv）を結合しました。")
+                try:
+                    _target_df_check, _features_check = load_target_features_cached()
+                    if _features_check:
+                        st.success("TARGET過去CSV（yosou.csv）を結合しました。")
+                    else:
+                        st.info("yosou.csv はありますが、着順が無いため過去補正なしで予想します。")
+                except Exception:
+                    st.info("yosou.csv はありますが、過去補正に使えないため出馬表単体で予想します。")
             else:
                 st.info("TARGET過去CSV（yosou.csv）は未配置です。URL/CSV単体で予想します。")
 

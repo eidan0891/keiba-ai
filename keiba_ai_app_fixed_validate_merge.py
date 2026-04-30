@@ -218,13 +218,19 @@ def load_netkeiba_shutuba(url: str) -> pd.DataFrame:
         raise ValueError(f"netkeibaページ取得に失敗しました: {e}")
 
     html = res.text
-    if "馬名" not in html and "出馬表" not in html:
-        raise ValueError("netkeibaの出馬表HTMLを取得できませんでした。URLまたはアクセス制限を確認してください。")
 
+    # Streamlit Cloudからnetkeibaへアクセスすると、実ページではなくブロック/別HTMLが返る場合がある。
+    # ここで即エラーにせず、まずテーブル解析を試す。
     try:
         tables = pd.read_html(StringIO(html))
     except Exception as e:
-        raise ValueError(f"出馬表テーブル解析に失敗しました: {e}")
+        snippet = html[:300].replace("\n", " ").replace("\r", " ")
+        raise ValueError(
+            "netkeibaの表を解析できませんでした。"
+            "Streamlit CloudからのURL取得がブロックされている可能性があります。"
+            "この場合は出馬表CSVアップロードを使ってください。"
+            f" 詳細: {e} / HTML先頭: {snippet}"
+        )
 
     if not tables:
         raise ValueError("出馬表テーブルを取得できませんでした。")
@@ -242,7 +248,12 @@ def load_netkeiba_shutuba(url: str) -> pd.DataFrame:
             break
 
     if src is None:
-        src = tables[0].copy()
+        # テーブルはあるが出馬表ではない場合
+        raise ValueError(
+            "netkeibaから取得したHTML内に出馬表テーブルが見つかりません。"
+            "Streamlit Cloudからのアクセス制限、またはURL違いの可能性があります。"
+            "出馬表CSVアップロードなら予想できます。"
+        )
 
     if isinstance(src.columns, pd.MultiIndex):
         src.columns = ["_".join([str(x) for x in c if str(x) != "nan"]).strip("_") for c in src.columns]
@@ -1607,24 +1618,33 @@ def app_main():
             st.info("TARGET過去CSVなし: yosou.csv をリポジトリ直下に置くと補正します。")
 
     st.subheader("入力方法")
-    input_tabs = st.tabs(["netkeiba URL", "出馬表CSV"])
 
-    with input_tabs[0]:
+    input_method = st.radio(
+        "入力方法を選択",
+        ["出馬表CSV", "netkeiba URL"],
+        horizontal=True,
+        index=0
+    )
+
+    race_url = ""
+    uploaded_csv = None
+
+    if input_method == "netkeiba URL":
         race_url = st.text_input(
             "netkeiba 出馬表URL",
             placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=202605020111"
         )
-        st.caption("発走前予想用。出馬表URLから馬番・馬名・騎手・斤量・オッズ・人気を取得します。URLは race_id 付きのものを入れてください。")
-
-    with input_tabs[1]:
+        st.caption("URL取得はnetkeiba側にブロックされる場合があります。その場合は出馬表CSVを使ってください。")
+    else:
         uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
-        st.caption("TARGET 52列CSV、または簡易CSVを使えます。")
+        st.caption("TARGET 52列CSV、または簡易CSVを使えます。CSV選択時はURL欄が残っていても無視します。")
 
-    has_url = bool(race_url and race_url.strip())
-    has_csv = uploaded_csv is not None
+    if input_method == "netkeiba URL" and not (race_url and race_url.strip()):
+        st.info("netkeiba 出馬表URLを入力してください。")
+        return
 
-    if not has_url and not has_csv:
-        st.info("netkeiba URLを入力するか、出馬表CSVをアップロードしてください。")
+    if input_method == "出馬表CSV" and uploaded_csv is None:
+        st.info("出馬表CSVをアップロードしてください。")
         return
 
     if st.button("予想する", type="primary"):
@@ -1636,8 +1656,7 @@ def app_main():
 
             st.success(f"モデル読込: {model_status}")
 
-            # URL優先。URLが空ならCSVを使う。
-            if has_url:
+            if input_method == "netkeiba URL":
                 pred_src = load_netkeiba_shutuba(race_url.strip())
                 st.success("netkeiba出馬表URLから取得しました。")
             else:

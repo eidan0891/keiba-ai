@@ -10,10 +10,11 @@
 # - 簡易CSVテンプレから実在馬名を削除
 #
 # 実行:
-#   python -m streamlit run nyanko_keiba_ipad_cloud_20260428_target_pkl_fixed.py
+#   python -m streamlit run nyanko_keiba_ipad_cloud_20260428.py
 # ------------------------------------------------------------
 
 import io
+import re
 from pathlib import Path
 
 import joblib
@@ -161,6 +162,138 @@ def repair_simple_imputer(obj):
 
     walk(obj)
     return obj
+
+
+
+def parse_netkeiba_race_id(url: str) -> dict:
+    m = re.search(r"race_id=(\d{12})", url or "")
+    if not m:
+        m = re.search(r"/race/(\d{12})", url or "")
+    if not m:
+        return {}
+
+    race_id = m.group(1)
+    place_map = {
+        "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+        "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉",
+    }
+    return {
+        "race_id": race_id,
+        "year": int(race_id[0:4]),
+        "place_code": race_id[4:6],
+        "place": place_map.get(race_id[4:6], "不明"),
+        "kai": int(race_id[6:8]),
+        "nichiji": int(race_id[8:10]),
+        "race_no": int(race_id[10:12]),
+    }
+
+
+def load_netkeiba_shutuba(url: str) -> pd.DataFrame:
+    """
+    netkeiba出馬表URLから発走前予想用CSV相当データを作る。
+    発走前なので、着順・通過順・上がりは空。
+    """
+    info = parse_netkeiba_race_id(url)
+    if not info:
+        raise ValueError("netkeibaのrace_idをURLから取得できませんでした。")
+
+    tables = pd.read_html(url)
+    if not tables:
+        raise ValueError("出馬表テーブルを取得できませんでした。")
+
+    src = None
+    for t in tables:
+        tmp_cols = t.columns
+        if isinstance(tmp_cols, pd.MultiIndex):
+            cols = ["_".join([str(x) for x in c if str(x) != "nan"]).strip("_") for c in tmp_cols]
+        else:
+            cols = [str(c) for c in tmp_cols]
+        joined = " ".join(cols)
+        if ("馬名" in joined or "馬番" in joined or "馬 番" in joined) and ("騎手" in joined or "斤量" in joined):
+            src = t.copy()
+            break
+
+    if src is None:
+        src = tables[0].copy()
+
+    if isinstance(src.columns, pd.MultiIndex):
+        src.columns = ["_".join([str(x) for x in c if str(x) != "nan"]).strip("_") for c in src.columns]
+    else:
+        src.columns = [str(c) for c in src.columns]
+
+    rename = {}
+    for c in src.columns:
+        s = str(c)
+        if "枠" == s or s.endswith("_枠") or "枠番" in s:
+            rename[c] = "frame_no"
+        elif "馬番" in s or "馬 番" in s:
+            rename[c] = "horse_no"
+        elif "馬名" in s:
+            rename[c] = "horse_name"
+        elif "性齢" in s or "性令" in s:
+            rename[c] = "sex_age"
+        elif "斤量" in s:
+            rename[c] = "carried_weight"
+        elif "騎手" in s:
+            rename[c] = "jockey"
+        elif "単勝" in s or "オッズ" in s:
+            rename[c] = "odds"
+        elif "人気" in s:
+            rename[c] = "popularity"
+
+    src = src.rename(columns=rename)
+
+    missing = [c for c in ["horse_no", "horse_name"] if c not in src.columns]
+    if missing:
+        raise ValueError(f"出馬表から必要列を取得できませんでした: {missing} / columns={list(src.columns)}")
+
+    src = src.dropna(subset=["horse_name"], how="all").copy()
+    src["horse_name"] = src["horse_name"].astype(str).str.replace("\n", " ", regex=False).str.strip()
+    src = src[src["horse_name"].ne("")]
+    src = src[~src["horse_name"].str.contains("馬名|出走取消|除外", na=False)]
+
+    rows = []
+    for i, r in src.iterrows():
+        row = {c: "" for c in COLS_52}
+        row["year"] = info["year"] - 2000
+        row["month"] = 1
+        row["day"] = 1
+        row["kai"] = info.get("kai", 1)
+        row["place"] = info.get("place", "不明")
+        row["nichiji"] = info.get("nichiji", 1)
+        row["race_no"] = info.get("race_no", 11)
+        row["race_name"] = f"netkeiba_{info.get('race_id', '')}"
+        row["race_grade"] = "3"
+        row["track_type"] = ""
+        row["course_kind"] = "0"
+        row["distance"] = "0"
+        row["going"] = ""
+        row["horse_name"] = r.get("horse_name", "")
+        sex_age = str(r.get("sex_age", "")).strip()
+        if sex_age:
+            row["sex"] = sex_age[0]
+            age = re.sub(r"\D", "", sex_age[1:])
+            row["age"] = age
+        row["jockey"] = r.get("jockey", "")
+        row["carried_weight"] = r.get("carried_weight", "")
+        row["field_size"] = len(src)
+        row["horse_no"] = r.get("horse_no", i + 1)
+        row["frame_no"] = r.get("frame_no", "")
+        row["odds"] = r.get("odds", "")
+        row["popularity"] = r.get("popularity", "")
+        rows.append([row[c] for c in COLS_52])
+
+    df = pd.DataFrame(rows, columns=COLS_52)
+    df["source_file"] = f"netkeiba_{info.get('race_id', '')}"
+    return clean_types(df)
+
+
+def load_uploaded_entry_csv(uploaded_csv, csv_mode: str) -> pd.DataFrame:
+    raw = uploaded_csv.read()
+    if csv_mode == "52列TARGET形式":
+        df0 = read_csv_bytes(raw)
+        return normalize_52cols(df0, uploaded_csv.name)
+    return read_simple_csv_to_52(raw, uploaded_csv.name)
 
 
 def read_csv_bytes(raw: bytes) -> pd.DataFrame:
@@ -322,151 +455,6 @@ def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.Dat
     return clean_types(df)
 
 
-
-# ------------------------------------------------------------
-# PKL内TARGETデータから事前成績を復元する補修
-# ------------------------------------------------------------
-def normalize_text_key(x):
-    if pd.isna(x):
-        return ""
-    return str(x).replace("\u3000", " ").strip().replace(" ", "")
-
-
-def flatten_bundle_dataframes(obj, prefix="pkl", seen=None):
-    if seen is None:
-        seen = set()
-    out = []
-    if obj is None:
-        return out
-    oid = id(obj)
-    if oid in seen:
-        return out
-    seen.add(oid)
-    if isinstance(obj, pd.DataFrame):
-        return [(prefix, obj)]
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            out.extend(flatten_bundle_dataframes(v, f"{prefix}.{k}", seen))
-        return out
-    if isinstance(obj, (list, tuple)):
-        for i, v in enumerate(obj):
-            out.extend(flatten_bundle_dataframes(v, f"{prefix}[{i}]", seen))
-        return out
-    if hasattr(obj, "__dict__"):
-        for k, v in obj.__dict__.items():
-            if isinstance(v, pd.DataFrame):
-                out.append((f"{prefix}.{k}", v))
-            elif isinstance(v, dict):
-                for kk, vv in v.items():
-                    if isinstance(vv, pd.DataFrame):
-                        out.append((f"{prefix}.{k}.{kk}", vv))
-    return out
-
-
-def normalize_history_df_for_priors(src: pd.DataFrame) -> pd.DataFrame:
-    df = src.copy()
-    if df.shape[1] >= 52 and not any(c in df.columns for c in ["horse_name", "馬名"]):
-        df = df.iloc[:, :52].copy()
-        df.columns = COLS_52
-    rename = {
-        "馬名": "horse_name", "騎手": "jockey", "調教師": "trainer", "種牡馬": "sire",
-        "母": "dam", "母父": "broodmare_sire", "距離": "distance", "芝ダ": "track_type",
-        "馬場": "going", "競馬場": "place", "着順": "finish", "人気": "popularity",
-        "オッズ": "odds", "年": "year", "月": "month", "日": "day", "R": "race_no",
-        "レース番号": "race_no", "馬番": "horse_no", "枠番": "frame_no", "頭数": "field_size",
-        "通過1": "pass1", "通過2": "pass2", "通過3": "pass3", "通過4": "pass4",
-        "上がり3F": "last3f", "horse": "horse_name", "jockey_name": "jockey",
-        "trainer_name": "trainer", "sire_name": "sire",
-    }
-    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-    if "finish" not in df.columns:
-        return pd.DataFrame()
-    if not any(c in df.columns for c in ["horse_name", "jockey", "trainer", "sire"]):
-        return pd.DataFrame()
-    for c in ["year", "month", "day", "race_no", "distance", "finish", "horse_no", "frame_no", "field_size", "odds", "popularity", "pass1", "pass2", "pass3", "pass4", "last3f"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "date_int" not in df.columns:
-        if all(c in df.columns for c in ["year", "month", "day"]):
-            y = pd.to_numeric(df["year"], errors="coerce").fillna(0)
-            y = y.apply(lambda x: int(x) + 2000 if int(x) < 100 and int(x) > 0 else int(x))
-            df["date_int"] = y * 10000 + pd.to_numeric(df["month"], errors="coerce").fillna(0).astype(int) * 100 + pd.to_numeric(df["day"], errors="coerce").fillna(0).astype(int)
-        else:
-            df["date_int"] = 0
-    for c in ["horse_name", "jockey", "trainer", "sire", "track_type", "place"]:
-        if c not in df.columns:
-            df[c] = ""
-        df[c + "_key"] = df[c].map(normalize_text_key)
-    df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
-    df = df[df["finish"].notna()].copy()
-    df = df[df["finish"] > 0].copy()
-    df["is_win"] = df["finish"].eq(1)
-    df["is_top3"] = df["finish"].between(1, 3)
-    return df
-
-
-def build_rate_table(hist: pd.DataFrame, key_cols, prefix: str) -> pd.DataFrame:
-    if hist.empty or any(c not in hist.columns for c in key_cols):
-        return pd.DataFrame()
-    g = hist.groupby(key_cols, dropna=False).agg(runs=("finish", "count"), wins=("is_win", "sum"), top3=("is_top3", "sum")).reset_index()
-    g[f"{prefix}_runs_prior"] = g["runs"].astype(float)
-    g[f"{prefix}_win_rate_prior"] = (g["wins"] / g["runs"]).fillna(0.0)
-    g[f"{prefix}_top3_rate_prior"] = (g["top3"] / g["runs"]).fillna(0.0)
-    return g.drop(columns=["runs", "wins", "top3"])
-
-
-def add_target_priors_from_pkl(bundle, df: pd.DataFrame):
-    base = df.copy()
-    debug = []
-    for c in ["horse_name", "jockey", "trainer", "sire", "track_type", "place"]:
-        if c not in base.columns:
-            base[c] = ""
-        base[c + "_key"] = base[c].map(normalize_text_key)
-    if "distance" not in base.columns:
-        base["distance"] = 0
-    base["distance"] = pd.to_numeric(base["distance"], errors="coerce").fillna(0)
-
-    frames = flatten_bundle_dataframes(bundle)
-    hist_list = []
-    for name, f in frames:
-        h = normalize_history_df_for_priors(f)
-        if not h.empty and len(h) >= 10:
-            hist_list.append(h)
-            debug.append(f"{name}: {len(h)}行")
-
-    if not hist_list:
-        base.attrs["pkl_prior_debug"] = "PKL内にTARGET過去成績DataFrameを検出できず。0%表示のまま。"
-        return add_prior_stats_for_prediction(base)
-
-    hist = pd.concat(hist_list, ignore_index=True, sort=False).drop_duplicates()
-    if "date_int" in base.columns and base["date_int"].notna().any():
-        min_pred_date = pd.to_numeric(base["date_int"], errors="coerce").min()
-        if pd.notna(min_pred_date) and min_pred_date > 0:
-            old = hist[pd.to_numeric(hist["date_int"], errors="coerce").fillna(0) < min_pred_date].copy()
-            if not old.empty:
-                hist = old
-
-    for keys, prefix in [
-        (["jockey_key"], "jockey"),
-        (["trainer_key"], "trainer"),
-        (["sire_key"], "sire"),
-        (["horse_name_key"], "horse"),
-        (["horse_name_key", "distance"], "horse_distance"),
-        (["horse_name_key", "track_type_key"], "horse_track"),
-    ]:
-        tbl = build_rate_table(hist, keys, prefix)
-        if not tbl.empty:
-            base = base.merge(tbl, on=keys, how="left")
-
-    base = add_prior_stats_for_prediction(base)
-    nonzero = {}
-    for c in ["jockey_top3_rate_prior", "trainer_top3_rate_prior", "sire_top3_rate_prior", "horse_distance_top3_rate_prior"]:
-        if c in base.columns:
-            nonzero[c] = int((pd.to_numeric(base[c], errors="coerce").fillna(0) > 0).sum())
-    base.attrs["pkl_prior_debug"] = " / ".join(debug[:5]) + f" / 非ゼロ件数: {nonzero}"
-    return base
-
-
 def add_prior_stats_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -532,7 +520,7 @@ def get_pipeline_and_features(bundle):
 
 
 def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
-    df = add_target_priors_from_pkl(bundle, df)
+    df = add_prior_stats_for_prediction(df)
     df = add_running_style(df)
     pipe, feature_cols = get_pipeline_and_features(bundle)
 
@@ -1273,7 +1261,7 @@ def show_ticket_tabs(race_df: pd.DataFrame):
 
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
-    st.caption("iPad / Streamlit Cloud対応版。単勝・複勝・馬連・枠連・ワイド・馬単・三連複・三連単・本命＋穴まで出します。")
+    st.caption("iPad / Streamlit Cloud対応版。netkeiba URLまたは出馬表CSVから発走前予想できます。")
 
     with st.sidebar:
         st.header("設定")
@@ -1285,10 +1273,25 @@ def app_main():
         else:
             st.warning("同梱PKLなし。画面からPKLをアップロードしてください。")
 
-    uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
+    st.subheader("入力方法")
+    input_tabs = st.tabs(["netkeiba URL", "出馬表CSV"])
 
-    if uploaded_csv is None:
-        st.info("予想CSVをアップロードしてください。")
+    with input_tabs[0]:
+        race_url = st.text_input(
+            "netkeiba 出馬表URL",
+            placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=202605020111"
+        )
+        st.caption("発走前予想用。出馬表URLから馬番・馬名・騎手・斤量・オッズ・人気を取得します。")
+
+    with input_tabs[1]:
+        uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
+        st.caption("TARGET 52列CSV、または簡易CSVを使えます。")
+
+    has_url = bool(race_url and race_url.strip())
+    has_csv = uploaded_csv is not None
+
+    if not has_url and not has_csv:
+        st.info("netkeiba URLを入力するか、出馬表CSVをアップロードしてください。")
         return
 
     if st.button("予想する", type="primary"):
@@ -1300,17 +1303,15 @@ def app_main():
 
             st.success(f"モデル読込: {model_status}")
 
-            raw = uploaded_csv.read()
-            if csv_mode == "52列TARGET形式":
-                df0 = read_csv_bytes(raw)
-                pred_src = normalize_52cols(df0, uploaded_csv.name)
+            # URL優先。URLが空ならCSVを使う。
+            if has_url:
+                pred_src = load_netkeiba_shutuba(race_url.strip())
+                st.success("netkeiba出馬表URLから取得しました。")
             else:
-                pred_src = read_simple_csv_to_52(raw, uploaded_csv.name)
+                pred_src = load_uploaded_entry_csv(uploaded_csv, csv_mode)
+                st.success("出馬表CSVから取得しました。")
 
             pred_df = predict(bundle, pred_src)
-            prior_debug = pred_df.attrs.get("pkl_prior_debug", "")
-            if prior_debug:
-                st.info(f"PKL/TARGETデータ連携: {prior_debug}")
 
             st.subheader("予想結果")
             race_options = (

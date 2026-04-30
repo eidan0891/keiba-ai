@@ -328,11 +328,50 @@ def load_netkeiba_shutuba(url: str) -> pd.DataFrame:
 
 
 def load_uploaded_entry_csv(uploaded_csv, csv_mode: str) -> pd.DataFrame:
+    """
+    出馬表CSVを読む。
+    - TARGET 52列CSV
+    - 簡易CSV（馬番,馬名,性別,年齢,騎手,斤量,オッズ,人気）
+    どちらでも自動判定する。
+    """
     raw = uploaded_csv.read()
+
+    # まずヘッダーありCSVとして読めるか確認
+    header_df = None
+    last_error = None
+    for enc in ["utf-8-sig", "utf-8", "cp932", "shift_jis"]:
+        try:
+            header_df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str)
+            break
+        except Exception as e:
+            last_error = e
+
+    # 簡易CSVっぽい列がある場合は、画面選択に関係なく簡易CSVとして処理
+    if header_df is not None:
+        cols = set([str(c).strip() for c in header_df.columns])
+        simple_markers = {
+            "馬名", "horse_name",
+            "騎手", "jockey",
+            "オッズ", "odds",
+            "人気", "popularity",
+        }
+        if len(cols & simple_markers) >= 3:
+            return read_simple_csv_to_52(raw)
+
+    # TARGET 52列形式を試す
     if csv_mode == "52列TARGET形式":
-        df0 = read_csv_bytes(raw)
-        return normalize_52cols(df0, uploaded_csv.name)
-    return read_simple_csv_to_52(raw, uploaded_csv.name)
+        try:
+            df0 = read_csv_bytes(raw)
+            return normalize_52cols(df0, uploaded_csv.name)
+        except Exception as e:
+            # 52列で失敗したら簡易CSVにフォールバック
+            try:
+                return read_simple_csv_to_52(raw)
+            except Exception:
+                raise e
+
+    # 明示的に簡易CSV
+    return read_simple_csv_to_52(raw)
 
 
 
@@ -738,29 +777,46 @@ def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.Dat
         "馬名": "horse_name",
         "性別": "sex",
         "年齢": "age",
+        "性齢": "sex_age",
         "騎手": "jockey",
         "斤量": "carried_weight",
         "オッズ": "odds",
+        "単勝オッズ": "odds",
         "人気": "popularity",
         "年": "year",
         "月": "month",
         "日": "day",
         "競馬場": "place",
+        "場所": "place",
         "レース番号": "race_no",
         "R": "race_no",
         "レース名": "race_name",
         "距離": "distance",
         "馬場": "going",
+        "馬場状態": "going",
         "馬番": "horse_no",
+        "枠番": "frame_no",
         "頭数": "field_size",
         "芝ダ": "track_type",
     }
     src = src.rename(columns=rename)
 
-    required = ["horse_name", "sex", "age", "jockey", "carried_weight", "odds", "popularity"]
+    # sex_age がある場合は 性別/年齢 に分解
+    if "sex_age" in src.columns:
+        if "sex" not in src.columns:
+            src["sex"] = src["sex_age"].astype(str).str[0]
+        if "age" not in src.columns:
+            src["age"] = src["sex_age"].astype(str).str[1:].str.extract(r"(\d+)")[0]
+
+    required = ["horse_name", "jockey", "carried_weight", "odds", "popularity"]
     missing = [c for c in required if c not in src.columns]
     if missing:
         raise ValueError(f"簡易CSVの必須列が不足しています: {missing}")
+
+    if "sex" not in src.columns:
+        src["sex"] = ""
+    if "age" not in src.columns:
+        src["age"] = ""
 
     rows = []
     for i, r in src.iterrows():

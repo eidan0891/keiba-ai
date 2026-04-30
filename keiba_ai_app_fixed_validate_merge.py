@@ -169,6 +169,251 @@ def repair_simple_imputer(obj):
 
 
 
+
+PLACE_MAP = {
+    "01": "札幌",
+    "02": "函館",
+    "03": "福島",
+    "04": "新潟",
+    "05": "東京",
+    "06": "中山",
+    "07": "中京",
+    "08": "京都",
+    "09": "阪神",
+    "10": "小倉",
+}
+PLACE_CODE_MAP = {v: k for k, v in PLACE_MAP.items()}
+
+
+def extract_race_id(text: str) -> str:
+    text = str(text).strip()
+    m = re.search(r"race_id=(\d{12})", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"/race/(\d{12})", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{12})", text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def race_id_to_info(race_id: str) -> dict:
+    race_id = str(race_id)
+    return {
+        "race_id": race_id,
+        "year": int(race_id[0:4]),
+        "place_code": race_id[4:6],
+        "place": PLACE_MAP.get(race_id[4:6], "不明"),
+        "kai": int(race_id[6:8]),
+        "nichiji": int(race_id[8:10]),
+        "race_no": int(race_id[10:12]),
+    }
+
+
+def build_race_ids(year: int, place_name: str, kai: int, nichiji_list: list[int], race_start: int, race_end: int) -> list[str]:
+    place_code = PLACE_CODE_MAP[place_name]
+    ids = []
+    for nichiji in nichiji_list:
+        for r in range(race_start, race_end + 1):
+            ids.append(f"{year}{place_code}{kai:02d}{nichiji:02d}{r:02d}")
+    return ids
+
+
+def make_netkeiba_url(race_id: str) -> str:
+    return f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+
+
+def flatten_html_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join([str(x) for x in c if str(x) != "nan"]).strip("_")
+            for c in df.columns
+        ]
+    else:
+        df.columns = [str(c) for c in df.columns]
+    return df
+
+
+def pick_shutuba_table_from_html(tables):
+    for t in tables:
+        tmp = flatten_html_columns(t)
+        joined = " ".join([str(c) for c in tmp.columns])
+        if ("馬名" in joined or "馬番" in joined or "馬 番" in joined) and ("騎手" in joined or "斤量" in joined):
+            return tmp
+    return None
+
+
+def fetch_netkeiba_html(url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://race.netkeiba.com/",
+    }
+    res = requests.get(url, headers=headers, timeout=20)
+    res.raise_for_status()
+    return res.text
+
+
+def netkeiba_table_to_52cols(src: pd.DataFrame, race_id: str) -> pd.DataFrame:
+    info = race_id_to_info(race_id)
+    src = flatten_html_columns(src)
+
+    rename = {}
+    for c in src.columns:
+        s = str(c)
+        if s == "枠" or "枠番" in s or s.endswith("_枠"):
+            rename[c] = "frame_no"
+        elif "馬番" in s or "馬 番" in s:
+            rename[c] = "horse_no"
+        elif "馬名" in s:
+            rename[c] = "horse_name"
+        elif "性齢" in s or "性令" in s:
+            rename[c] = "sex_age"
+        elif "斤量" in s:
+            rename[c] = "carried_weight"
+        elif "騎手" in s:
+            rename[c] = "jockey"
+        elif "単勝" in s or "オッズ" in s:
+            rename[c] = "odds"
+        elif "人気" in s:
+            rename[c] = "popularity"
+        elif "厩舎" in s or "調教師" in s:
+            rename[c] = "trainer"
+        elif "馬体重" in s:
+            rename[c] = "body_weight"
+
+    src = src.rename(columns=rename)
+
+    if "horse_name" not in src.columns:
+        raise ValueError(f"馬名列が見つかりません: columns={list(src.columns)}")
+
+    src = src.dropna(subset=["horse_name"], how="all").copy()
+    src["horse_name"] = (
+        src["horse_name"].astype(str)
+        .str.replace("\\n", " ", regex=False)
+        .str.replace("  ", " ", regex=False)
+        .str.strip()
+    )
+    src = src[src["horse_name"].ne("")]
+    src = src[~src["horse_name"].str.contains("馬名|出走取消|除外", na=False)]
+
+    rows = []
+    for i, r in src.iterrows():
+        row = {c: "" for c in COLS_52}
+        row["year"] = info["year"] - 2000
+        row["month"] = 1
+        row["day"] = 1
+        row["kai"] = info.get("kai", 1)
+        row["place"] = info.get("place", "不明")
+        row["nichiji"] = info.get("nichiji", 1)
+        row["race_no"] = info.get("race_no", 11)
+        row["race_name"] = f"netkeiba_{race_id}"
+        row["race_grade"] = "3"
+        row["track_type"] = ""
+        row["course_kind"] = "0"
+        row["distance"] = "0"
+        row["going"] = ""
+        row["horse_name"] = r.get("horse_name", "")
+
+        sex_age = str(r.get("sex_age", "")).strip()
+        if sex_age:
+            row["sex"] = sex_age[0]
+            m = re.search(r"(\\d+)", sex_age[1:])
+            row["age"] = m.group(1) if m else ""
+
+        row["jockey"] = r.get("jockey", "")
+        row["carried_weight"] = r.get("carried_weight", "")
+        row["field_size"] = len(src)
+        row["horse_no"] = r.get("horse_no", i + 1)
+        row["frame_no"] = r.get("frame_no", "")
+        row["odds"] = r.get("odds", "")
+        row["popularity"] = r.get("popularity", "")
+        row["trainer"] = r.get("trainer", "")
+        row["body_weight"] = r.get("body_weight", "")
+
+        rows.append([row[c] for c in COLS_52])
+
+    out = pd.DataFrame(rows, columns=COLS_52)
+    out["source_file"] = f"netkeiba_{race_id}"
+    return clean_types(out)
+
+
+def fetch_netkeiba_race_to_52cols(race_id_or_url: str) -> pd.DataFrame:
+    race_id = extract_race_id(race_id_or_url)
+    if not race_id:
+        raise ValueError("race_idを取得できませんでした。URLまたは12桁race_idを確認してください。")
+
+    url = make_netkeiba_url(race_id)
+    html = fetch_netkeiba_html(url)
+
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception as e:
+        snippet = html[:300].replace("\\n", " ").replace("\\r", " ")
+        raise ValueError(f"netkeiba HTML解析失敗: {e} / HTML先頭: {snippet}")
+
+    table = pick_shutuba_table_from_html(tables)
+    if table is None:
+        raise ValueError("出馬表テーブルが見つかりません。netkeiba側ブロック、またはURL違いの可能性があります。")
+
+    return netkeiba_table_to_52cols(table, race_id)
+
+
+def fetch_many_netkeiba_to_52cols(race_ids_or_urls: list[str], sleep_sec: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
+    import time
+
+    frames = []
+    errors = []
+
+    for idx, item in enumerate(race_ids_or_urls, start=1):
+        rid = extract_race_id(item)
+        if not rid:
+            errors.append({"入力": item, "エラー": "race_id取得不可"})
+            continue
+
+        try:
+            df = fetch_netkeiba_race_to_52cols(rid)
+            frames.append(df)
+        except Exception as e:
+            errors.append({"race_id": rid, "エラー": str(e)})
+
+        time.sleep(float(sleep_sec))
+
+    if frames:
+        all_df = pd.concat(frames, ignore_index=True)
+    else:
+        all_df = pd.DataFrame()
+
+    return all_df, pd.DataFrame(errors)
+
+
+def convert_52_to_simple_export(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    cols = {
+        "source_file": "source_file",
+        "place": "競馬場",
+        "race_no": "レース番号",
+        "frame_no": "枠番",
+        "horse_no": "馬番",
+        "horse_name": "馬名",
+        "sex": "性別",
+        "age": "年齢",
+        "jockey": "騎手",
+        "carried_weight": "斤量",
+        "odds": "オッズ",
+        "popularity": "人気",
+    }
+    use = [c for c in cols if c in out.columns]
+    return out[use].rename(columns=cols)
+
+
 def parse_netkeiba_race_id(url: str) -> dict:
     m = re.search(r"race_id=(\d{12})", url or "")
     if not m:
@@ -1679,30 +1924,81 @@ def app_main():
 
     input_method = st.radio(
         "入力方法を選択",
-        ["出馬表CSV", "netkeiba URL"],
+        ["netkeiba一括取得→そのまま予想", "出馬表CSV", "netkeiba URL単発"],
         horizontal=True,
         index=0
     )
 
-    race_url = ""
+    pred_src_preloaded = None
     uploaded_csv = None
+    race_url = ""
 
-    if input_method == "netkeiba URL":
+    if input_method == "netkeiba一括取得→そのまま予想":
+        st.caption("race_id/URL一覧、または開催情報から一括取得して、そのまま予想できます。取得CSVのダウンロードも可能です。")
+        make_mode = st.radio(
+            "一括取得方法",
+            ["race_id / URL一覧", "開催情報から自動生成"],
+            horizontal=True,
+            index=0
+        )
+
+        race_items = []
+        if make_mode == "race_id / URL一覧":
+            sample = "202605020111\n202605020112\n202605020113"
+            text = st.text_area("race_id または URLを1行ずつ入力", value=sample, height=120)
+            race_items = [x.strip() for x in text.splitlines() if x.strip()]
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                year = st.number_input("年", min_value=2020, max_value=2035, value=2026, step=1)
+            with c2:
+                place_name = st.selectbox("競馬場", list(PLACE_CODE_MAP.keys()), index=list(PLACE_CODE_MAP.keys()).index("東京"))
+            with c3:
+                kai = st.number_input("開催回", min_value=1, max_value=10, value=2, step=1)
+            with c4:
+                nichiji_text = st.text_input("日次（カンマ区切り）", value="1,2")
+
+            c5, c6 = st.columns(2)
+            with c5:
+                race_start = st.number_input("開始R", min_value=1, max_value=12, value=1, step=1)
+            with c6:
+                race_end = st.number_input("終了R", min_value=1, max_value=12, value=12, step=1)
+
+            nichiji_list = []
+            for x in nichiji_text.split(","):
+                x = x.strip()
+                if x.isdigit():
+                    nichiji_list.append(int(x))
+
+            race_items = build_race_ids(int(year), place_name, int(kai), nichiji_list, int(race_start), int(race_end))
+
+        st.write("取得予定レース数:", len(race_items))
+        with st.expander("取得予定race_id"):
+            st.write([extract_race_id(x) for x in race_items if extract_race_id(x)])
+
+        sleep_sec = st.slider("アクセス間隔（秒）", min_value=0.2, max_value=3.0, value=0.8, step=0.1)
+
+    elif input_method == "出馬表CSV":
+        uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
+        st.caption("TARGET 52列CSV、または簡易CSVを使えます。")
+
+    else:
         race_url = st.text_input(
             "netkeiba 出馬表URL",
             placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=202605020111"
         )
-        st.caption("URL取得はnetkeiba側にブロックされる場合があります。その場合は出馬表CSVを使ってください。")
-    else:
-        uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
-        st.caption("TARGET 52列CSV、または簡易CSVを使えます。CSV選択時はURL欄が残っていても無視します。")
+        st.caption("単発URL取得。ブロックされる場合はCSVか一括取得後ダウンロードを使ってください。")
 
-    if input_method == "netkeiba URL" and not (race_url and race_url.strip()):
-        st.info("netkeiba 出馬表URLを入力してください。")
+    if input_method == "netkeiba一括取得→そのまま予想" and not race_items:
+        st.info("race_id/URLを入力するか、開催情報を指定してください。")
         return
 
     if input_method == "出馬表CSV" and uploaded_csv is None:
         st.info("出馬表CSVをアップロードしてください。")
+        return
+
+    if input_method == "netkeiba URL単発" and not (race_url and race_url.strip()):
+        st.info("netkeiba 出馬表URLを入力してください。")
         return
 
     if st.button("予想する", type="primary"):
@@ -1714,9 +2010,42 @@ def app_main():
 
             st.success(f"モデル読込: {model_status}")
 
-            if input_method == "netkeiba URL":
-                pred_src = load_netkeiba_shutuba(race_url.strip())
+            if input_method == "netkeiba一括取得→そのまま予想":
+                with st.spinner("netkeibaから出馬表を一括取得中..."):
+                    pred_src, fetch_errors = fetch_many_netkeiba_to_52cols(race_items, sleep_sec=sleep_sec)
+
+                if pred_src.empty:
+                    st.error("1レースも取得できませんでした。netkeiba側のアクセス制限、またはrace_id違いの可能性があります。")
+                    if not fetch_errors.empty:
+                        st.dataframe(fetch_errors, use_container_width=True, hide_index=True)
+                    return
+
+                st.success(f"netkeibaから取得しました: {pred_src['race_key'].nunique()}レース / {len(pred_src)}頭")
+
+                export_simple = convert_52_to_simple_export(pred_src)
+                st.download_button(
+                    "取得した出馬表CSVをダウンロード",
+                    data=export_simple.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="entry_all_races.csv",
+                    mime="text/csv",
+                )
+
+                if not fetch_errors.empty:
+                    st.warning(f"取得失敗: {len(fetch_errors)}件")
+                    st.dataframe(fetch_errors, use_container_width=True, hide_index=True)
+
+            elif input_method == "netkeiba URL単発":
+                pred_src = fetch_netkeiba_race_to_52cols(race_url.strip())
                 st.success("netkeiba出馬表URLから取得しました。")
+
+                export_simple = convert_52_to_simple_export(pred_src)
+                st.download_button(
+                    "取得した出馬表CSVをダウンロード",
+                    data=export_simple.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="entry_race.csv",
+                    mime="text/csv",
+                )
+
             else:
                 pred_src = load_uploaded_entry_csv(uploaded_csv, csv_mode)
                 st.success("出馬表CSVから取得しました。")

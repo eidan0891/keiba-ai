@@ -14,10 +14,13 @@
 # ------------------------------------------------------------
 
 import io
+import os
 import re
+from io import StringIO
 from pathlib import Path
 
 import joblib
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -31,6 +34,7 @@ st.set_page_config(
 
 APP_DIR = Path(__file__).parent
 MODEL_PATH = APP_DIR / "models" / "nyanko_keiba_top3_model.pkl"
+TARGET_CSV_PATH = APP_DIR / "yosou.csv"
 
 COLS_52 = [
     "year", "month", "day", "kai", "place", "nichiji", "race_no", "race_name",
@@ -197,7 +201,31 @@ def load_netkeiba_shutuba(url: str) -> pd.DataFrame:
     if not info:
         raise ValueError("netkeibaのrace_idをURLから取得できませんでした。")
 
-    tables = pd.read_html(url)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://race.netkeiba.com/",
+    }
+
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        res.raise_for_status()
+    except Exception as e:
+        raise ValueError(f"netkeibaページ取得に失敗しました: {e}")
+
+    html = res.text
+    if "馬名" not in html and "出馬表" not in html:
+        raise ValueError("netkeibaの出馬表HTMLを取得できませんでした。URLまたはアクセス制限を確認してください。")
+
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception as e:
+        raise ValueError(f"出馬表テーブル解析に失敗しました: {e}")
+
     if not tables:
         raise ValueError("出馬表テーブルを取得できませんでした。")
 
@@ -294,6 +322,306 @@ def load_uploaded_entry_csv(uploaded_csv, csv_mode: str) -> pd.DataFrame:
         df0 = read_csv_bytes(raw)
         return normalize_52cols(df0, uploaded_csv.name)
     return read_simple_csv_to_52(raw, uploaded_csv.name)
+
+
+
+def read_target_history_csv(path: Path) -> pd.DataFrame | None:
+    """
+    GitHub上のyosou.csv（TARGET過去CSV）を読み込む。
+    日本語ヘッダー/英語ヘッダーの両方に寄せる。
+    """
+    if not path.exists():
+        return None
+
+    last_error = None
+    for enc in ["utf-8-sig", "utf-8", "cp932", "shift_jis"]:
+        try:
+            df = pd.read_csv(path, encoding=enc, dtype=str)
+            return normalize_target_history_columns(df)
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"TARGET過去CSVを読めませんでした: {last_error}")
+
+
+def normalize_target_history_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    TARGET CSVの列名をアプリ内部名へ変換する。
+    例:
+      確定着順/着順 -> finish
+      単勝オッズ/オッズ -> odds
+      馬名 -> horse_name
+      騎手 -> jockey
+      騎手コード -> jockey_id
+      距離 -> distance
+      場所/競馬場 -> place
+      通過順1角 -> pass1
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    rename_map = {
+        "年": "year",
+        "月": "month",
+        "日": "day",
+        "日付": "race_date",
+        "回次": "kai",
+        "場所": "place",
+        "競馬場": "place",
+        "日次": "nichiji",
+        "レース番号": "race_no",
+        "R": "race_no",
+        "レース名": "race_name",
+        "クラスコード": "race_grade",
+        "芝・ダ": "track_type",
+        "トラックコード": "track_type",
+        "コース区分": "course_kind",
+        "距離": "distance",
+        "馬場状態": "going",
+        "馬名": "horse_name",
+        "性別": "sex",
+        "性": "sex",
+        "年齢": "age",
+        "騎手": "jockey",
+        "斤量": "carried_weight",
+        "頭数": "field_size",
+        "馬番": "horse_no",
+        "枠番": "frame_no",
+        "確定着順": "finish",
+        "着順": "finish",
+        "入線着順": "finish_raw",
+        "単勝オッズ": "odds",
+        "オッズ": "odds",
+        "人気": "popularity",
+        "走破タイム(秒)": "time_sec",
+        "タイム": "time_raw",
+        "通過順1角": "pass1",
+        "通過順2角": "pass2",
+        "通過順3角": "pass3",
+        "通過順4角": "pass4",
+        "上り3Fタイム": "last3f",
+        "上がり3Fタイム": "last3f",
+        "上り3F順位": "last3f_rank",
+        "馬体重": "body_weight",
+        "増減": "body_weight_diff",
+        "調教師": "trainer",
+        "所属": "belonging",
+        "賞金": "prize",
+        "騎手コード": "jockey_id",
+        "調教師コード": "trainer_id",
+        "血統登録番号": "horse_id",
+        "父馬名": "sire",
+        "母馬名": "dam",
+        "母の父馬名": "broodmare_sire",
+        "毛色": "coat_color",
+        "生年月日": "birthdate",
+    }
+
+    # 完全一致
+    df = df.rename(columns={c: rename_map[c] for c in df.columns if c in rename_map})
+
+    # ゆらぎ対応
+    dynamic_rename = {}
+    for c in df.columns:
+        s = str(c)
+        if s in dynamic_rename:
+            continue
+        if "確定" in s and "着順" in s:
+            dynamic_rename[c] = "finish"
+        elif "単勝" in s and "オッズ" in s:
+            dynamic_rename[c] = "odds"
+        elif "通過" in s and "1" in s:
+            dynamic_rename[c] = "pass1"
+        elif "通過" in s and "2" in s:
+            dynamic_rename[c] = "pass2"
+        elif "通過" in s and "3" in s:
+            dynamic_rename[c] = "pass3"
+        elif "通過" in s and "4" in s:
+            dynamic_rename[c] = "pass4"
+        elif "上" in s and "3F" in s and "順位" not in s:
+            dynamic_rename[c] = "last3f"
+        elif "騎手" in s and "コード" in s:
+            dynamic_rename[c] = "jockey_id"
+        elif "調教師" in s and "コード" in s:
+            dynamic_rename[c] = "trainer_id"
+
+    if dynamic_rename:
+        df = df.rename(columns=dynamic_rename)
+
+    # 数値化
+    for c in [
+        "year", "month", "day", "race_no", "race_grade", "course_kind",
+        "distance", "age", "carried_weight", "field_size", "horse_no",
+        "frame_no", "finish", "odds", "popularity", "pass1", "pass2",
+        "pass3", "pass4", "last3f", "body_weight", "prize"
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    for c in ["horse_name", "jockey", "trainer", "sire", "dam", "broodmare_sire", "place", "track_type", "going", "sex", "belonging"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
+
+    return df
+
+
+def create_target_features(target_df: pd.DataFrame) -> dict:
+    """
+    TARGET過去CSVから、PKLが必要としている prior 特徴量を作る。
+    """
+    if target_df is None or target_df.empty:
+        return {}
+
+    df = target_df.copy()
+
+    if "finish" not in df.columns:
+        raise ValueError("TARGET過去CSVに 確定着順/着順 がありません。")
+
+    df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
+    df = df[df["finish"].notna()].copy()
+
+    if df.empty:
+        return {}
+
+    df["is_win"] = df["finish"].eq(1)
+    df["is_top3"] = df["finish"].between(1, 3)
+
+    features = {}
+
+    # 騎手
+    if "jockey" in df.columns:
+        features["jockey_stats"] = (
+            df.groupby("jockey", dropna=False)
+            .agg(
+                jockey_runs_prior=("finish", "count"),
+                jockey_win_rate_prior=("is_win", "mean"),
+                jockey_top3_rate_prior=("is_top3", "mean"),
+            )
+            .reset_index()
+        )
+
+    # 調教師
+    if "trainer" in df.columns:
+        features["trainer_stats"] = (
+            df.groupby("trainer", dropna=False)
+            .agg(
+                trainer_runs_prior=("finish", "count"),
+                trainer_win_rate_prior=("is_win", "mean"),
+                trainer_top3_rate_prior=("is_top3", "mean"),
+            )
+            .reset_index()
+        )
+
+    # 種牡馬
+    if "sire" in df.columns:
+        features["sire_stats"] = (
+            df.groupby("sire", dropna=False)
+            .agg(
+                sire_runs_prior=("finish", "count"),
+                sire_win_rate_prior=("is_win", "mean"),
+                sire_top3_rate_prior=("is_top3", "mean"),
+            )
+            .reset_index()
+        )
+
+    # 馬の総合成績
+    if "horse_name" in df.columns:
+        features["horse_stats"] = (
+            df.groupby("horse_name", dropna=False)
+            .agg(
+                horse_runs_prior=("finish", "count"),
+                horse_win_rate_prior=("is_win", "mean"),
+                horse_top3_rate_prior=("is_top3", "mean"),
+            )
+            .reset_index()
+        )
+
+    # 馬×距離
+    if "horse_name" in df.columns and "distance" in df.columns:
+        features["horse_distance_stats"] = (
+            df.groupby(["horse_name", "distance"], dropna=False)
+            .agg(
+                horse_distance_runs_prior=("finish", "count"),
+                horse_distance_top3_rate_prior=("is_top3", "mean"),
+            )
+            .reset_index()
+        )
+
+    # 馬×競馬場
+    if "horse_name" in df.columns and "place" in df.columns:
+        features["horse_track_stats"] = (
+            df.groupby(["horse_name", "place"], dropna=False)
+            .agg(
+                horse_track_runs_prior=("finish", "count"),
+                horse_track_top3_rate_prior=("is_top3", "mean"),
+            )
+            .reset_index()
+        )
+
+    return features
+
+
+@st.cache_data(show_spinner=False)
+def load_target_features_cached():
+    target_df = read_target_history_csv(TARGET_CSV_PATH)
+    if target_df is None:
+        return None, {}
+    return target_df, create_target_features(target_df)
+
+
+def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    当日出馬表にTARGET過去CSV由来の特徴量を付与する。
+    yosou.csvが無い場合は何もしない。
+    """
+    df = entry_df.copy()
+
+    if not TARGET_CSV_PATH.exists():
+        return df
+
+    target_df, features = load_target_features_cached()
+    if not features:
+        return df
+
+    if "jockey_stats" in features and "jockey" in df.columns:
+        df = df.merge(features["jockey_stats"], on="jockey", how="left", suffixes=("", "_target"))
+
+    if "trainer_stats" in features and "trainer" in df.columns:
+        df = df.merge(features["trainer_stats"], on="trainer", how="left", suffixes=("", "_target"))
+
+    if "sire_stats" in features and "sire" in df.columns:
+        df = df.merge(features["sire_stats"], on="sire", how="left", suffixes=("", "_target"))
+
+    if "horse_stats" in features and "horse_name" in df.columns:
+        df = df.merge(features["horse_stats"], on="horse_name", how="left", suffixes=("", "_target"))
+
+    if "horse_distance_stats" in features and {"horse_name", "distance"}.issubset(df.columns):
+        df["distance"] = pd.to_numeric(df["distance"], errors="coerce")
+        df = df.merge(features["horse_distance_stats"], on=["horse_name", "distance"], how="left", suffixes=("", "_target"))
+
+    if "horse_track_stats" in features and {"horse_name", "place"}.issubset(df.columns):
+        df = df.merge(features["horse_track_stats"], on=["horse_name", "place"], how="left", suffixes=("", "_target"))
+
+    # mergeで _target が付いた場合は空の元列を上書き
+    for c in [
+        "jockey_runs_prior", "jockey_win_rate_prior", "jockey_top3_rate_prior",
+        "trainer_runs_prior", "trainer_win_rate_prior", "trainer_top3_rate_prior",
+        "sire_runs_prior", "sire_win_rate_prior", "sire_top3_rate_prior",
+        "horse_runs_prior", "horse_win_rate_prior", "horse_top3_rate_prior",
+        "horse_distance_runs_prior", "horse_distance_top3_rate_prior",
+        "horse_track_runs_prior", "horse_track_top3_rate_prior",
+    ]:
+        tc = f"{c}_target"
+        if tc in df.columns:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+                df[tc] = pd.to_numeric(df[tc], errors="coerce")
+                df[c] = df[c].where(df[c].notna() & (df[c] != 0), df[tc])
+            else:
+                df[c] = df[tc]
+            df = df.drop(columns=[tc])
+
+    return df
 
 
 def read_csv_bytes(raw: bytes) -> pd.DataFrame:
@@ -1273,6 +1601,11 @@ def app_main():
         else:
             st.warning("同梱PKLなし。画面からPKLをアップロードしてください。")
 
+        if TARGET_CSV_PATH.exists():
+            st.success(f"TARGET過去CSVあり: {TARGET_CSV_PATH.name}")
+        else:
+            st.info("TARGET過去CSVなし: yosou.csv をリポジトリ直下に置くと補正します。")
+
     st.subheader("入力方法")
     input_tabs = st.tabs(["netkeiba URL", "出馬表CSV"])
 
@@ -1281,7 +1614,7 @@ def app_main():
             "netkeiba 出馬表URL",
             placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=202605020111"
         )
-        st.caption("発走前予想用。出馬表URLから馬番・馬名・騎手・斤量・オッズ・人気を取得します。")
+        st.caption("発走前予想用。出馬表URLから馬番・馬名・騎手・斤量・オッズ・人気を取得します。URLは race_id 付きのものを入れてください。")
 
     with input_tabs[1]:
         uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
@@ -1310,6 +1643,14 @@ def app_main():
             else:
                 pred_src = load_uploaded_entry_csv(uploaded_csv, csv_mode)
                 st.success("出馬表CSVから取得しました。")
+
+            # TARGET過去CSV（yosou.csv）があれば、騎手・調教師・血統・馬の適性を結合
+            pred_src = merge_target_features(pred_src)
+
+            if TARGET_CSV_PATH.exists():
+                st.success("TARGET過去CSV（yosou.csv）を結合しました。")
+            else:
+                st.info("TARGET過去CSV（yosou.csv）は未配置です。URL/CSV単体で予想します。")
 
             pred_df = predict(bundle, pred_src)
 

@@ -1434,6 +1434,166 @@ def get_buy_candidates(race_df: pd.DataFrame, max_horses: int = 8) -> pd.DataFra
     return buy
 
 
+
+def _ensure_10_rows(rows: list, race_df: pd.DataFrame, bet_type: str, max_count: int = 10) -> list:
+    """
+    表示名が「各10通り」なのに件数不足になる問題を防ぐ。
+    候補が足りない券種は、AI順位・回収率スコア上位から補完して必ず10行にする。
+    ただし三連系など物理的に組み合わせが足りない場合も、最後は見送り行で10行に揃える。
+    """
+    rows = list(rows or [])
+
+    def key_of(x):
+        return str(x.get("買い目", ""))
+
+    seen = set()
+    clean = []
+    for r0 in rows:
+        if not isinstance(r0, dict):
+            continue
+        k = key_of(r0)
+        if k and k not in seen:
+            clean.append(r0)
+            seen.add(k)
+    rows = clean
+
+    r = race_df.copy()
+    if "value_score" not in r.columns:
+        r["value_score"] = 0
+    if "ml_top3_prob" not in r.columns:
+        r["ml_top3_prob"] = 0
+    if "ml_rank" not in r.columns:
+        r["ml_rank"] = range(1, len(r) + 1)
+
+    r = r[pd.notna(r.get("horse_no", np.nan))].copy()
+    r = r.sort_values(["value_score", "ml_top3_prob", "ml_rank"], ascending=[False, False, True])
+
+    nums = []
+    labels = {}
+    frames = {}
+
+    for _, row in r.iterrows():
+        n = _horse_no(row)
+        if not n or n in nums:
+            continue
+        nums.append(n)
+        labels[n] = _horse_label(row)
+        try:
+            frames[n] = str(int(row.get("frame_no"))) if pd.notna(row.get("frame_no")) else ""
+        except Exception:
+            frames[n] = ""
+
+    def add(item):
+        k = str(item.get("買い目", ""))
+        if k and k not in seen and len(rows) < max_count:
+            rows.append(item)
+            seen.add(k)
+
+    # 単勝・複勝は馬単体なので上位馬で補完
+    if bet_type in ["単勝", "複勝"]:
+        for n in nums:
+            add({"買い目": n, "馬名": labels.get(n, n), "狙い": "AI/回収率上位で補完"})
+
+    # 枠連は枠番がある場合だけ組み合わせ補完
+    elif bet_type == "枠連":
+        frame_list = []
+        for n in nums:
+            f = frames.get(n, "")
+            if f and f not in frame_list:
+                frame_list.append(f)
+        for i in range(len(frame_list)):
+            for j in range(i, len(frame_list)):
+                add({"買い目": f"{frame_list[i]}-{frame_list[j]}", "狙い": "枠連補完"})
+                if len(rows) >= max_count:
+                    break
+            if len(rows) >= max_count:
+                break
+
+    # 馬連・ワイド・本命1頭＋穴は2頭組み合わせで補完
+    elif bet_type in ["馬連", "ワイド", "本命1頭＋穴"]:
+        if nums:
+            main = nums[0]
+            for n in nums[1:]:
+                add({"買い目": f"{main}-{n}", "狙い": "本命軸補完"})
+            for i in range(len(nums)):
+                for j in range(i + 1, len(nums)):
+                    add({"買い目": f"{nums[i]}-{nums[j]}", "狙い": "BOX補完"})
+                    if len(rows) >= max_count:
+                        break
+                if len(rows) >= max_count:
+                    break
+
+    # 馬単は順序付き2頭
+    elif bet_type == "馬単":
+        if nums:
+            main = nums[0]
+            for n in nums[1:]:
+                add({"買い目": f"{main}→{n}", "狙い": "本命頭補完"})
+            for n in nums[1:]:
+                add({"買い目": f"{n}→{main}", "狙い": "相手頭補完"})
+            for a in nums:
+                for b in nums:
+                    if a != b:
+                        add({"買い目": f"{a}→{b}", "狙い": "順序補完"})
+                    if len(rows) >= max_count:
+                        break
+                if len(rows) >= max_count:
+                    break
+
+    # 三連複・本命2頭＋穴は3頭組み合わせ
+    elif bet_type in ["三連複", "本命2頭＋穴"]:
+        if len(nums) >= 3:
+            h1 = nums[0]
+            h2 = nums[1] if len(nums) > 1 else None
+            if h2:
+                for n in nums[2:]:
+                    add({"買い目": f"{h1}-{h2}-{n}", "狙い": "本命2頭軸補完"})
+            for i in range(len(nums)):
+                for j in range(i + 1, len(nums)):
+                    for k in range(j + 1, len(nums)):
+                        add({"買い目": f"{nums[i]}-{nums[j]}-{nums[k]}", "狙い": "三連複補完"})
+                        if len(rows) >= max_count:
+                            break
+                    if len(rows) >= max_count:
+                        break
+                if len(rows) >= max_count:
+                    break
+
+    # 三連単は順序付き3頭
+    elif bet_type == "三連単":
+        if len(nums) >= 3:
+            firsts = nums[:4]
+            seconds = nums[:6]
+            thirds = nums[:8]
+            for a in firsts:
+                for b in seconds:
+                    for c in thirds:
+                        if len({a, b, c}) == 3:
+                            add({"買い目": f"{a}→{b}→{c}", "狙い": "三連単補完"})
+                        if len(rows) >= max_count:
+                            break
+                    if len(rows) >= max_count:
+                        break
+                if len(rows) >= max_count:
+                    break
+
+    # 最後の保険。どうしても足りない場合も10行表示に揃える
+    while len(rows) < max_count:
+        rows.append({
+            "買い目": f"候補不足{len(rows)+1}",
+            "狙い": "候補不足。実買いは見送り推奨"
+        })
+
+    return rows[:max_count]
+
+
+def _ensure_combo_dict_10(combos: dict, race_df: pd.DataFrame, max_count: int = 10) -> dict:
+    order = ["単勝", "複勝", "馬連", "枠連", "ワイド", "馬単", "三連複", "三連単", "本命2頭＋穴", "本命1頭＋穴"]
+    out = dict(combos or {})
+    for bet_type in order:
+        out[bet_type] = _ensure_10_rows(out.get(bet_type, []), race_df, bet_type, max_count=max_count)
+    return out
+
 def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10) -> dict:
     """
     回収率寄りの買い目を最大10通り作る。
@@ -1612,7 +1772,7 @@ def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10) ->
             break
     combos["本命1頭＋穴"] = honmei1_ana or [{"買い目": "穴候補なし", "狙い": "見送り推奨"}]
 
-    return combos
+    return _ensure_combo_dict_10(combos, race_df, max_count=max_count)
 
 
 def show_roi_strategy(race_df: pd.DataFrame):
@@ -1630,8 +1790,8 @@ def show_roi_strategy(race_df: pd.DataFrame):
 
 
 def show_roi_ticket_tabs(race_df: pd.DataFrame):
-    st.subheader("回収率重視TAB（各10通り）")
-    combos = generate_roi_bet_combinations(race_df, max_count=10)
+    st.subheader("回収率重視TAB（必ず各10通り）")
+    combos = _ensure_combo_dict_10(generate_roi_bet_combinations(race_df, max_count=10), race_df, max_count=10)
     order = ["単勝", "複勝", "馬連", "枠連", "ワイド", "馬単", "三連複", "三連単", "本命2頭＋穴", "本命1頭＋穴"]
     tabs = st.tabs(order)
 
@@ -1868,13 +2028,13 @@ def generate_bet_combinations(race_df: pd.DataFrame, max_count: int = 10) -> dic
                 break
     combos["本命1頭＋穴"] = honmei1_ana or [{"買い目": "穴候補なし", "狙い": "人気/AI順位から穴が拾えません"}]
 
-    return combos
+    return _ensure_combo_dict_10(combos, race_df, max_count=max_count)
 
 
 def show_ticket_tabs(race_df: pd.DataFrame):
-    st.subheader("馬券おすすめ（TAB別・各10通り）")
+    st.subheader("馬券おすすめ（TAB別・必ず各10通り）")
 
-    combos = generate_bet_combinations(race_df, max_count=10)
+    combos = _ensure_combo_dict_10(generate_bet_combinations(race_df, max_count=10), race_df, max_count=10)
     order = ["単勝", "複勝", "馬連", "枠連", "ワイド", "馬単", "三連複", "三連単", "本命2頭＋穴", "本命1頭＋穴"]
 
     tabs = st.tabs(order)

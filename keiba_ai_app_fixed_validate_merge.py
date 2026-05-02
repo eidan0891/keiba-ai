@@ -35,6 +35,7 @@ st.set_page_config(
 APP_DIR = Path(__file__).parent
 MODEL_PATH = APP_DIR / "models" / "nyanko_keiba_top3_model.pkl"
 TARGET_CSV_PATH = APP_DIR / "yosou.csv"
+DATA_DIR = APP_DIR / "data"
 
 COLS_52 = [
     "year", "month", "day", "kai", "place", "nichiji", "race_no", "race_name",
@@ -1901,9 +1902,102 @@ def show_ticket_tabs(race_df: pd.DataFrame):
             elif bet_type in ["馬連", "ワイド", "三連複", "枠連"]:
                 st.caption("※順序なし。BOX/流し候補。")
 
+
+def list_preloaded_csv_files() -> list[Path]:
+    """
+    GitHubリポジトリ内 data/ 配下のCSVを一覧する。
+    例:
+      data/tokyo_1R.csv
+      data/tokyo_2R.csv
+      data/tokyo_12R.csv
+    """
+    if not DATA_DIR.exists():
+        return []
+
+    files = sorted(DATA_DIR.glob("*.csv"))
+    return [p for p in files if p.is_file()]
+
+
+def make_preloaded_file_label(path: Path) -> str:
+    """
+    iPadで見やすい表示名にする。
+    """
+    name = path.stem
+
+    # tokyo_1R / 東京1R などを見やすくする
+    m = re.search(r"(\d{1,2})\s*[RrＲｒ]", name)
+    if m:
+        return f"{m.group(1)}R：{path.name}"
+
+    return path.name
+
+
+def load_preloaded_entry_csv(path: Path, csv_mode: str) -> pd.DataFrame:
+    """
+    data/ 配下に事前配置したCSVを読む。
+    TARGET 52列でも簡易CSVでも自動判定する。
+    """
+    if not path.exists():
+        raise ValueError(f"事前CSVが見つかりません: {path}")
+
+    raw = path.read_bytes()
+
+    # まずヘッダーありCSVとして読み、簡易CSVっぽければ簡易CSVへ
+    header_df = None
+    for enc in ["utf-8-sig", "utf-8", "cp932", "shift_jis"]:
+        try:
+            header_df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str)
+            break
+        except Exception:
+            pass
+
+    if header_df is not None:
+        cols = set([str(c).strip() for c in header_df.columns])
+        simple_markers = {"馬名", "horse_name", "騎手", "jockey", "オッズ", "odds", "人気", "popularity"}
+        if len(cols & simple_markers) >= 3:
+            return read_simple_csv_to_52(raw, source_name=path.name)
+
+    # TARGET 52列を試す。失敗したら簡易CSVへフォールバック。
+    try:
+        df0 = read_csv_bytes(raw)
+        return normalize_52cols(df0, path.name)
+    except Exception as e52:
+        try:
+            return read_simple_csv_to_52(raw, source_name=path.name)
+        except Exception:
+            raise e52
+
+
+def load_many_preloaded_entry_csv(paths: list[Path], csv_mode: str) -> pd.DataFrame:
+    """
+    data/ 配下の複数CSVをまとめて読む。
+    東京1R〜12Rをまとめて予想する用途。
+    """
+    frames = []
+    errors = []
+
+    for p in paths:
+        try:
+            frames.append(load_preloaded_entry_csv(p, csv_mode))
+        except Exception as e:
+            errors.append({"ファイル": p.name, "エラー": str(e)})
+
+    if not frames:
+        if errors:
+            raise ValueError("事前CSVを1件も読めませんでした: " + str(errors[:3]))
+        raise ValueError("事前CSVがありません。dataフォルダにCSVを置いてください。")
+
+    df = pd.concat(frames, ignore_index=True)
+    if errors:
+        st.warning(f"読めなかった事前CSVがあります: {len(errors)}件")
+        st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
+
+    return df
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
-    st.caption("iPad / Streamlit Cloud対応版。netkeiba URLまたは出馬表CSVから発走前予想できます。")
+    st.caption("iPad / Streamlit Cloud対応版。事前CSV・netkeiba URL・出馬表CSVから発走前予想できます。")
 
     with st.sidebar:
         st.header("設定")
@@ -1924,16 +2018,38 @@ def app_main():
 
     input_method = st.radio(
         "入力方法を選択",
-        ["netkeiba一括取得→そのまま予想", "出馬表CSV", "netkeiba URL単発"],
+        ["事前CSVから選択", "netkeiba一括取得→そのまま予想", "出馬表CSV", "netkeiba URL単発"],
         horizontal=True,
         index=0
     )
 
+    preloaded_paths = []
+    selected_preloaded_paths = []
     pred_src_preloaded = None
     uploaded_csv = None
     race_url = ""
 
-    if input_method == "netkeiba一括取得→そのまま予想":
+    if input_method == "事前CSVから選択":
+        st.caption("GitHubの data/ フォルダに置いたCSVを選ぶだけで予想できます。WINS/iPad向け。")
+        preloaded_paths = list_preloaded_csv_files()
+
+        if not preloaded_paths:
+            st.warning("dataフォルダにCSVがありません。GitHubで data/tokyo_1R.csv 〜 data/tokyo_12R.csv のように置いてください。")
+        else:
+            labels = [make_preloaded_file_label(p) for p in preloaded_paths]
+            mode = st.radio("読み込み方法", ["1レースだけ選ぶ", "全部まとめて読む"], horizontal=True, index=0)
+
+            if mode == "1レースだけ選ぶ":
+                selected_label = st.selectbox("事前CSVを選択", labels)
+                selected_preloaded_paths = [preloaded_paths[labels.index(selected_label)]]
+            else:
+                selected_preloaded_paths = preloaded_paths
+                st.info(f"dataフォルダ内のCSVを全部読みます: {len(selected_preloaded_paths)}件")
+
+            with st.expander("検出した事前CSV"):
+                st.write([p.name for p in preloaded_paths])
+
+    elif input_method == "netkeiba一括取得→そのまま予想":
         st.caption("race_id/URL一覧、または開催情報から一括取得して、そのまま予想できます。取得CSVのダウンロードも可能です。")
         make_mode = st.radio(
             "一括取得方法",
@@ -1989,6 +2105,11 @@ def app_main():
         )
         st.caption("単発URL取得。ブロックされる場合はCSVか一括取得後ダウンロードを使ってください。")
 
+
+    if input_method == "事前CSVから選択" and not selected_preloaded_paths:
+        st.info("dataフォルダにCSVを置くか、事前CSVを選択してください。")
+        return
+
     if input_method == "netkeiba一括取得→そのまま予想" and not race_items:
         st.info("race_id/URLを入力するか、開催情報を指定してください。")
         return
@@ -2010,7 +2131,20 @@ def app_main():
 
             st.success(f"モデル読込: {model_status}")
 
-            if input_method == "netkeiba一括取得→そのまま予想":
+            if input_method == "事前CSVから選択":
+                with st.spinner("事前CSVを読み込み中..."):
+                    pred_src = load_many_preloaded_entry_csv(selected_preloaded_paths, csv_mode)
+                st.success(f"事前CSVから取得しました: {pred_src['race_key'].nunique()}レース / {len(pred_src)}頭")
+
+                export_simple = convert_52_to_simple_export(pred_src)
+                st.download_button(
+                    "読み込んだ出馬表CSVをダウンロード",
+                    data=export_simple.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="preloaded_entry_races.csv",
+                    mime="text/csv",
+                )
+
+            elif input_method == "netkeiba一括取得→そのまま予想":
                 with st.spinner("netkeibaから出馬表を一括取得中..."):
                     pred_src, fetch_errors = fetch_many_netkeiba_to_52cols(race_items, sleep_sec=sleep_sec)
 

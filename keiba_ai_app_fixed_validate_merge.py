@@ -187,6 +187,111 @@ PLACE_MAP = {
 PLACE_CODE_MAP = {v: k for k, v in PLACE_MAP.items()}
 
 
+# ------------------------------------------------------------
+# v4: TARGET過去CSVと出馬表CSVの表記ゆれ吸収
+# - 馬名/騎手/競馬場の空白・全角空白を除去
+# - 騎手の短縮表記（北村友 → 北村友一 など）を寄せる
+# - 距離/通過順/着順/上がり3Fを数値化
+# これを入れないと、CSV内にクロワデュノール等が存在しても
+# 予想側と完全一致せず「未取得」になりやすい。
+# ------------------------------------------------------------
+JOCKEY_ALIAS_MAP = {
+    "岩田望": "岩田望来",
+    "北村友": "北村友一",
+    "横山武": "横山武史",
+    "横山和": "横山和生",
+    "横山典": "横山典弘",
+    "鮫島駿": "鮫島克駿",
+    "鮫島克": "鮫島克駿",
+    "佐々木": "佐々木大輔",
+    "佐々木大": "佐々木大輔",
+    "松山": "松山弘平",
+    "坂井": "坂井瑠星",
+    "武豊": "武豊",
+    "ルメール": "ルメール",
+    "Ｃ．ルメール": "ルメール",
+    "C.ルメール": "ルメール",
+    "Ｍ．デム": "Ｍ．デムーロ",
+    "M.デム": "Ｍ．デムーロ",
+    "Ｍデムーロ": "Ｍ．デムーロ",
+    "戸崎": "戸崎圭太",
+    "川田": "川田将雅",
+    "丹内": "丹内祐次",
+    "池添": "池添謙一",
+    "浜中": "浜中俊",
+    "藤岡佑": "藤岡佑介",
+    "田口": "田口貫太",
+    "高杉": "高杉吏麒",
+    "吉村": "吉村誠之助",
+    "吉村誠": "吉村誠之助",
+    "小沢": "小沢大仁",
+    "斎藤": "斎藤新",
+    "富田": "富田暁",
+    "古川奈": "古川奈穂",
+    "小林勝": "小林勝太",
+    "小林凌": "小林凌大",
+    "角田河": "角田大河",
+    "角田和": "角田大和",
+    "団野": "団野大成",
+    "西村淳": "西村淳也",
+    "菅原明": "菅原明良",
+    "津村": "津村明秀",
+    "三浦": "三浦皇成",
+    "内田博": "内田博幸",
+    "菱田": "菱田裕二",
+    "幸": "幸英明",
+    "和田竜": "和田竜二",
+}
+
+
+def _norm_text_value(x) -> str:
+    s = str(x).strip()
+    if s in ["nan", "None", "<NA>"]:
+        return ""
+    return (
+        s.replace("　", "")
+         .replace(" ", "")
+         .replace("・", "")
+         .replace("．", ".")
+         .strip()
+    )
+
+
+def _norm_jockey_value(x) -> str:
+    s = _norm_text_value(x)
+    if not s:
+        return ""
+    # 外国人騎手の表記を少し寄せる
+    s = s.replace("Ｃ.", "C.").replace("Ｍ.", "M.")
+    if s in JOCKEY_ALIAS_MAP:
+        return JOCKEY_ALIAS_MAP[s]
+    # 既にフル表記のものも、短縮表記側に寄せたい場合があるため逆引きしやすい形にする
+    return s
+
+
+def normalize_match_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """TARGET過去CSVと出馬表CSVの結合キーを正規化する。"""
+    df = df.copy()
+
+    if "horse_name" in df.columns:
+        df["horse_name"] = df["horse_name"].apply(_norm_text_value)
+
+    if "jockey" in df.columns:
+        df["jockey"] = df["jockey"].apply(_norm_jockey_value)
+
+    if "place" in df.columns:
+        df["place"] = (
+            df["place"].apply(_norm_text_value)
+            .str.replace("競馬場", "", regex=False)
+        )
+
+    for c in ["distance", "finish", "pass1", "pass2", "pass3", "pass4", "last3f", "odds", "popularity", "horse_no", "frame_no", "field_size"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
+
+
 def extract_race_id(text: str) -> str:
     text = str(text).strip()
     m = re.search(r"race_id=(\d{12})", text)
@@ -767,6 +872,9 @@ def normalize_target_history_columns(df: pd.DataFrame) -> pd.DataFrame:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
 
+    # v4: 出馬表側と結合できるように馬名・騎手・競馬場・距離を正規化
+    df = normalize_match_keys(df)
+
     return df
 
 
@@ -884,6 +992,17 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
+    # 馬×距離が使えない出馬表（distance=0/空）のため、馬単体の距離適性代替も作る
+    if "horse_name" in df.columns:
+        features["horse_distance_fallback_stats"] = (
+            df.groupby("horse_name", dropna=False)
+            .agg(
+                horse_distance_runs_prior_fallback=("finish", "count"),
+                horse_distance_top3_rate_prior_fallback=("is_top3", "mean"),
+            )
+            .reset_index()
+        )
+
     # 馬×競馬場
     if "horse_name" in df.columns and "place" in df.columns:
         features["horse_track_stats"] = (
@@ -935,6 +1054,8 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
     yosou.csvが無い場合は何もしない。
     """
     df = entry_df.copy()
+    # v4: TARGET過去CSVとのマッチング失敗を防ぐ
+    df = normalize_match_keys(df)
 
     if not TARGET_CSV_PATH.exists():
         return df
@@ -976,6 +1097,21 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
 
     if "horse_track_stats" in features and {"horse_name", "place"}.issubset(df.columns):
         df = df.merge(features["horse_track_stats"], on=["horse_name", "place"], how="left", suffixes=("", "_target"))
+
+    # v4: distanceが0/空で馬×距離に一致しない場合、馬単体の3着内率で距離適性欄を補完
+    if "horse_distance_fallback_stats" in features and "horse_name" in df.columns:
+        df = df.merge(features["horse_distance_fallback_stats"], on="horse_name", how="left")
+        if "horse_distance_top3_rate_prior" not in df.columns:
+            df["horse_distance_top3_rate_prior"] = np.nan
+        df["horse_distance_top3_rate_prior"] = pd.to_numeric(df["horse_distance_top3_rate_prior"], errors="coerce")
+        df["horse_distance_top3_rate_prior_fallback"] = pd.to_numeric(df.get("horse_distance_top3_rate_prior_fallback", np.nan), errors="coerce")
+        df["horse_distance_top3_rate_prior"] = df["horse_distance_top3_rate_prior"].where(
+            df["horse_distance_top3_rate_prior"].notna() & (df["horse_distance_top3_rate_prior"] != 0),
+            df["horse_distance_top3_rate_prior_fallback"]
+        )
+        for cc in ["horse_distance_runs_prior_fallback", "horse_distance_top3_rate_prior_fallback"]:
+            if cc in df.columns:
+                df = df.drop(columns=[cc])
 
     # mergeで _target が付いた場合は空の元列を上書き
     for c in [
@@ -1034,6 +1170,9 @@ def clean_types(df: pd.DataFrame) -> pd.DataFrame:
 
     if "source_file" not in df.columns:
         df["source_file"] = ""
+
+    # v4: 出馬表側も結合キーを正規化
+    df = normalize_match_keys(df)
 
     # 別ファイル/別CSV由来の同一日・同一競馬場・同一R混入を防ぐ
     df["race_key"] = (

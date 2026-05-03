@@ -2463,15 +2463,6 @@ def app_main():
     st.title("🐾 にゃんこ競馬AI")
 
         # v5: TARGET過去CSVの読込状況を画面に出す
-     _target_path = find_target_csv_path()
-        if _target_path is not None:
-            try:
-                _tmp_df = read_target_history_csv(_target_path)
-                st.sidebar.success(f"TARGET過去CSV読込OK: {_target_path.name} / {len(_tmp_df):,}行")
-            except Exception as _e:
-                st.sidebar.error(f"TARGET過去CSV読込エラー: {_e}")
-        else:
-            st.sidebar.warning("TARGET過去CSV未検出: yosou.csv を .py と同じ場所へ")
     st.caption("iPad / Streamlit Cloud対応版。事前CSV・netkeiba URL・出馬表CSVから発走前予想できます。")
 
     with st.sidebar:

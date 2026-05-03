@@ -38,6 +38,31 @@ MODEL_PATH = APP_DIR / "models" / "nyanko_keiba_top3_model.pkl"
 TARGET_CSV_PATH = APP_DIR / "yosou.csv"
 DATA_DIR = APP_DIR / "data"
 
+def find_target_csv_path() -> Path | None:
+    """
+    TARGET過去CSVの場所を自動検出する。
+    優先順:
+      1) .py と同じ場所の yosou.csv
+      2) .py と同じ場所の yosou_clean.csv
+      3) カレントフォルダの yosou.csv
+      4) カレントフォルダの 254/yosou.csv
+    """
+    candidates = [
+        APP_DIR / "yosou.csv",
+        APP_DIR / "yosou_clean.csv",
+        Path.cwd() / "yosou.csv",
+        Path.cwd() / "yosou_clean.csv",
+        Path.cwd() / "254" / "yosou.csv",
+        Path.cwd() / "254" / "yosou_clean.csv",
+    ]
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            pass
+    return None
+
 COLS_52 = [
     "year", "month", "day", "kai", "place", "nichiji", "race_no", "race_name",
     "race_grade", "track_type", "course_kind", "distance", "going",
@@ -1040,9 +1065,16 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
     return features
 
 
-@st.cache_data(show_spinner=False)
 def load_target_features_cached():
-    target_df = read_target_history_csv(TARGET_CSV_PATH)
+    """
+    v5修正:
+    st.cache_dataを外す。
+    CSVを入れ替えても古いキャッシュを使って「未取得」のままになる問題を防ぐ。
+    """
+    path = find_target_csv_path()
+    if path is None:
+        return None, {}
+    target_df = read_target_history_csv(path)
     if target_df is None:
         return None, {}
     return target_df, create_target_features(target_df)
@@ -1057,7 +1089,7 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
     # v4: TARGET過去CSVとのマッチング失敗を防ぐ
     df = normalize_match_keys(df)
 
-    if not TARGET_CSV_PATH.exists():
+    if find_target_csv_path() is None:
         return df
 
     target_df, features = load_target_features_cached()
@@ -2429,6 +2461,17 @@ def load_many_preloaded_entry_csv(paths: list[Path], csv_mode: str) -> pd.DataFr
 
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
+
+        # v5: TARGET過去CSVの読込状況を画面に出す
+        _target_path = find_target_csv_path()
+        if _target_path is not None:
+            try:
+                _tmp_df = read_target_history_csv(_target_path)
+                st.sidebar.success(f"TARGET過去CSV読込OK: {_target_path.name} / {len(_tmp_df):,}行")
+            except Exception as _e:
+                st.sidebar.error(f"TARGET過去CSV読込エラー: {_e}")
+        else:
+            st.sidebar.warning("TARGET過去CSV未検出: yosou.csv を .py と同じ場所へ")
     st.caption("iPad / Streamlit Cloud対応版。事前CSV・netkeiba URL・出馬表CSVから発走前予想できます。")
 
     with st.sidebar:

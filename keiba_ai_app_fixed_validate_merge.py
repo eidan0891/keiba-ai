@@ -567,6 +567,14 @@ def load_netkeiba_shutuba(url: str) -> pd.DataFrame:
         row["frame_no"] = r.get("frame_no", "")
         row["odds"] = r.get("odds", "")
         row["popularity"] = r.get("popularity", "")
+        row["pass1"] = r.get("pass1", "")
+        row["pass2"] = r.get("pass2", "")
+        row["pass3"] = r.get("pass3", "")
+        row["pass4"] = r.get("pass4", "")
+        row["trainer"] = r.get("trainer", "")
+        row["sire"] = r.get("sire", "")
+        row["dam"] = r.get("dam", "")
+        row["broodmare_sire"] = r.get("broodmare_sire", "")
         rows.append([row[c] for c in COLS_52])
 
     df = pd.DataFrame(rows, columns=COLS_52)
@@ -762,6 +770,36 @@ def normalize_target_history_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+def _judge_running_style_from_pass_values(pass_values, field_size=18):
+    vals = []
+    for v in pass_values:
+        try:
+            f = float(v)
+            if f > 0:
+                vals.append(f)
+        except Exception:
+            pass
+    if not vals:
+        return "", ""
+    try:
+        fs = float(field_size)
+        if fs <= 0:
+            fs = max(18.0, max(vals))
+    except Exception:
+        fs = max(18.0, max(vals))
+    early = vals[0]
+    avg_pos = float(np.mean(vals))
+    early_ratio = early / fs
+    avg_ratio = avg_pos / fs
+    if early <= 1.5 or early_ratio <= 0.12:
+        return "逃げ", f"過去通過:序盤{early:.0f}番手"
+    if early_ratio <= 0.38 or avg_ratio <= 0.40:
+        return "先行", f"過去通過:前目 avg{avg_pos:.1f}"
+    if avg_ratio <= 0.70:
+        return "差し", f"過去通過:中団 avg{avg_pos:.1f}"
+    return "追込", f"過去通過:後方 avg{avg_pos:.1f}"
+
 def create_target_features(target_df: pd.DataFrame) -> dict:
     """
     TARGET過去CSVから、PKLが必要としている prior 特徴量を作る。
@@ -857,6 +895,29 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
+    # 馬ごとの過去通過順から脚質を補完
+    pass_cols = [c for c in ["pass1", "pass2", "pass3", "pass4"] if c in df.columns]
+    if "horse_name" in df.columns and pass_cols:
+        tmp = df.copy()
+        for c in pass_cols + (["field_size"] if "field_size" in tmp.columns else []):
+            tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+        style_rows = []
+        for horse, g in tmp.groupby("horse_name", dropna=False):
+            g2 = g.dropna(subset=pass_cols, how="all")
+            if g2.empty:
+                continue
+            # 最新情報があれば最新、なければ平均通過順
+            g2 = g2.sort_values([c for c in ["year", "month", "day", "race_no"] if c in g2.columns])
+            last = g2.iloc[-1]
+            style, note = _judge_running_style_from_pass_values(
+                [last.get(c, np.nan) for c in ["pass1", "pass2", "pass3", "pass4"]],
+                last.get("field_size", 18),
+            )
+            if style:
+                style_rows.append({"horse_name": horse, "running_style_target": style, "style_note_target": note})
+        if style_rows:
+            features["horse_style_stats"] = pd.DataFrame(style_rows)
+
     return features
 
 
@@ -893,6 +954,21 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
 
     if "horse_stats" in features and "horse_name" in df.columns:
         df = df.merge(features["horse_stats"], on="horse_name", how="left", suffixes=("", "_target"))
+
+    if "horse_style_stats" in features and "horse_name" in df.columns:
+        df = df.merge(features["horse_style_stats"], on="horse_name", how="left", suffixes=("", "_target"))
+        if "running_style_target" in df.columns:
+            if "running_style" not in df.columns:
+                df["running_style"] = ""
+            cur = df["running_style"].astype(str).replace({"nan": "", "None": "", "不明": "", "未取得": ""}).str.strip()
+            df["running_style"] = np.where(cur.ne(""), df["running_style"], df["running_style_target"])
+            df = df.drop(columns=["running_style_target"])
+        if "style_note_target" in df.columns:
+            if "style_note" not in df.columns:
+                df["style_note"] = ""
+            cur = df["style_note"].astype(str).replace({"nan": "", "None": "", "通過順なし": "", "通過順データなし": ""}).str.strip()
+            df["style_note"] = np.where(cur.ne(""), df["style_note"], df["style_note_target"])
+            df = df.drop(columns=["style_note_target"])
 
     if "horse_distance_stats" in features and {"horse_name", "distance"}.issubset(df.columns):
         df["distance"] = pd.to_numeric(df["distance"], errors="coerce")
@@ -1047,6 +1123,24 @@ def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.Dat
         "枠番": "frame_no",
         "頭数": "field_size",
         "芝ダ": "track_type",
+        "脚質": "running_style",
+        "脚質メモ": "style_note",
+        "通過順1角": "pass1",
+        "通過順2角": "pass2",
+        "通過順3角": "pass3",
+        "通過順4角": "pass4",
+        "1角": "pass1",
+        "2角": "pass2",
+        "3角": "pass3",
+        "4角": "pass4",
+        "調教師": "trainer",
+        "厩舎": "trainer",
+        "父馬名": "sire",
+        "父": "sire",
+        "母馬名": "dam",
+        "母": "dam",
+        "母の父馬名": "broodmare_sire",
+        "母父": "broodmare_sire",
     }
     src = src.rename(columns=rename)
 
@@ -1096,6 +1190,11 @@ def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.Dat
 
     df = pd.DataFrame(rows, columns=COLS_52)
     df["source_file"] = source_name
+    # 簡易CSVに脚質/脚質メモがある場合は、52列外の補助列として保持する
+    if "running_style" in src.columns:
+        df["running_style"] = src["running_style"].astype(str).values
+    if "style_note" in src.columns:
+        df["style_note"] = src["style_note"].astype(str).values
     return clean_types(df)
 
 
@@ -1197,12 +1296,30 @@ def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
 
 
 def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
+    """
+    予想結果の日本語表示用。
+    v3修正:
+    - 列は非表示にしない
+    - 脚質/実績が入っていればそのまま表示
+    - 取得できないものは 0.00% のままではなく「未取得」と表示して原因を明確化
+    """
     cols = DISPLAY_COLUMNS.copy()
     if include_race_key:
         cols = ["race_label", "race_key"] + cols
 
     cols = [c for c in cols if c in df.columns]
     out = df[cols].copy()
+
+    if "running_style" in out.columns:
+        out["running_style"] = (
+            out["running_style"].astype(str)
+            .replace({"nan": "", "None": "", "不明": "未取得", "": "未取得"})
+        )
+    if "style_note" in out.columns:
+        out["style_note"] = (
+            out["style_note"].astype(str)
+            .replace({"nan": "", "None": "", "通過順なし": "通過順データなし", "": "データなし"})
+        )
 
     if "ml_top3_prob" in out.columns:
         out["ml_top3_prob"] = (out["ml_top3_prob"] * 100).round(1).astype(str) + "%"
@@ -1211,11 +1328,14 @@ def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
 
     for c in ["jockey_top3_rate_prior", "trainer_top3_rate_prior", "sire_top3_rate_prior", "horse_distance_top3_rate_prior"]:
         if c in out.columns:
-            out[c] = (pd.to_numeric(out[c], errors="coerce").fillna(0) * 100).round(1).astype(str) + "%"
+            vals = pd.to_numeric(out[c], errors="coerce")
+            out[c] = np.where(
+                vals.notna() & (vals > 0),
+                (vals * 100).round(1).astype(str) + "%",
+                "未取得"
+            )
 
     return out.rename(columns=JP_COLUMNS)
-
-
 
 def add_running_style(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1225,7 +1345,7 @@ def add_running_style(df: pd.DataFrame) -> pd.DataFrame:
       先行: 序盤で前目
       差し: 中団
       追込: 後方
-    pass列が無い/空の場合は「不明」。
+    pass列が無い/空の場合は「未取得」。
     """
     df = df.copy()
 
@@ -1241,7 +1361,11 @@ def add_running_style(df: pd.DataFrame) -> pd.DataFrame:
                 passes.append(float(v))
 
         if not passes:
-            return "不明", "通過順なし"
+            existing_style = str(row.get("running_style", "")).strip()
+            existing_note = str(row.get("style_note", "")).strip()
+            if existing_style and existing_style not in ["nan", "None", "不明", "未取得"]:
+                return existing_style, existing_note if existing_note and existing_note not in ["nan", "None"] else "CSV/TARGET補完"
+            return "未取得", "通過順データなし"
 
         field_size = row.get("field_size", np.nan)
         if pd.isna(field_size) or field_size <= 0:
@@ -1300,7 +1424,7 @@ def make_style_summary(df: pd.DataFrame) -> pd.DataFrame:
             "3着内率": f"{(top3 / runs * 100):.1f}%" if runs else "0.0%",
         })
 
-    order = {"逃げ": 1, "先行": 2, "差し": 3, "追込": 4, "不明": 5}
+    order = {"逃げ": 1, "先行": 2, "差し": 3, "追込": 4, "未取得": 5, "不明": 6}
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=["脚質", "件数", "勝利数", "3着内数", "勝率", "3着内率"])
@@ -1376,7 +1500,8 @@ def add_value_strategy(df: pd.DataFrame) -> pd.DataFrame:
         "先行": 0.03,
         "差し": 0.00,
         "追込": -0.03,
-        "不明": -0.01,
+        "未取得": 0.00,
+        "不明": 0.00,
     }
     df["style_bonus"] = df.get("running_style", "不明").map(style_bonus_map).fillna(0)
 

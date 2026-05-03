@@ -2905,7 +2905,10 @@ def app_main():
                 st.success("出馬表CSVから取得しました。")
 
             # TARGET過去CSV（yosou.csv）があれば、騎手・調教師・血統・馬の適性を結合
-            pred_src = merge_target_features(pred_src)
+            st.info("TARGET過去CSVを結合中...")
+            with st.spinner("TARGET過去CSVを結合中..."):
+                pred_src = merge_target_features(pred_src)
+            st.success("TARGET結合処理完了")
 
             if TARGET_CSV_PATH.exists():
                 try:
@@ -2919,9 +2922,17 @@ def app_main():
             else:
                 st.info("TARGET過去CSV（yosou.csv）は未配置です。URL/CSV単体で予想します。")
 
-            pred_df = predict(bundle, pred_src)
+            st.info("AI予想計算中...")
+            with st.spinner("AI予想計算中..."):
+                pred_df = predict(bundle, pred_src)
             st.success(f"予想完了: {len(pred_df)}頭")
             nyanko_safe_show_prediction_table(pred_df)
+
+            # v13:
+            # ここで止める。下の買い目タブ/ROI/脚質タブ生成が重くて
+            # 画面が返らない問題を避ける。
+            st.info("v13安全版: 予想表まで表示しました。買い目生成は次版で軽量化して戻します。")
+            st.stop()
 
             st.subheader("予想結果")
             race_options = (

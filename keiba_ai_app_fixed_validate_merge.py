@@ -41,11 +41,7 @@ DATA_DIR = APP_DIR / "data"
 def find_target_csv_path() -> Path | None:
     """
     TARGET過去CSVの場所を自動検出する。
-    優先順:
-      1) .py と同じ場所の yosou.csv
-      2) .py と同じ場所の yosou_clean.csv
-      3) カレントフォルダの yosou.csv
-      4) カレントフォルダの 254/yosou.csv
+    空ファイルは無視する。
     """
     candidates = [
         APP_DIR / "yosou.csv",
@@ -763,22 +759,55 @@ def load_uploaded_entry_csv(uploaded_csv, csv_mode: str) -> pd.DataFrame:
 def read_target_history_csv(path: Path) -> pd.DataFrame | None:
     """
     GitHub上のyosou.csv（TARGET過去CSV）を読み込む。
-    日本語ヘッダー/英語ヘッダーの両方に寄せる。
+    v7:
+      - 空ファイルは None 扱い
+      - UTF-8-SIG / UTF-8 / cp932 / shift_jis を順に試す
+      - ヘッダーあり/なし両対応
+      - 10列CSV（馬名,騎手,着順,距離,競馬場,通過1,通過2,通過3,通過4,上がり3F）を内部列名へ変換
     """
-    if not path.exists():
+    if path is None or not Path(path).exists():
         return None
 
+    path = Path(path)
+    try:
+        if path.stat().st_size == 0:
+            return None
+    except Exception:
+        return None
+
+    encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
     last_error = None
-    for enc in ["utf-8-sig", "utf-8", "cp932", "shift_jis"]:
+
+    for enc in encodings:
+        # まずヘッダーありとして読む
         try:
             df = pd.read_csv(path, encoding=enc, dtype=str)
-            return normalize_target_history_columns(df)
+            if df is not None and not df.empty:
+                return normalize_target_history_columns(df)
+        except pd.errors.EmptyDataError:
+            return None
+        except Exception as e:
+            last_error = e
+
+        # 次にヘッダーなしとして読む
+        try:
+            df = pd.read_csv(path, encoding=enc, header=None, dtype=str)
+            if df is None or df.empty:
+                continue
+
+            if df.shape[1] >= 10:
+                df = df.iloc[:, :10].copy()
+                df.columns = [
+                    "horse_name", "jockey", "finish", "distance", "place",
+                    "pass1", "pass2", "pass3", "pass4", "last3f"
+                ]
+                return normalize_target_history_columns(df)
+        except pd.errors.EmptyDataError:
+            return None
         except Exception as e:
             last_error = e
 
     raise ValueError(f"TARGET過去CSVを読めませんでした: {last_error}")
-
-
 def normalize_target_history_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     TARGET CSVの列名をアプリ内部名へ変換する。
@@ -1067,15 +1096,13 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
 
 def load_target_features_cached():
     """
-    v5修正:
-    st.cache_dataを外す。
-    CSVを入れ替えても古いキャッシュを使って「未取得」のままになる問題を防ぐ。
+    CSVを入れ替えても古いキャッシュを使わない。
     """
     path = find_target_csv_path()
     if path is None:
         return None, {}
     target_df = read_target_history_csv(path)
-    if target_df is None:
+    if target_df is None or target_df.empty:
         return None, {}
     return target_df, create_target_features(target_df)
 

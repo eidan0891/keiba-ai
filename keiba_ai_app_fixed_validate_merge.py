@@ -1,4 +1,4 @@
-# nyanko_keiba_ipad_cloud_20260428_safe_full.py
+# nyanko_keiba_ipad_cloud_20260428_safe_full_rankfix.py
 # ------------------------------------------------------------
 # にゃんこ競馬AI iPad / Streamlit Cloud版 安全起動フル版
 #
@@ -8,6 +8,7 @@
 # - SimpleImputer _fill_dtype 補修
 # - race_keyにsource_fileを混ぜて別レース混入を防止
 # - 簡易CSVテンプレから実在馬名を削除
+# - AI順位を印より前に表示、☆以降も×/無印で順位が分かるように修正
 #
 # 実行:
 #   python -m streamlit run nyanko_keiba_ipad_cloud_20260428.py
@@ -94,7 +95,7 @@ JP_COLUMNS = {
 }
 
 DISPLAY_COLUMNS = [
-    "mark", "ml_rank", "horse_no", "horse_name", "sex", "age", "jockey",
+    "ml_rank", "mark", "horse_no", "horse_name", "sex", "age", "jockey",
     "carried_weight", "odds", "popularity", "ml_top3_prob",
     "expected_value", "danger_popular", "value_horse", "running_style", "style_note",
     "jockey_top3_rate_prior", "trainer_top3_rate_prior",
@@ -1180,7 +1181,12 @@ def predict(bundle, df: pd.DataFrame) -> pd.DataFrame:
     df["ml_top3_prob"] = prob
     df["ml_rank"] = df.groupby("race_key")["ml_top3_prob"].rank(ascending=False, method="first").astype(int)
 
-    df["mark"] = df["ml_rank"].map({1: "◎", 2: "○", 3: "▲", 4: "△", 5: "☆"}).fillna("")
+    # 5位までしか印が無いと、☆以降が馬番昇順のように見えるため、
+    # 6〜8位にも補助印を付けてAI順位の連続性を見える化する。
+    df["mark"] = df["ml_rank"].map({
+        1: "◎", 2: "○", 3: "▲", 4: "△", 5: "☆",
+        6: "×", 7: "×", 8: "×"
+    }).fillna("")
     df["expected_value"] = df["ml_top3_prob"] * df["odds"].fillna(0)
     df["danger_popular"] = ((df["popularity"].fillna(99) <= 3) & (df["ml_rank"] >= 5)).map({True: "危険", False: ""})
     df["value_horse"] = ((df["popularity"].fillna(0) >= 6) & (df["ml_rank"] <= 4)).map({True: "穴候補", False: ""})
@@ -1310,7 +1316,7 @@ def show_style_tabs(pred_df: pd.DataFrame, race_df: pd.DataFrame):
     with tab1:
         view_cols = ["mark", "ml_rank", "horse_no", "horse_name", "running_style", "style_note", "pass1", "pass2", "pass3", "pass4", "ml_top3_prob"]
         view_cols = [c for c in view_cols if c in race_df.columns]
-        out = race_df.sort_values("ml_rank")[view_cols].copy()
+        out = race_df.sort_values(["ml_rank", "value_score", "horse_no"], ascending=[True, False, True])[view_cols].copy()
         if "ml_top3_prob" in out.columns:
             out["ml_top3_prob"] = (out["ml_top3_prob"] * 100).round(1).astype(str) + "%"
         st.dataframe(out.rename(columns=JP_COLUMNS), use_container_width=True, hide_index=True)
@@ -1407,7 +1413,9 @@ def make_value_summary(race_df: pd.DataFrame) -> pd.DataFrame:
         "buy_flag", "buy_reason", "danger_popular", "value_horse",
     ]
     cols = [c for c in cols if c in race_df.columns]
-    out = race_df.sort_values(["buy_flag", "value_score", "ml_rank"], ascending=[True, False, True])[cols].copy()
+    tmp = race_df.copy()
+    tmp["_buy_order"] = tmp.get("buy_flag", "").map({"買い": 0, "見送り": 1}).fillna(9)
+    out = tmp.sort_values(["_buy_order", "value_score", "ml_top3_prob", "ml_rank"], ascending=[True, False, False, True])[cols].copy()
     if "ml_top3_prob" in out.columns:
         out["ml_top3_prob"] = (out["ml_top3_prob"] * 100).round(1).astype(str) + "%"
     return out.rename(columns={
@@ -1619,7 +1627,7 @@ def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10) ->
         return {}
 
     # 本命はAI順位1位、ただしvalue_scoreが低すぎる場合はvalue_score1位
-    ai_top = race_df.sort_values("ml_rank").head(1)
+    ai_top = race_df.sort_values(["ml_rank", "value_score", "horse_no"], ascending=[True, False, True]).head(1)
     value_top = race_df.sort_values("value_score", ascending=False).head(1)
     if len(ai_top) and len(value_top):
         main = ai_top.iloc[0]
@@ -1750,7 +1758,7 @@ def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10) ->
 
     # 本命2頭＋穴
     honmei2_ana = []
-    sorted_ai = race_df.sort_values("ml_rank")
+    sorted_ai = race_df.sort_values(["ml_rank", "value_score", "horse_no"], ascending=[True, False, True])
     if len(sorted_ai) >= 2:
         h1 = no(sorted_ai.iloc[0])
         h2 = no(sorted_ai.iloc[1])
@@ -1814,7 +1822,7 @@ def show_roi_ticket_tabs(race_df: pd.DataFrame):
 
 def make_tickets(race_df: pd.DataFrame) -> dict:
     """画面上部の簡易サマリー用"""
-    r = race_df.sort_values("ml_rank").copy()
+    r = race_df.sort_values(["ml_rank", "value_score", "horse_no"], ascending=[True, False, True]).copy()
 
     def horse_label(row):
         try:
@@ -2371,7 +2379,7 @@ def app_main():
             selected_label = st.selectbox("レース選択", list(label_map.keys()))
             selected_race = label_map[selected_label]
 
-            race_df = pred_df[pred_df["race_key"] == selected_race].sort_values("ml_rank")
+            race_df = pred_df[pred_df["race_key"] == selected_race].sort_values(["ml_rank", "value_score", "horse_no"], ascending=[True, False, True])
             st.dataframe(jp_view(race_df), use_container_width=True, hide_index=True)
 
             tickets = make_tickets(race_df)

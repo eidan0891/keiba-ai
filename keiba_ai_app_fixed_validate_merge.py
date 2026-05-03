@@ -962,25 +962,69 @@ def _judge_running_style_from_pass_values(pass_values, field_size=18):
         return "差し", f"過去通過:中団 avg{avg_pos:.1f}"
     return "追込", f"過去通過:後方 avg{avg_pos:.1f}"
 
+
+def _nyanko_norm_text(s):
+    return (
+        pd.Series(s).astype(str)
+        .str.replace("\u3000", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.strip()
+        .replace({"nan": "", "None": "", "<NA>": ""})
+    )
+
+def _nyanko_prepare_match_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    v8:
+    予想側に距離・競馬場が無い/0でも補完できるように、
+    馬名キー・騎手キーを作る。
+    """
+    df = df.copy()
+    if "horse_name" in df.columns:
+        df["horse_name_key"] = _nyanko_norm_text(df["horse_name"])
+    else:
+        df["horse_name_key"] = ""
+    if "jockey" in df.columns:
+        df["jockey_key"] = _nyanko_norm_text(df["jockey"])
+    else:
+        df["jockey_key"] = ""
+    if "place" in df.columns:
+        df["place_key"] = _nyanko_norm_text(df["place"])
+    else:
+        df["place_key"] = ""
+    if "distance" in df.columns:
+        df["distance_key"] = pd.to_numeric(df["distance"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["distance_key"] = 0
+    return df
+
+
 def create_target_features(target_df: pd.DataFrame) -> dict:
     """
-    TARGET過去CSVから、PKLが必要としている prior 特徴量を作る。
+    TARGET過去CSVから prior 特徴量を作る。
+    v8:
+      - 馬名/騎手/競馬場の表記ゆれ吸収
+      - 距離・競馬場が予想側に無くても、馬名だけで脚質・馬成績を補完
+      - 馬名×距離が無理なら馬名だけにフォールバック
     """
     if target_df is None or target_df.empty:
         return {}
 
     df = target_df.copy()
+    df = _nyanko_prepare_match_keys(df)
 
-    # yosou.csv が「今週の予想用CSV」の場合、着順が無いのは正常。
-    # その場合はTARGET補正をスキップして、出馬表単体で予想を続行する。
     if "finish" not in df.columns:
         return {}
 
     df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
-    df = df[df["finish"].notna()].copy()
+    df = df[df["finish"].notna() & (df["finish"] > 0)].copy()
 
     if df.empty:
         return {}
+
+    # 数値化
+    for c in ["distance", "distance_key", "pass1", "pass2", "pass3", "pass4", "last3f"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df["is_win"] = df["finish"].eq(1)
     df["is_top3"] = df["finish"].between(1, 3)
@@ -988,9 +1032,9 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
     features = {}
 
     # 騎手
-    if "jockey" in df.columns:
+    if "jockey_key" in df.columns:
         features["jockey_stats"] = (
-            df.groupby("jockey", dropna=False)
+            df.groupby("jockey_key", dropna=False)
             .agg(
                 jockey_runs_prior=("finish", "count"),
                 jockey_win_rate_prior=("is_win", "mean"),
@@ -999,10 +1043,11 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
-    # 調教師
+    # 調教師（CSVにあれば）
     if "trainer" in df.columns:
+        df["trainer_key"] = _nyanko_norm_text(df["trainer"])
         features["trainer_stats"] = (
-            df.groupby("trainer", dropna=False)
+            df.groupby("trainer_key", dropna=False)
             .agg(
                 trainer_runs_prior=("finish", "count"),
                 trainer_win_rate_prior=("is_win", "mean"),
@@ -1011,10 +1056,11 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
-    # 種牡馬
+    # 種牡馬（CSVにあれば）
     if "sire" in df.columns:
+        df["sire_key"] = _nyanko_norm_text(df["sire"])
         features["sire_stats"] = (
-            df.groupby("sire", dropna=False)
+            df.groupby("sire_key", dropna=False)
             .agg(
                 sire_runs_prior=("finish", "count"),
                 sire_win_rate_prior=("is_win", "mean"),
@@ -1023,22 +1069,27 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
-    # 馬の総合成績
-    if "horse_name" in df.columns:
+    # 馬の総合成績（距離/競馬場が無くても使える）
+    if "horse_name_key" in df.columns:
         features["horse_stats"] = (
-            df.groupby("horse_name", dropna=False)
+            df.groupby("horse_name_key", dropna=False)
             .agg(
                 horse_runs_prior=("finish", "count"),
                 horse_win_rate_prior=("is_win", "mean"),
                 horse_top3_rate_prior=("is_top3", "mean"),
+                horse_last3f_mean=("last3f", "mean"),
+                pass1_mean=("pass1", "mean"),
+                pass2_mean=("pass2", "mean"),
+                pass3_mean=("pass3", "mean"),
+                pass4_mean=("pass4", "mean"),
             )
             .reset_index()
         )
 
     # 馬×距離
-    if "horse_name" in df.columns and "distance" in df.columns:
+    if "horse_name_key" in df.columns and "distance_key" in df.columns:
         features["horse_distance_stats"] = (
-            df.groupby(["horse_name", "distance"], dropna=False)
+            df.groupby(["horse_name_key", "distance_key"], dropna=False)
             .agg(
                 horse_distance_runs_prior=("finish", "count"),
                 horse_distance_top3_rate_prior=("is_top3", "mean"),
@@ -1046,21 +1097,10 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
-    # 馬×距離が使えない出馬表（distance=0/空）のため、馬単体の距離適性代替も作る
-    if "horse_name" in df.columns:
-        features["horse_distance_fallback_stats"] = (
-            df.groupby("horse_name", dropna=False)
-            .agg(
-                horse_distance_runs_prior_fallback=("finish", "count"),
-                horse_distance_top3_rate_prior_fallback=("is_top3", "mean"),
-            )
-            .reset_index()
-        )
-
     # 馬×競馬場
-    if "horse_name" in df.columns and "place" in df.columns:
+    if "horse_name_key" in df.columns and "place_key" in df.columns:
         features["horse_track_stats"] = (
-            df.groupby(["horse_name", "place"], dropna=False)
+            df.groupby(["horse_name_key", "place_key"], dropna=False)
             .agg(
                 horse_track_runs_prior=("finish", "count"),
                 horse_track_top3_rate_prior=("is_top3", "mean"),
@@ -1068,28 +1108,15 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
-    # 馬ごとの過去通過順から脚質を補完
-    pass_cols = [c for c in ["pass1", "pass2", "pass3", "pass4"] if c in df.columns]
-    if "horse_name" in df.columns and pass_cols:
-        tmp = df.copy()
-        for c in pass_cols + (["field_size"] if "field_size" in tmp.columns else []):
-            tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
-        style_rows = []
-        for horse, g in tmp.groupby("horse_name", dropna=False):
-            g2 = g.dropna(subset=pass_cols, how="all")
-            if g2.empty:
-                continue
-            # 最新情報があれば最新、なければ平均通過順
-            g2 = g2.sort_values([c for c in ["year", "month", "day", "race_no"] if c in g2.columns])
-            last = g2.iloc[-1]
-            style, note = _judge_running_style_from_pass_values(
-                [last.get(c, np.nan) for c in ["pass1", "pass2", "pass3", "pass4"]],
-                last.get("field_size", 18),
+    # 脚質補完用：馬ごとの平均通過順
+    if "horse_name_key" in df.columns:
+        style_cols = [c for c in ["pass1", "pass2", "pass3", "pass4"] if c in df.columns]
+        if style_cols:
+            features["horse_style_stats"] = (
+                df.groupby("horse_name_key", dropna=False)[style_cols]
+                .mean()
+                .reset_index()
             )
-            if style:
-                style_rows.append({"horse_name": horse, "running_style_target": style, "style_note_target": note})
-        if style_rows:
-            features["horse_style_stats"] = pd.DataFrame(style_rows)
 
     return features
 
@@ -1110,11 +1137,14 @@ def load_target_features_cached():
 def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
     """
     当日出馬表にTARGET過去CSV由来の特徴量を付与する。
-    yosou.csvが無い場合は何もしない。
+    v8:
+      - 予想CSV側にdistance/placeが無くても horse_name_key で補完
+      - 騎手実績は jockey_key で補完
+      - 距離適性がマッチしない場合は horse_top3_rate_prior を代用
+      - 通過順が無ければ過去平均通過順を入れて脚質判定可能にする
     """
     df = entry_df.copy()
-    # v4: TARGET過去CSVとのマッチング失敗を防ぐ
-    df = normalize_match_keys(df)
+    df = _nyanko_prepare_match_keys(df)
 
     if find_target_csv_path() is None:
         return df
@@ -1123,56 +1153,50 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
     if not features:
         return df
 
-    if "jockey_stats" in features and "jockey" in df.columns:
-        df = df.merge(features["jockey_stats"], on="jockey", how="left", suffixes=("", "_target"))
+    # 騎手
+    if "jockey_stats" in features and "jockey_key" in df.columns:
+        df = df.merge(features["jockey_stats"], on="jockey_key", how="left", suffixes=("", "_target"))
 
+    # 調教師
     if "trainer_stats" in features and "trainer" in df.columns:
-        df = df.merge(features["trainer_stats"], on="trainer", how="left", suffixes=("", "_target"))
+        df["trainer_key"] = _nyanko_norm_text(df["trainer"])
+        df = df.merge(features["trainer_stats"], on="trainer_key", how="left", suffixes=("", "_target"))
 
+    # 血統
     if "sire_stats" in features and "sire" in df.columns:
-        df = df.merge(features["sire_stats"], on="sire", how="left", suffixes=("", "_target"))
+        df["sire_key"] = _nyanko_norm_text(df["sire"])
+        df = df.merge(features["sire_stats"], on="sire_key", how="left", suffixes=("", "_target"))
 
-    if "horse_stats" in features and "horse_name" in df.columns:
-        df = df.merge(features["horse_stats"], on="horse_name", how="left", suffixes=("", "_target"))
+    # 馬の総合成績
+    if "horse_stats" in features and "horse_name_key" in df.columns:
+        df = df.merge(features["horse_stats"], on="horse_name_key", how="left", suffixes=("", "_target"))
 
-    if "horse_style_stats" in features and "horse_name" in df.columns:
-        df = df.merge(features["horse_style_stats"], on="horse_name", how="left", suffixes=("", "_target"))
-        if "running_style_target" in df.columns:
-            if "running_style" not in df.columns:
-                df["running_style"] = ""
-            cur = df["running_style"].astype(str).replace({"nan": "", "None": "", "不明": "", "未取得": ""}).str.strip()
-            df["running_style"] = np.where(cur.ne(""), df["running_style"], df["running_style_target"])
-            df = df.drop(columns=["running_style_target"])
-        if "style_note_target" in df.columns:
-            if "style_note" not in df.columns:
-                df["style_note"] = ""
-            cur = df["style_note"].astype(str).replace({"nan": "", "None": "", "通過順なし": "", "通過順データなし": ""}).str.strip()
-            df["style_note"] = np.where(cur.ne(""), df["style_note"], df["style_note_target"])
-            df = df.drop(columns=["style_note_target"])
+    # 馬×距離
+    if "horse_distance_stats" in features and {"horse_name_key", "distance_key"}.issubset(df.columns):
+        df = df.merge(features["horse_distance_stats"], on=["horse_name_key", "distance_key"], how="left", suffixes=("", "_target"))
 
-    if "horse_distance_stats" in features and {"horse_name", "distance"}.issubset(df.columns):
-        df["distance"] = pd.to_numeric(df["distance"], errors="coerce")
-        df = df.merge(features["horse_distance_stats"], on=["horse_name", "distance"], how="left", suffixes=("", "_target"))
+    # 馬×競馬場
+    if "horse_track_stats" in features and {"horse_name_key", "place_key"}.issubset(df.columns):
+        df = df.merge(features["horse_track_stats"], on=["horse_name_key", "place_key"], how="left", suffixes=("", "_target"))
 
-    if "horse_track_stats" in features and {"horse_name", "place"}.issubset(df.columns):
-        df = df.merge(features["horse_track_stats"], on=["horse_name", "place"], how="left", suffixes=("", "_target"))
+    # 脚質補完: 予想側に通過順が無い場合、過去平均通過順を入れる
+    if "horse_style_stats" in features and "horse_name_key" in df.columns:
+        style_stats = features["horse_style_stats"].rename(columns={
+            "pass1": "pass1_hist", "pass2": "pass2_hist", "pass3": "pass3_hist", "pass4": "pass4_hist"
+        })
+        df = df.merge(style_stats, on="horse_name_key", how="left", suffixes=("", "_style"))
+        for c in ["pass1", "pass2", "pass3", "pass4"]:
+            hc = f"{c}_hist"
+            if hc in df.columns:
+                if c not in df.columns:
+                    df[c] = df[hc]
+                else:
+                    cur = pd.to_numeric(df[c], errors="coerce")
+                    hist = pd.to_numeric(df[hc], errors="coerce")
+                    df[c] = cur.where(cur.notna() & (cur > 0), hist)
+                df = df.drop(columns=[hc])
 
-    # v4: distanceが0/空で馬×距離に一致しない場合、馬単体の3着内率で距離適性欄を補完
-    if "horse_distance_fallback_stats" in features and "horse_name" in df.columns:
-        df = df.merge(features["horse_distance_fallback_stats"], on="horse_name", how="left")
-        if "horse_distance_top3_rate_prior" not in df.columns:
-            df["horse_distance_top3_rate_prior"] = np.nan
-        df["horse_distance_top3_rate_prior"] = pd.to_numeric(df["horse_distance_top3_rate_prior"], errors="coerce")
-        df["horse_distance_top3_rate_prior_fallback"] = pd.to_numeric(df.get("horse_distance_top3_rate_prior_fallback", np.nan), errors="coerce")
-        df["horse_distance_top3_rate_prior"] = df["horse_distance_top3_rate_prior"].where(
-            df["horse_distance_top3_rate_prior"].notna() & (df["horse_distance_top3_rate_prior"] != 0),
-            df["horse_distance_top3_rate_prior_fallback"]
-        )
-        for cc in ["horse_distance_runs_prior_fallback", "horse_distance_top3_rate_prior_fallback"]:
-            if cc in df.columns:
-                df = df.drop(columns=[cc])
-
-    # mergeで _target が付いた場合は空の元列を上書き
+    # _target列を元列へ反映
     for c in [
         "jockey_runs_prior", "jockey_win_rate_prior", "jockey_top3_rate_prior",
         "trainer_runs_prior", "trainer_win_rate_prior", "trainer_top3_rate_prior",
@@ -1180,6 +1204,7 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
         "horse_runs_prior", "horse_win_rate_prior", "horse_top3_rate_prior",
         "horse_distance_runs_prior", "horse_distance_top3_rate_prior",
         "horse_track_runs_prior", "horse_track_top3_rate_prior",
+        "horse_last3f_mean",
     ]:
         tc = f"{c}_target"
         if tc in df.columns:
@@ -1190,6 +1215,17 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
             else:
                 df[c] = df[tc]
             df = df.drop(columns=[tc])
+
+    # 距離適性が取れない時は馬の総合3着内率を代用
+    if "horse_distance_top3_rate_prior" not in df.columns:
+        df["horse_distance_top3_rate_prior"] = np.nan
+    if "horse_top3_rate_prior" in df.columns:
+        df["horse_distance_top3_rate_prior"] = pd.to_numeric(df["horse_distance_top3_rate_prior"], errors="coerce")
+        df["horse_top3_rate_prior"] = pd.to_numeric(df["horse_top3_rate_prior"], errors="coerce")
+        df["horse_distance_top3_rate_prior"] = df["horse_distance_top3_rate_prior"].where(
+            df["horse_distance_top3_rate_prior"].notna() & (df["horse_distance_top3_rate_prior"] > 0),
+            df["horse_top3_rate_prior"]
+        )
 
     return df
 

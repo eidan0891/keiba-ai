@@ -2667,6 +2667,67 @@ def load_many_preloaded_entry_csv(paths: list[Path], csv_mode: str) -> pd.DataFr
     return df
 
 
+
+def nyanko_force_show_prediction_results(pred_df: pd.DataFrame):
+    """
+    v11:
+    予想結果が画面に出ない時の保険表示。
+    pred_df が存在すれば必ずメイン表・買い目候補を表示する。
+    """
+    if pred_df is None or pred_df.empty:
+        st.warning("予想結果が空です。CSVの列・モデル読込を確認してください。")
+        return
+
+    st.markdown("---")
+    st.subheader("予想結果")
+
+    show_df = pred_df.copy()
+    if "ml_rank" in show_df.columns:
+        show_df = show_df.sort_values(["race_key", "ml_rank"], ascending=[True, True])
+    elif "AI順位" in show_df.columns:
+        show_df = show_df.sort_values("AI順位", ascending=True)
+
+    try:
+        view = jp_view(show_df, include_race_key=False)
+    except Exception:
+        view = show_df
+
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+    # CSVダウンロード
+    try:
+        csv_bytes = view.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            "予想結果CSVをダウンロード",
+            data=csv_bytes,
+            file_name="nyanko_prediction_result.csv",
+            mime="text/csv",
+        )
+    except Exception:
+        pass
+
+    # 買い目候補
+    try:
+        race_keys = list(show_df["race_key"].dropna().unique()) if "race_key" in show_df.columns else [None]
+        for rk in race_keys:
+            race_df = show_df if rk is None else show_df[show_df["race_key"] == rk].copy()
+            if race_df.empty:
+                continue
+
+            label = str(race_df["race_label"].iloc[0]) if "race_label" in race_df.columns else "このレース"
+            st.subheader(f"買い目候補：{label}")
+
+            combos = generate_roi_bet_combinations(race_df, max_count=10)
+            combos = _ensure_combo_dict_10(combos, race_df, max_count=10)
+
+            tabs = st.tabs(list(combos.keys()))
+            for tab, (bet_type, rows) in zip(tabs, combos.items()):
+                with tab:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"買い目候補の生成はスキップしました: {e}")
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
 
@@ -2874,6 +2935,9 @@ def app_main():
                 st.info("TARGET過去CSV（yosou.csv）は未配置です。URL/CSV単体で予想します。")
 
             pred_df = predict(bundle, pred_src)
+            st.session_state["nyanko_last_pred_df"] = pred_df
+            nyanko_force_show_prediction_results(pred_df)
+            st.success(f"予想完了: {len(pred_df)}頭")
 
             st.subheader("予想結果")
             race_options = (

@@ -2463,7 +2463,7 @@ def app_main():
     st.title("🐾 にゃんこ競馬AI")
 
         # v5: TARGET過去CSVの読込状況を画面に出す
-        _target_path = find_target_csv_path()
+     _target_path = find_target_csv_path()
         if _target_path is not None:
             try:
                 _tmp_df = read_target_history_csv(_target_path)

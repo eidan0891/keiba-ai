@@ -1108,6 +1108,78 @@ def create_target_features(target_df: pd.DataFrame) -> dict:
             .reset_index()
         )
 
+    # 馬ごとの調教師・血統プロファイル
+    # 予想側CSVに trainer/sire が無い場合でも、過去CSVの馬名から補完する
+    if "horse_name_key" in df.columns:
+        profile_cols = ["horse_name_key"]
+        if "trainer" in df.columns:
+            df["trainer_key"] = _nyanko_norm_text(df["trainer"])
+            profile_cols.append("trainer_key")
+        if "sire" in df.columns:
+            df["sire_key"] = _nyanko_norm_text(df["sire"])
+            profile_cols.append("sire_key")
+
+        if len(profile_cols) > 1:
+            profiles = []
+            for horse_key, g in df.groupby("horse_name_key", dropna=False):
+                row = {"horse_name_key": horse_key}
+                if "trainer_key" in g.columns:
+                    vc = g["trainer_key"].dropna()
+                    vc = vc[vc.astype(str).str.len() > 0]
+                    row["trainer_key"] = vc.mode().iloc[0] if not vc.empty else ""
+                if "sire_key" in g.columns:
+                    vc = g["sire_key"].dropna()
+                    vc = vc[vc.astype(str).str.len() > 0]
+                    row["sire_key"] = vc.mode().iloc[0] if not vc.empty else ""
+                profiles.append(row)
+            features["horse_profile"] = pd.DataFrame(profiles)
+
+    # v10: 馬名だけで調教師実績・血統実績を確実に補完するための直引きテーブル
+    # 予想側CSVに trainer/sire が無くても、過去CSVの同一馬から代表trainer/sireを拾い、
+    # そのtrainer/sire全体の3着内率を表示用に入れる。
+    if "horse_name_key" in df.columns:
+        horse_direct_rows = []
+
+        trainer_rate_map = {}
+        if "trainer_key" in df.columns:
+            trainer_tmp = (
+                df.groupby("trainer_key", dropna=False)
+                .agg(trainer_top3_rate_direct=("is_top3", "mean"))
+                .reset_index()
+            )
+            trainer_rate_map = dict(zip(trainer_tmp["trainer_key"], trainer_tmp["trainer_top3_rate_direct"]))
+
+        sire_rate_map = {}
+        if "sire_key" in df.columns:
+            sire_tmp = (
+                df.groupby("sire_key", dropna=False)
+                .agg(sire_top3_rate_direct=("is_top3", "mean"))
+                .reset_index()
+            )
+            sire_rate_map = dict(zip(sire_tmp["sire_key"], sire_tmp["sire_top3_rate_direct"]))
+
+        for horse_key, g in df.groupby("horse_name_key", dropna=False):
+            row = {"horse_name_key": horse_key}
+
+            if "trainer_key" in g.columns:
+                vc = g["trainer_key"].dropna()
+                vc = vc[vc.astype(str).str.len() > 0]
+                trainer_key = vc.mode().iloc[0] if not vc.empty else ""
+                row["trainer_key_direct"] = trainer_key
+                row["trainer_top3_rate_prior_direct"] = trainer_rate_map.get(trainer_key, np.nan)
+
+            if "sire_key" in g.columns:
+                vc = g["sire_key"].dropna()
+                vc = vc[vc.astype(str).str.len() > 0]
+                sire_key = vc.mode().iloc[0] if not vc.empty else ""
+                row["sire_key_direct"] = sire_key
+                row["sire_top3_rate_prior_direct"] = sire_rate_map.get(sire_key, np.nan)
+
+            horse_direct_rows.append(row)
+
+        if horse_direct_rows:
+            features["horse_direct_profile_stats"] = pd.DataFrame(horse_direct_rows)
+
     # 脚質補完用：馬ごとの平均通過順
     if "horse_name_key" in df.columns:
         style_cols = [c for c in ["pass1", "pass2", "pass3", "pass4"] if c in df.columns]
@@ -1153,18 +1225,50 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
     if not features:
         return df
 
+    # 予想側に trainer/sire が無い場合、馬名から過去CSVの代表 trainer/sire を補完
+    if "horse_profile" in features and "horse_name_key" in df.columns:
+        df = df.merge(features["horse_profile"], on="horse_name_key", how="left", suffixes=("", "_profile"))
+
+        if "trainer_key_profile" in df.columns:
+            if "trainer_key" not in df.columns:
+                df["trainer_key"] = df["trainer_key_profile"]
+            else:
+                df["trainer_key"] = df["trainer_key"].where(
+                    df["trainer_key"].astype(str).str.len() > 0,
+                    df["trainer_key_profile"]
+                )
+            df = df.drop(columns=["trainer_key_profile"])
+
+        if "sire_key_profile" in df.columns:
+            if "sire_key" not in df.columns:
+                df["sire_key"] = df["sire_key_profile"]
+            else:
+                df["sire_key"] = df["sire_key"].where(
+                    df["sire_key"].astype(str).str.len() > 0,
+                    df["sire_key_profile"]
+                )
+            df = df.drop(columns=["sire_key_profile"])
+
     # 騎手
     if "jockey_stats" in features and "jockey_key" in df.columns:
         df = df.merge(features["jockey_stats"], on="jockey_key", how="left", suffixes=("", "_target"))
 
     # 調教師
-    if "trainer_stats" in features and "trainer" in df.columns:
-        df["trainer_key"] = _nyanko_norm_text(df["trainer"])
+    if "trainer_stats" in features:
+        if "trainer_key" not in df.columns:
+            if "trainer" in df.columns:
+                df["trainer_key"] = _nyanko_norm_text(df["trainer"])
+            else:
+                df["trainer_key"] = ""
         df = df.merge(features["trainer_stats"], on="trainer_key", how="left", suffixes=("", "_target"))
 
     # 血統
-    if "sire_stats" in features and "sire" in df.columns:
-        df["sire_key"] = _nyanko_norm_text(df["sire"])
+    if "sire_stats" in features:
+        if "sire_key" not in df.columns:
+            if "sire" in df.columns:
+                df["sire_key"] = _nyanko_norm_text(df["sire"])
+            else:
+                df["sire_key"] = ""
         df = df.merge(features["sire_stats"], on="sire_key", how="left", suffixes=("", "_target"))
 
     # 馬の総合成績
@@ -1227,7 +1331,48 @@ def merge_target_features(entry_df: pd.DataFrame) -> pd.DataFrame:
             df["horse_top3_rate_prior"]
         )
 
+
+    # v10: 最終フォールバック
+    # ここまでで調教師/血統が未取得なら、馬名直引きテーブルから直接入れる。
+    if "horse_direct_profile_stats" in features and "horse_name_key" in df.columns:
+        direct = features["horse_direct_profile_stats"]
+        df = df.merge(direct, on="horse_name_key", how="left", suffixes=("", "_direct2"))
+
+        if "trainer_top3_rate_prior_direct" in df.columns:
+            if "trainer_top3_rate_prior" not in df.columns:
+                df["trainer_top3_rate_prior"] = np.nan
+            cur = pd.to_numeric(df["trainer_top3_rate_prior"], errors="coerce")
+            val = pd.to_numeric(df["trainer_top3_rate_prior_direct"], errors="coerce")
+            df["trainer_top3_rate_prior"] = cur.where(cur.notna() & (cur > 0), val)
+
+        if "sire_top3_rate_prior_direct" in df.columns:
+            if "sire_top3_rate_prior" not in df.columns:
+                df["sire_top3_rate_prior"] = np.nan
+            cur = pd.to_numeric(df["sire_top3_rate_prior"], errors="coerce")
+            val = pd.to_numeric(df["sire_top3_rate_prior_direct"], errors="coerce")
+            df["sire_top3_rate_prior"] = cur.where(cur.notna() & (cur > 0), val)
+
+        # 表示/デバッグ用にキーも補完
+        if "trainer_key_direct" in df.columns:
+            if "trainer_key" not in df.columns:
+                df["trainer_key"] = df["trainer_key_direct"]
+            else:
+                df["trainer_key"] = df["trainer_key"].where(
+                    df["trainer_key"].astype(str).str.len() > 0,
+                    df["trainer_key_direct"]
+                )
+
+        if "sire_key_direct" in df.columns:
+            if "sire_key" not in df.columns:
+                df["sire_key"] = df["sire_key_direct"]
+            else:
+                df["sire_key"] = df["sire_key"].where(
+                    df["sire_key"].astype(str).str.len() > 0,
+                    df["sire_key_direct"]
+                )
+
     return df
+
 
 
 def read_csv_bytes(raw: bytes) -> pd.DataFrame:

@@ -2853,8 +2853,38 @@ def nyanko_force_bets_after_result_v17(pred_df: pd.DataFrame):
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+
+def nyanko_force_bets_v18(pred_df: pd.DataFrame):
+    if pred_df is None or pred_df.empty:
+        st.warning("買い目候補: 予想結果が空です。")
+        return
+
+    st.markdown("---")
+    st.subheader("買い目候補")
+
+    try:
+        race_df = pred_df.copy()
+        if "ml_rank" in race_df.columns:
+            race_df = race_df.sort_values("ml_rank")
+
+        combos = generate_roi_bet_combinations(race_df, max_count=10)
+        combos = _ensure_combo_dict_10(combos, race_df, max_count=10)
+
+        if not combos:
+            st.warning("買い目候補が生成されませんでした。")
+            return
+
+        tabs = st.tabs(list(combos.keys()))
+        for tab, (bet_type, rows) in zip(tabs, combos.items()):
+            with tab:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"買い目生成エラー: {e}")
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
+    st.success("起動版: v18 買い目表示復活 / v13文言削除済み")
     st.caption("起動版: v17 買い目表示復活")
 
         # v5: TARGET過去CSVの読込状況を画面に出す
@@ -3061,6 +3091,7 @@ def app_main():
                 st.info("TARGET過去CSV（yosou.csv）は未配置です。URL/CSV単体で予想します。")
 
             pred_df = predict(bundle, pred_src)
+            nyanko_force_bets_v18(pred_df)
             st.success(f"予想完了: {len(pred_df)}頭")
             nyanko_show_full_prediction_and_bets(pred_df)
             nyanko_force_bets_after_result_v17(pred_df)

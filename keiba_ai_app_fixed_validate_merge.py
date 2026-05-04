@@ -2819,8 +2819,43 @@ def nyanko_show_bets_only_v16(pred_df: pd.DataFrame):
         st.error(f"買い目生成エラー: {e}")
 
 
+
+def nyanko_force_bets_after_result_v17(pred_df: pd.DataFrame):
+    """
+    v17:
+    予想結果の後に買い目候補を必ず表示する。
+    """
+    if pred_df is None or pred_df.empty:
+        st.warning("買い目候補: 予想結果が空です。")
+        return
+
+    st.markdown("---")
+    st.subheader("買い目候補")
+
+    race_df = pred_df.copy()
+    if "ml_rank" in race_df.columns:
+        race_df = race_df.sort_values("ml_rank")
+
+    try:
+        combos = generate_roi_bet_combinations(race_df, max_count=10)
+        combos = _ensure_combo_dict_10(combos, race_df, max_count=10)
+    except Exception as e:
+        st.error(f"買い目生成エラー: {e}")
+        return
+
+    if not combos:
+        st.warning("買い目候補が生成されませんでした。")
+        return
+
+    tabs = st.tabs(list(combos.keys()))
+    for tab, (bet_type, rows) in zip(tabs, combos.items()):
+        with tab:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
+    st.caption("起動版: v17 買い目表示復活")
 
         # v5: TARGET過去CSVの読込状況を画面に出す
     st.caption("iPad / Streamlit Cloud対応版。事前CSV・netkeiba URL・出馬表CSVから発走前予想できます。")
@@ -3028,6 +3063,7 @@ def app_main():
             pred_df = predict(bundle, pred_src)
             st.success(f"予想完了: {len(pred_df)}頭")
             nyanko_show_full_prediction_and_bets(pred_df)
+            nyanko_force_bets_after_result_v17(pred_df)
 
             st.subheader("予想結果")
             race_options = (

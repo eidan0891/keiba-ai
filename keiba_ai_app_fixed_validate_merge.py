@@ -1,3 +1,4 @@
+# v16 bets forced / old v13 message removed
 # v14 full bets restored / no st.stop
 # nyanko_keiba_ipad_cloud_20260428_safe_full_rankfix.py
 # ------------------------------------------------------------
@@ -2673,7 +2674,7 @@ def nyanko_show_full_prediction_and_bets(pred_df: pd.DataFrame):
     """
     フル版:
     予想結果表 + 買い目タブを表示する。
-    # st.stop() removed は使わない。
+    # # st.stop removed removed は使わない。
     """
     if pred_df is None or pred_df.empty:
         st.warning("予想結果が空です。")
@@ -2758,6 +2759,40 @@ def nyanko_show_bets_only(pred_df: pd.DataFrame):
     予想結果の直下に買い目候補を必ず表示する。
     """
     if pred_df is None or pred_df.empty:
+        return
+
+    st.markdown("---")
+    st.subheader("買い目候補")
+
+    try:
+        race_df = pred_df.copy()
+        if "ml_rank" in race_df.columns:
+            race_df = race_df.sort_values("ml_rank")
+
+        combos = generate_roi_bet_combinations(race_df, max_count=10)
+        combos = _ensure_combo_dict_10(combos, race_df, max_count=10)
+
+        if not combos:
+            st.warning("買い目候補が生成されませんでした。")
+            return
+
+        tabs = st.tabs(list(combos.keys()))
+        for tab, (bet_type, rows) in zip(tabs, combos.items()):
+            with tab:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.error(f"買い目生成エラー: {e}")
+
+
+
+def nyanko_show_bets_only_v16(pred_df: pd.DataFrame):
+    """
+    v16:
+    予想結果の直下に買い目候補を必ず表示する。
+    """
+    if pred_df is None or pred_df.empty:
+        st.warning("買い目候補: 予想結果が空です。")
         return
 
     st.markdown("---")

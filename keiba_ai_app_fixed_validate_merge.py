@@ -1,3 +1,4 @@
+# v14 full bets restored / no st.stop
 # nyanko_keiba_ipad_cloud_20260428_safe_full_rankfix.py
 # ------------------------------------------------------------
 # にゃんこ競馬AI iPad / Streamlit Cloud版 安全起動フル版
@@ -2668,11 +2669,11 @@ def load_many_preloaded_entry_csv(paths: list[Path], csv_mode: str) -> pd.DataFr
 
 
 
-def nyanko_safe_show_prediction_table(pred_df: pd.DataFrame):
+def nyanko_show_full_prediction_and_bets(pred_df: pd.DataFrame):
     """
-    v12安全版:
-    重い買い目生成をしない。
-    予想結果表だけを確実に表示する。
+    フル版:
+    予想結果表 + 買い目タブを表示する。
+    st.stop() は使わない。
     """
     if pred_df is None or pred_df.empty:
         st.warning("予想結果が空です。")
@@ -2682,14 +2683,11 @@ def nyanko_safe_show_prediction_table(pred_df: pd.DataFrame):
     st.subheader("予想結果")
 
     show_df = pred_df.copy()
-
-    # 並び順
     sort_cols = []
     if "race_key" in show_df.columns:
         sort_cols.append("race_key")
     if "ml_rank" in show_df.columns:
         sort_cols.append("ml_rank")
-
     if sort_cols:
         show_df = show_df.sort_values(sort_cols)
 
@@ -2707,10 +2705,51 @@ def nyanko_safe_show_prediction_table(pred_df: pd.DataFrame):
             data=csv_bytes,
             file_name="nyanko_prediction_result.csv",
             mime="text/csv",
-            key="download_prediction_result_v12"
+            key="download_prediction_result_full_v14"
         )
     except Exception as e:
         st.caption(f"CSVダウンロード生成をスキップ: {e}")
+
+    st.markdown("---")
+    st.subheader("買い目候補")
+
+    try:
+        race_keys = list(show_df["race_key"].dropna().unique()) if "race_key" in show_df.columns else [None]
+
+        for idx, rk in enumerate(race_keys, start=1):
+            race_df = show_df if rk is None else show_df[show_df["race_key"] == rk].copy()
+            if race_df.empty:
+                continue
+
+            label = str(race_df["race_label"].iloc[0]) if "race_label" in race_df.columns else f"レース{idx}"
+            st.markdown(f"### {label}")
+
+            combos = generate_roi_bet_combinations(race_df, max_count=10)
+            combos = _ensure_combo_dict_10(combos, race_df, max_count=10)
+
+            if not combos:
+                st.info("買い目候補がありません。")
+                continue
+
+            tabs = st.tabs(list(combos.keys()))
+            for tab, (bet_type, rows) in zip(tabs, combos.items()):
+                with tab:
+                    df_rows = pd.DataFrame(rows)
+                    st.dataframe(df_rows, use_container_width=True, hide_index=True)
+                    try:
+                        bet_csv = df_rows.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                        st.download_button(
+                            f"{bet_type} CSVダウンロード",
+                            data=bet_csv,
+                            file_name=f"nyanko_bets_{bet_type}.csv",
+                            mime="text/csv",
+                            key=f"download_bets_{idx}_{bet_type}_v14"
+                        )
+                    except Exception:
+                        pass
+
+    except Exception as e:
+        st.error(f"買い目候補の生成でエラー: {e}")
 
 
 def app_main():
@@ -2905,10 +2944,7 @@ def app_main():
                 st.success("出馬表CSVから取得しました。")
 
             # TARGET過去CSV（yosou.csv）があれば、騎手・調教師・血統・馬の適性を結合
-            st.info("TARGET過去CSVを結合中...")
-            with st.spinner("TARGET過去CSVを結合中..."):
-                pred_src = merge_target_features(pred_src)
-            st.success("TARGET結合処理完了")
+            pred_src = merge_target_features(pred_src)
 
             if TARGET_CSV_PATH.exists():
                 try:
@@ -2922,17 +2958,9 @@ def app_main():
             else:
                 st.info("TARGET過去CSV（yosou.csv）は未配置です。URL/CSV単体で予想します。")
 
-            st.info("AI予想計算中...")
-            with st.spinner("AI予想計算中..."):
-                pred_df = predict(bundle, pred_src)
+            pred_df = predict(bundle, pred_src)
             st.success(f"予想完了: {len(pred_df)}頭")
-            nyanko_safe_show_prediction_table(pred_df)
-
-            # v13:
-            # ここで止める。下の買い目タブ/ROI/脚質タブ生成が重くて
-            # 画面が返らない問題を避ける。
-            st.info("v13安全版: 予想表まで表示しました。買い目生成は次版で軽量化して戻します。")
-            st.stop()
+            nyanko_show_full_prediction_and_bets(pred_df)
 
             st.subheader("予想結果")
             race_options = (

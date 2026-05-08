@@ -1,4 +1,4 @@
-race_id,race_name,course,distance,track_type,weather,ground,horse_no,frame_no,horse_name,sex_age,weight,jockey,trainer,odds,popularity
+race_id,race_name,course,distance,track_type,weather,ground,horse_no,frame_no,horse_name,sex_age,carried_weight,jockey,trainer,odds,popularity
 202605100811,NHKマイルC,東京,1600,芝,,,1,1,リゾートアイランド,牡3,57.0,佐々木,上原佑,121.9,18
 202605100811,NHKマイルC,東京,1600,芝,,,2,1,ショウファオ,牡3,57.0,松若,森秀,82.8,17
 202605100811,NHKマイルC,東京,1600,芝,,,3,2,オルネーロ,牡3,57.0,津村,吉岡,38.1,12

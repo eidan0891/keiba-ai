@@ -102,6 +102,26 @@ STRATEGY_MODE_ROI     = "回収率重視"
 STRATEGY_MODE_HITRATE = "的中率重視"
 STRATEGY_MODE_OPTIONS = [STRATEGY_MODE_ROI, STRATEGY_MODE_HITRATE]
 
+# 特徴量日本語名マップ（AI分析用）
+FEAT_JP = {
+    "odds":"単勝オッズ","popularity":"人気順位",
+    "field_odds_rank":"オッズ順位(場内)","field_pop_rank":"人気順位(場内)",
+    "odds_gap_to_fav":"1番人気とのオッズ差","popularity_gap_to_fav":"1番人気との人気差",
+    "jockey_top3_rate_prior":"騎手3着内率","jockey_win_rate_prior":"騎手勝率",
+    "jockey_runs_prior":"騎手出走数","trainer_top3_rate_prior":"調教師3着内率",
+    "trainer_win_rate_prior":"調教師勝率","sire_top3_rate_prior":"父馬3着内率",
+    "horse_top3_rate_prior":"馬の3着内率","horse_win_rate_prior":"馬の勝率",
+    "horse_distance_top3_rate_prior":"距離別3着内率",
+    "horse_track_top3_rate_prior":"競馬場別3着内率",
+    "horse_distance_runs_prior":"距離別出走数","distance":"距離(m)",
+    "course_kind":"コース種別","race_grade":"レースグレード",
+    "age":"年齢","carried_weight":"斤量","field_size":"出走頭数",
+    "horse_no":"馬番","frame_no":"枠番",
+    "pass1":"1角通過順","pass2":"2角通過順","pass3":"3角通過順","pass4":"4角通過順",
+    "last3f":"上り3F",
+}
+
+
 
 def find_target_csv_path() -> Path | None:
     candidates = [
@@ -3033,6 +3053,871 @@ def show_ticket_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_R
 # メイン
 # ============================================================
 
+
+# ============================================================
+# PKL本格AI分析モジュール（nyanko_ai_analyzerより完全統合）
+# [AI-1] モデル概要  [AI-2] 特徴量重要度  [AI-3] 自信度
+# [AI-4] 個別根拠説明  [AI-5] 馬比較ビュー  [AI-6] 健全性
+# ============================================================
+
+def extract_model_info(bundle) -> dict:
+    """
+    PKLバンドルからモデルオブジェクトと特徴量列を取り出す。
+    dict形式・生モデル形式どちらにも対応。
+    """
+    if isinstance(bundle, dict):
+        pipe = bundle.get("pipeline") or bundle.get("model")
+        feature_cols = bundle.get("feature_cols", [])
+    else:
+        pipe = bundle
+        feature_cols = []
+    return {"pipe": pipe, "feature_cols": feature_cols}
+
+
+def unwrap_pipeline(pipe):
+    """
+    sklearn Pipeline の最終推定器を取り出す。
+    Pipeline でない場合はそのまま返す。
+    """
+    from sklearn.pipeline import Pipeline
+    if isinstance(pipe, Pipeline):
+        return pipe.steps[-1][1]
+    return pipe
+
+
+def get_model_type(estimator) -> str:
+    """モデルの種類名を返す"""
+    name = type(estimator).__name__
+    type_map = {
+        "RandomForestClassifier": "ランダムフォレスト",
+        "GradientBoostingClassifier": "勾配ブースティング(sklearn)",
+        "ExtraTreesClassifier": "エクストラツリー",
+        "AdaBoostClassifier": "AdaBoost",
+        "LogisticRegression": "ロジスティック回帰",
+        "SVC": "SVM",
+        "LGBMClassifier": "LightGBM",
+        "XGBClassifier": "XGBoost",
+        "CatBoostClassifier": "CatBoost",
+        "BaggingClassifier": "バギング",
+        "VotingClassifier": "アンサンブル投票",
+        "StackingClassifier": "スタッキング",
+    }
+    return type_map.get(name, name)
+
+
+def get_feature_importances(pipe, feature_cols: list) -> pd.DataFrame | None:
+    """
+    モデルから特徴量重要度を取り出す。
+    対応: feature_importances_ / coef_ / ネストしたPipeline
+    """
+    estimator = unwrap_pipeline(pipe)
+
+    # --- feature_importances_ (RF, GBDT, XGB, LGB, CatBoost など) ---
+    if hasattr(estimator, "feature_importances_"):
+        imp = estimator.feature_importances_
+        if len(feature_cols) == len(imp):
+            df = pd.DataFrame({
+                "特徴量": feature_cols,
+                "重要度": imp,
+                "重要度(%)": (imp / imp.sum() * 100).round(2),
+            }).sort_values("重要度", ascending=False).reset_index(drop=True)
+            df.insert(0, "順位", range(1, len(df) + 1))
+            return df
+
+    # --- coef_ (ロジスティック回帰、SVM linear など) ---
+    if hasattr(estimator, "coef_"):
+        coef = np.abs(estimator.coef_[0]) if estimator.coef_.ndim > 1 else np.abs(estimator.coef_)
+        if len(feature_cols) == len(coef):
+            df = pd.DataFrame({
+                "特徴量": feature_cols,
+                "重要度(係数絶対値)": coef,
+                "重要度(%)": (coef / coef.sum() * 100).round(2),
+            }).sort_values("重要度(係数絶対値)", ascending=False).reset_index(drop=True)
+            df.insert(0, "順位", range(1, len(df) + 1))
+            return df
+
+    # --- VotingClassifier / StackingClassifier → 各サブモデルの平均 ---
+    if hasattr(estimator, "estimators_"):
+        all_imps = []
+        for sub in estimator.estimators_:
+            sub_est = unwrap_pipeline(sub)
+            if hasattr(sub_est, "feature_importances_"):
+                all_imps.append(sub_est.feature_importances_)
+        if all_imps and len(feature_cols) == len(all_imps[0]):
+            avg_imp = np.mean(all_imps, axis=0)
+            df = pd.DataFrame({
+                "特徴量": feature_cols,
+                "重要度(平均)": avg_imp,
+                "重要度(%)": (avg_imp / avg_imp.sum() * 100).round(2),
+            }).sort_values("重要度(平均)", ascending=False).reset_index(drop=True)
+            df.insert(0, "順位", range(1, len(df) + 1))
+            return df
+
+    return None
+
+
+def get_prediction_uncertainty(pipe, X: pd.DataFrame) -> np.ndarray | None:
+    """
+    アンサンブルモデルの各推定器の予測標準偏差（不確実性）を計算。
+    RFの各木、GBDTのステージ予測などに対応。
+    返り値: shape (n_samples,) の標準偏差配列
+    """
+    estimator = unwrap_pipeline(pipe)
+
+    # --- RandomForest / ExtraTrees / Bagging → 各木の予測 ---
+    if hasattr(estimator, "estimators_") and hasattr(estimator.estimators_[0], "predict_proba"):
+        try:
+            tree_preds = np.array([
+                tree.predict_proba(X)[:, 1]
+                for tree in estimator.estimators_
+            ])
+            return tree_preds.std(axis=0)
+        except Exception:
+            pass
+
+    # --- GradientBoosting → staged_predict_proba ---
+    if hasattr(estimator, "staged_predict_proba"):
+        try:
+            staged = list(estimator.staged_predict_proba(X))
+            staged_arr = np.array([s[:, 1] for s in staged])
+            return staged_arr.std(axis=0)
+        except Exception:
+            pass
+
+    return None
+
+
+def get_model_params(pipe) -> dict:
+    """PKLモデルの主要ハイパーパラメータを取り出す"""
+    estimator = unwrap_pipeline(pipe)
+    params = {}
+    important_params = [
+        "n_estimators", "max_depth", "min_samples_leaf", "min_samples_split",
+        "max_features", "learning_rate", "subsample", "n_jobs",
+        "C", "gamma", "kernel", "num_leaves", "n_leaves",
+        "colsample_bytree", "reg_alpha", "reg_lambda",
+    ]
+    all_params = estimator.get_params() if hasattr(estimator, "get_params") else {}
+    for k in important_params:
+        if k in all_params:
+            params[k] = all_params[k]
+    return params
+
+
+# ============================================================
+# 個別馬の予測根拠推定（ローカル特徴量寄与）
+# ============================================================
+
+def calc_local_feature_contribution(
+    pipe,
+    X_row: pd.Series,
+    X_all: pd.DataFrame,
+    feature_cols: list,
+    feature_importances: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """
+    SHAPなしで個別馬の「なぜこの確率か」を近似説明する。
+
+    手法:
+    1. グローバル特徴量重要度 × 各特徴量の偏差（レース内平均との差）
+    2. 偏差の符号でプラス要因/マイナス要因を判定
+    3. 重要度加重で「寄与スコア」を算出
+
+    これはSHAPの完全な代替ではないが、
+    「どの特徴量が平均より高くて、それが重要か」を直感的に示す。
+    """
+    if feature_importances is None or feature_cols is None:
+        return pd.DataFrame()
+
+    # 特徴量重要度マップ
+    imp_col = [c for c in feature_importances.columns if "重要度" in c and "%" not in c]
+    if not imp_col:
+        return pd.DataFrame()
+    imp_col = imp_col[0]
+
+    imp_map = dict(zip(feature_importances["特徴量"], feature_importances[imp_col]))
+
+    rows = []
+    for feat in feature_cols:
+        if feat not in X_row.index or feat not in X_all.columns:
+            continue
+        imp = imp_map.get(feat, 0)
+        if imp < 0.001:  # 重要度が極めて低い特徴量はスキップ
+            continue
+
+        val = float(X_row[feat]) if pd.notna(X_row.get(feat)) else 0.0
+        col_vals = pd.to_numeric(X_all[feat], errors="coerce").dropna()
+        if col_vals.empty:
+            continue
+
+        mean_val = float(col_vals.mean())
+        std_val = float(col_vals.std()) if col_vals.std() > 0 else 1.0
+
+        # 標準化偏差（この馬の値が平均より何σ離れているか）
+        z_score = (val - mean_val) / std_val
+
+        # 寄与スコア = 重要度 × 標準化偏差
+        # 正 → この特徴量がプラス方向に寄与
+        # 負 → この特徴量がマイナス方向に寄与
+        contribution = imp * z_score
+
+        rows.append({
+            "特徴量": feat,
+            "この馬の値": round(val, 4),
+            "レース内平均": round(mean_val, 4),
+            "偏差(σ)": round(z_score, 3),
+            "重要度": round(imp, 4),
+            "寄与スコア": round(contribution, 5),
+            "方向": "🟢 プラス" if contribution > 0 else "🔴 マイナス",
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values("寄与スコア", key=abs, ascending=False)
+    return df.reset_index(drop=True)
+
+
+# ============================================================
+# 予測分布の健全性チェック
+# ============================================================
+
+def check_prediction_health(probs: np.ndarray, field_size: int) -> dict:
+    """
+    予測確率の分布が統計的に健全かをチェックする。
+
+    健全な分布の条件:
+    - 全馬の確率の合計が理論値(3.0)付近にある（3着内なので3頭分）
+    - 特定の1頭に確率が偏りすぎていない
+    - 確率0に近い馬が多すぎない
+    """
+    prob_sum = float(probs.sum())
+    prob_max = float(probs.max())
+    prob_min = float(probs.min())
+    prob_std = float(probs.std())
+    near_zero = int((probs < 0.05).sum())
+    near_one = int((probs > 0.80).sum())
+
+    # 理論的には3頭が3着内なので合計≒3.0が健全
+    # ただしモデルの予測確率は絶対値でなく相対的なスコアの場合もある
+    ideal_sum = 3.0
+    sum_deviation = abs(prob_sum - ideal_sum) / ideal_sum
+
+    issues = []
+    if sum_deviation > 0.5:
+        issues.append(f"確率合計({prob_sum:.2f})が理論値(3.0)から大きく乖離しています")
+    if prob_max > 0.90:
+        issues.append(f"最高確率({prob_max:.3f})が高すぎます（断然人気の過学習の可能性）")
+    if near_zero > field_size * 0.6:
+        issues.append(f"確率5%未満の馬が{near_zero}頭（全体の{near_zero/field_size*100:.0f}%）と多すぎます")
+    if prob_std < 0.02:
+        issues.append("予測確率のばらつきが極端に小さい（モデルが識別できていない可能性）")
+
+    health_score = max(0, 100 - len(issues) * 25)
+
+    return {
+        "確率合計": round(prob_sum, 3),
+        "最高確率": round(prob_max, 3),
+        "最低確率": round(prob_min, 3),
+        "標準偏差": round(prob_std, 4),
+        "確率5%未満の馬数": near_zero,
+        "health_score": health_score,
+        "issues": issues,
+        "status": "✅ 正常" if not issues else f"⚠️ {len(issues)}件の注意",
+    }
+
+
+# ============================================================
+# Streamlit 表示関数群
+# ============================================================
+
+def show_model_overview(pipe, feature_cols: list):
+    """
+    PKLモデルの概要をダッシュボード表示する。
+    モデルの種類・複雑度・設定を分かりやすく見せる。
+    """
+    st.subheader("🤖 PKLモデル概要")
+
+    estimator = unwrap_pipeline(pipe)
+    model_type = get_model_type(estimator)
+    params = get_model_params(pipe)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("モデル種類", model_type)
+    col2.metric("入力特徴量数", len(feature_cols) if feature_cols else "不明")
+
+    n_est = params.get("n_estimators", None)
+    if n_est:
+        col3.metric("推定器数(木の数)", n_est)
+    else:
+        col3.metric("推定器数", "-")
+
+    max_d = params.get("max_depth", None)
+    col4.metric("最大深さ", max_d if max_d else "無制限")
+
+    if params:
+        with st.expander("📋 ハイパーパラメータ詳細"):
+            param_df = pd.DataFrame(
+                [{"パラメータ": k, "値": v} for k, v in params.items()]
+            )
+            st.dataframe(param_df, use_container_width=True, hide_index=True)
+
+    # Pipelineの場合はステップを表示
+    from sklearn.pipeline import Pipeline
+    if isinstance(pipe, Pipeline):
+        with st.expander("🔧 Pipelineステップ"):
+            steps_df = pd.DataFrame([
+                {"ステップ名": name, "処理クラス": type(step).__name__}
+                for name, step in pipe.steps
+            ])
+            st.dataframe(steps_df, use_container_width=True, hide_index=True)
+
+
+def show_feature_importance(pipe, feature_cols: list, top_n: int = 20):
+    """
+    特徴量重要度をランキング形式で表示。
+    カテゴリ別（オッズ系/実績系/血統系など）にグループ化して解説も付ける。
+    """
+    st.subheader("📊 特徴量重要度ランキング（AIが何を重視しているか）")
+
+    fi = get_feature_importances(pipe, feature_cols)
+    if fi is None:
+        st.warning("このモデルタイプは特徴量重要度を取り出せません。")
+        return None
+
+    # 上位N件だけ表示
+    fi_top = fi.head(top_n).copy()
+
+    # カテゴリ分類
+    def categorize(feat: str) -> str:
+        if any(x in feat for x in ["odds", "popularity", "implied", "ev"]):
+            return "💴 オッズ/市場系"
+        if any(x in feat for x in ["jockey"]):
+            return "🏇 騎手系"
+        if any(x in feat for x in ["trainer"]):
+            return "🏋️ 調教師系"
+        if any(x in feat for x in ["sire", "dam", "broodmare"]):
+            return "🧬 血統系"
+        if any(x in feat for x in ["horse_distance", "horse_track", "horse_"]):
+            return "📈 馬実績系"
+        if any(x in feat for x in ["distance", "course", "track", "going"]):
+            return "🏟️ コース条件系"
+        if any(x in feat for x in ["pass", "last3f", "style"]):
+            return "🦵 脚質/上がり系"
+        if any(x in feat for x in ["age", "carried", "weight", "sex"]):
+            return "⚖️ 馬体系"
+        if any(x in feat for x in ["race_no", "field_size", "frame", "horse_no"]):
+            return "🔢 レース情報系"
+        return "📌 その他"
+
+    fi_top["カテゴリ"] = fi_top["特徴量"].apply(categorize)
+
+    # 日本語特徴量名マッピング
+    FEAT_JP = {
+        "odds": "単勝オッズ",
+        "popularity": "人気順位",
+        "field_odds_rank": "フィールド内オッズ順位",
+        "field_pop_rank": "フィールド内人気順位",
+        "odds_gap_to_fav": "1番人気とのオッズ差",
+        "popularity_gap_to_fav": "1番人気との人気差",
+        "jockey_top3_rate_prior": "騎手3着内率",
+        "jockey_win_rate_prior": "騎手勝率",
+        "jockey_runs_prior": "騎手出走数",
+        "trainer_top3_rate_prior": "調教師3着内率",
+        "trainer_win_rate_prior": "調教師勝率",
+        "sire_top3_rate_prior": "父馬3着内率",
+        "sire_win_rate_prior": "父馬勝率",
+        "horse_top3_rate_prior": "馬の3着内率",
+        "horse_win_rate_prior": "馬の勝率",
+        "horse_distance_top3_rate_prior": "距離別3着内率",
+        "horse_track_top3_rate_prior": "競馬場別3着内率",
+        "horse_distance_runs_prior": "距離別出走数",
+        "distance": "距離(m)",
+        "course_kind": "コース種別",
+        "race_grade": "レースグレード",
+        "age": "年齢",
+        "carried_weight": "斤量",
+        "field_size": "出走頭数",
+        "horse_no": "馬番",
+        "frame_no": "枠番",
+        "pass1": "1角通過順",
+        "pass2": "2角通過順",
+        "pass3": "3角通過順",
+        "pass4": "4角通過順",
+        "last3f": "上り3F",
+    }
+    fi_top["日本語名"] = fi_top["特徴量"].map(FEAT_JP).fillna(fi_top["特徴量"])
+
+    # 重要度カラム名を統一
+    imp_col = [c for c in fi_top.columns if "重要度" in c and "%" not in c and "順位" not in c]
+    if not imp_col:
+        st.dataframe(fi_top, use_container_width=True, hide_index=True)
+        return fi
+
+    imp_col = imp_col[0]
+
+    # バー付きで表示
+    display_cols = ["順位", "日本語名", "特徴量", imp_col, "重要度(%)", "カテゴリ"]
+    display_cols = [c for c in display_cols if c in fi_top.columns]
+
+    try:
+        styled = fi_top[display_cols].style.bar(
+            subset=[imp_col], color="#4CAF50", vmin=0
+        ).format({imp_col: "{:.4f}", "重要度(%)": "{:.2f}%"})
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(fi_top[display_cols], use_container_width=True, hide_index=True)
+
+    # カテゴリ別集計
+    st.markdown("#### カテゴリ別重要度シェア")
+    cat_sum = (
+        fi_top.groupby("カテゴリ")[imp_col]
+        .sum()
+        .reset_index()
+        .rename(columns={imp_col: "合計重要度"})
+        .sort_values("合計重要度", ascending=False)
+    )
+    cat_sum["シェア(%)"] = (cat_sum["合計重要度"] / cat_sum["合計重要度"].sum() * 100).round(1)
+
+    # トップカテゴリの解説
+    top_cat = cat_sum.iloc[0]["カテゴリ"] if not cat_sum.empty else ""
+    cat_advice = {
+        "💴 オッズ/市場系": "市場のオッズ情報をAIが最も重視しています。市場の効率性が高いレースでは予測が難しくなる傾向があります。",
+        "🏇 騎手系": "騎手の実績がAIの判断に大きく影響しています。有力騎手の馬は高確率になりやすいです。",
+        "📈 馬実績系": "馬自身の過去成績をAIが最重視しています。実績のない新馬/未勝利戦は予測精度が下がる可能性があります。",
+        "🏟️ コース条件系": "距離・コース条件への適性をAIが重視しています。初距離・初コースの馬は割引が必要です。",
+    }
+    if top_cat in cat_advice:
+        st.info(f"💡 **{top_cat}が最重要**: {cat_advice[top_cat]}")
+
+    try:
+        styled_cat = cat_sum.style.bar(
+            subset=["合計重要度"], color="#2196F3", vmin=0
+        ).format({"合計重要度": "{:.4f}", "シェア(%)": "{:.1f}%"})
+        st.dataframe(styled_cat, use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(cat_sum, use_container_width=True, hide_index=True)
+
+    return fi
+
+
+def show_prediction_uncertainty(pipe, X: pd.DataFrame, race_df: pd.DataFrame):
+    """
+    各馬の予測不確実性（AIの自信度）を表示する。
+    標準偏差が大きい馬 = AIが迷っている馬。
+    """
+    st.subheader("🎯 AI予測の自信度（不確実性分析）")
+
+    uncertainty = get_prediction_uncertainty(pipe, X)
+    if uncertainty is None:
+        st.info("このモデルタイプは不確実性推定に非対応です。")
+        return
+
+    result_df = race_df[["horse_no", "horse_name", "ml_top3_prob",
+                           "ml_rank", "odds", "popularity"]].copy()
+    result_df = result_df.reset_index(drop=True)
+    result_df["予測標準偏差(不確実性)"] = uncertainty.round(4)
+    result_df["AI自信度"] = result_df["予測標準偏差(不確実性)"].apply(
+        lambda s: "🔴 迷っている" if s > 0.15 else ("🟡 やや不安" if s > 0.08 else "🟢 自信あり")
+    )
+    result_df["ml_top3_prob_pct"] = (result_df["ml_top3_prob"] * 100).round(1).astype(str) + "%"
+
+    display = result_df[[
+        "ml_rank", "horse_no", "horse_name", "ml_top3_prob_pct",
+        "予測標準偏差(不確実性)", "AI自信度", "odds", "popularity"
+    ]].rename(columns={
+        "ml_rank": "AI順位", "horse_no": "馬番", "horse_name": "馬名",
+        "ml_top3_prob_pct": "3着内確率", "odds": "オッズ", "popularity": "人気"
+    }).sort_values("AI順位")
+
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # 注意馬のハイライト
+    unsure = result_df[result_df["予測標準偏差(不確実性)"] > 0.15].sort_values(
+        "予測標準偏差(不確実性)", ascending=False)
+    if not unsure.empty:
+        names = " / ".join(
+            f"馬番{int(r['horse_no'])} {r['horse_name']}"
+            for _, r in unsure.head(3).iterrows()
+        )
+        st.warning(
+            f"⚠️ **AIが迷っている馬**: {names}\n\n"
+            "これらの馬は推定器間で予測が大きくばらついており、"
+            "実際の結果も不安定になりやすいです。購入は慎重に。"
+        )
+
+    # 自信度が高くてEVも良い馬
+    if "ev_score" in race_df.columns:
+        result_df["ev_score"] = race_df["ev_score"].values
+        confident_ev = result_df[
+            (result_df["予測標準偏差(不確実性)"] < 0.08) &
+            (result_df["ev_score"] > 0.03) &
+            (result_df["ml_rank"] <= 5)
+        ]
+        if not confident_ev.empty:
+            names2 = " / ".join(
+                f"馬番{int(r['horse_no'])} {r['horse_name']}(EV+{r['ev_score']:.3f})"
+                for _, r in confident_ev.iterrows()
+            )
+            st.success(f"✅ **AI自信×EV高め**: {names2} → 三連複の軸候補として有望")
+
+
+def show_local_explanation(pipe, X: pd.DataFrame, race_df: pd.DataFrame,
+                            feature_cols: list, feature_importances: pd.DataFrame | None):
+    """
+    レース内の各馬について「なぜその確率になったか」を説明する。
+    上位馬と下位馬の比較を中心に表示。
+    """
+    st.subheader("🔍 個別馬の予測根拠説明（特徴量寄与分析）")
+
+    if feature_importances is None:
+        st.info("特徴量重要度がないため、個別説明を生成できません。")
+        return
+
+    horses = race_df.sort_values("ml_rank").head(8)
+    horse_options = [
+        f"馬番{int(r['horse_no'])} {r['horse_name']} (AI{int(r['ml_rank'])}位)"
+        for _, r in horses.iterrows()
+    ]
+    selected = st.selectbox("分析する馬を選択", horse_options, key="local_exp_select")
+
+    if not selected:
+        return
+
+    # 選択馬のインデックスを特定
+    idx_in_horses = horse_options.index(selected)
+    target_row = horses.iloc[idx_in_horses]
+    target_idx = target_row.name
+
+    if target_idx not in X.index:
+        st.warning("この馬のデータが特徴量行列に見つかりません。")
+        return
+
+    X_row = X.loc[target_idx]
+    contrib_df = calc_local_feature_contribution(
+        pipe, X_row, X, feature_cols, feature_importances)
+
+    if contrib_df.empty:
+        st.info("寄与スコアを計算できませんでした。")
+        return
+
+    prob = float(target_row.get("ml_top3_prob", 0))
+    rank = int(target_row.get("ml_rank", 0))
+    horse_name = target_row.get("horse_name", "")
+
+    st.markdown(
+        f"**{horse_name}** (AI{rank}位 / 3着内確率: {prob*100:.1f}%) の予測根拠"
+    )
+
+    # プラス要因 / マイナス要因を分けて表示
+    plus_df = contrib_df[contrib_df["寄与スコア"] > 0].head(8)
+    minus_df = contrib_df[contrib_df["寄与スコア"] < 0].head(8)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("##### 🟢 プラス要因（確率を上げた特徴量）")
+        if not plus_df.empty:
+            st.dataframe(
+                plus_df[["特徴量", "この馬の値", "レース内平均", "偏差(σ)", "重要度", "寄与スコア"]],
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("明確なプラス要因なし")
+
+    with col2:
+        st.markdown("##### 🔴 マイナス要因（確率を下げた特徴量）")
+        if not minus_df.empty:
+            st.dataframe(
+                minus_df[["特徴量", "この馬の値", "レース内平均", "偏差(σ)", "重要度", "寄与スコア"]],
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("明確なマイナス要因なし")
+
+    # 自動コメント生成
+    comments = []
+    for _, row in plus_df.head(3).iterrows():
+        feat = row["特徴量"]
+        val = row["この馬の値"]
+        avg = row["レース内平均"]
+        sigma = row["偏差(σ)"]
+        if "jockey_top3" in feat:
+            comments.append(f"騎手の3着内率({val:.1%})がレース平均({avg:.1%})より高い")
+        elif "odds" in feat and feat == "odds":
+            if val < avg:
+                comments.append(f"オッズ({val:.1f}倍)がレース平均({avg:.1f}倍)より低く市場評価が高い")
+        elif "horse_distance" in feat:
+            comments.append(f"この距離での3着内率({val:.1%})が平均({avg:.1%})より優秀")
+        elif "trainer_top3" in feat:
+            comments.append(f"調教師の3着内率({val:.1%})が平均({avg:.1%})を上回る")
+
+    for _, row in minus_df.head(2).iterrows():
+        feat = row["特徴量"]
+        val = row["この馬の値"]
+        avg = row["レース内平均"]
+        if "popularity" in feat and feat == "popularity":
+            if val > avg:
+                comments.append(f"人気順位({val:.0f}番人気)が低め(平均{avg:.1f}番人気)")
+        elif "horse_distance" in feat:
+            comments.append(f"この距離での実績({val:.1%})が平均({avg:.1%})を下回る")
+
+    if comments:
+        st.info("💬 **AI根拠サマリー**: " + " / ".join(comments))
+
+
+def show_race_comparison(race_df: pd.DataFrame, X: pd.DataFrame,
+                          feature_importances: pd.DataFrame | None, feature_cols: list):
+    """
+    レース内の全馬を上位重要特徴量で比較するヒートマップ的表示。
+    """
+    st.subheader("⚔️ レース内 馬比較（重要特徴量ビュー）")
+
+    if feature_importances is None:
+        st.info("特徴量重要度がないため比較できません。")
+        return
+
+    # 上位10特徴量を取得
+    imp_col = [c for c in feature_importances.columns if "重要度" in c and "%" not in c and "順位" not in c]
+    if not imp_col:
+        return
+    imp_col = imp_col[0]
+
+    top_features = feature_importances.head(10)["特徴量"].tolist()
+    top_features = [f for f in top_features if f in X.columns][:10]
+
+    if not top_features:
+        st.info("比較用の特徴量が見つかりません。")
+        return
+
+    # 表示用データ構築
+    result = race_df[["horse_no", "horse_name", "ml_rank", "ml_top3_prob",
+                       "odds", "popularity"]].copy().reset_index(drop=True)
+    X_reset = X.reset_index(drop=True)
+
+    # 特徴量値をマージ
+    for feat in top_features:
+        if feat in X_reset.columns:
+            result[feat] = X_reset[feat].values
+
+    # 日本語列名マッピング
+    FEAT_JP = {
+        "odds": "オッズ", "popularity": "人気", "jockey_top3_rate_prior": "騎手3着内率",
+        "trainer_top3_rate_prior": "調教師3着内率", "sire_top3_rate_prior": "父馬3着内率",
+        "horse_distance_top3_rate_prior": "距離別3着内率", "horse_top3_rate_prior": "馬3着内率",
+        "field_odds_rank": "オッズ順位", "field_pop_rank": "人気順位",
+        "odds_gap_to_fav": "1番人気とのオッズ差", "age": "年齢",
+        "carried_weight": "斤量", "distance": "距離", "last3f": "上り3F",
+    }
+    rename_dict = {f: FEAT_JP.get(f, f) for f in top_features}
+    rename_dict.update({
+        "ml_rank": "AI順位", "horse_no": "馬番", "horse_name": "馬名",
+        "ml_top3_prob": "3着内確率"
+    })
+
+    result["3着内確率"] = (result["ml_top3_prob"] * 100).round(1).astype(str) + "%"
+    display_cols = ["ml_rank", "horse_no", "horse_name", "3着内確率"] + top_features
+    display_cols = [c for c in display_cols if c in result.columns]
+
+    out = result[display_cols].rename(columns=rename_dict).sort_values("AI順位")
+
+    # 数値列をハイライト（高いほど緑）
+    numeric_cols = [rename_dict.get(f, f) for f in top_features
+                    if f not in ["odds", "popularity", "field_odds_rank",
+                                  "field_pop_rank", "odds_gap_to_fav"]]
+    inverse_cols = [rename_dict.get(f, f) for f in top_features
+                    if f in ["odds", "popularity", "field_odds_rank",
+                              "field_pop_rank", "odds_gap_to_fav"]]
+
+    try:
+        styled = out.style
+        for col in numeric_cols:
+            if col in out.columns:
+                try:
+                    styled = styled.background_gradient(
+                        subset=[col], cmap="RdYlGn", vmin=0)
+                except Exception:
+                    pass
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(out, use_container_width=True, hide_index=True)
+
+    st.caption(
+        "🟢 緑 = レース内で高い値（実績・確率系は高いほど有利） / "
+        "🔴 赤 = 低い値 ※オッズ・人気列は逆転しているため注意"
+    )
+
+
+def show_prediction_health(probs: np.ndarray, field_size: int):
+    """予測分布の健全性チェック結果を表示"""
+    st.subheader("🏥 AI予測の健全性チェック")
+
+    health = check_prediction_health(probs, field_size)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("健全性スコア", f"{health['health_score']}/100")
+    col2.metric("確率合計", f"{health['確率合計']:.3f}", help="理論値は3.0（3頭が3着内）")
+    col3.metric("最高確率", f"{health['最高確率']:.3f}")
+    col4.metric("予測標準偏差", f"{health['標準偏差']:.4f}")
+
+    if health["issues"]:
+        for issue in health["issues"]:
+            st.warning(f"⚠️ {issue}")
+    else:
+        st.success("✅ 予測分布は正常です。AIが正常に動作しています。")
+
+    # 分布の解説
+    prob_sum = health["確率合計"]
+    if prob_sum < 1.5:
+        st.info(
+            "💡 確率合計が低い場合: モデルが出力する値は絶対的な確率ではなく、"
+            "相対的なスコアである可能性があります。馬の順位比較には使えますが、"
+            "絶対値としての解釈には注意が必要です。"
+        )
+    elif prob_sum > 5.0:
+        st.info(
+            "💡 確率合計が高い場合: モデルがポジティブ方向に偏って学習している可能性があります。"
+            "EV計算の信頼性がやや低下します。"
+        )
+
+
+# ============================================================
+# メイン統合表示関数
+# ============================================================
+
+def show_full_ai_analysis(bundle, pred_df: pd.DataFrame, race_df: pd.DataFrame,
+                           feature_data: pd.DataFrame | None = None):
+    """
+    PKLを使った全AI分析を一括表示する。
+    nyanko_keiba_v25.py のレース詳細画面から呼び出す。
+
+    引数:
+        bundle      : joblib.load()で読み込んだPKLバンドル
+        pred_df     : predict()後の全レースDataFrame
+        race_df     : 対象レースのDataFrame
+        feature_data: add_prior_stats_for_prediction()後のDataFrame（任意）
+    """
+    info = extract_model_info(bundle)
+    pipe = info["pipe"]
+    feature_cols = info["feature_cols"]
+
+    if pipe is None:
+        st.error("PKLからモデルを取り出せませんでした。")
+        return
+
+    st.markdown("---")
+    st.header("🧠 PKL本格AI分析ダッシュボード")
+    st.caption(
+        "PKLモデルの内部情報を使ったAI分析です。"
+        "「なぜこの馬が選ばれたか」「AIが何を重視しているか」を可視化します。"
+    )
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🤖 モデル概要",
+        "📊 特徴量重要度",
+        "🎯 AI自信度",
+        "🔍 個別根拠説明",
+        "⚔️ 馬比較ビュー",
+    ])
+
+    # 特徴量行列を準備
+    X = None
+    if feature_data is not None and feature_cols:
+        avail = [c for c in feature_cols if c in feature_data.columns]
+        if avail:
+            X_raw = feature_data[feature_cols].copy()
+            for c in feature_cols:
+                if c not in X_raw.columns:
+                    X_raw[c] = 0
+                X_raw[c] = pd.to_numeric(X_raw[c], errors="coerce").fillna(0)
+            # race_dfと行を合わせる
+            X = X_raw.loc[X_raw.index.isin(race_df.index)].copy()
+
+    with tab1:
+        show_model_overview(pipe, feature_cols)
+
+        # 予測分布の健全性
+        probs = race_df.get("ml_top3_prob", pd.Series(dtype=float))
+        if not probs.empty:
+            show_prediction_health(
+                probs.values,
+                int(race_df.get("field_size", pd.Series([len(race_df)])).iloc[0])
+            )
+
+    with tab2:
+        fi = show_feature_importance(pipe, feature_cols, top_n=25)
+
+    with tab3:
+        if X is not None and not X.empty:
+            show_prediction_uncertainty(pipe, X, race_df)
+        else:
+            st.info(
+                "不確実性分析には特徴量データが必要です。\n\n"
+                "**対応方法**: `show_full_ai_analysis()` の `feature_data` 引数に "
+                "`add_prior_stats_for_prediction(pred_src)` の結果を渡してください。"
+            )
+            st.code(
+                "# v25本体での呼び出し例\n"
+                "pred_src_enriched = add_prior_stats_for_prediction(pred_src)\n"
+                "show_full_ai_analysis(bundle, pred_df, race_df,\n"
+                "                      feature_data=pred_src_enriched)",
+                language="python"
+            )
+
+    with tab4:
+        fi_for_exp = fi if "fi" in dir() else None
+        if X is not None and not X.empty and fi_for_exp is not None:
+            show_local_explanation(pipe, X, race_df, feature_cols, fi_for_exp)
+        else:
+            st.info("個別根拠説明には特徴量データと特徴量重要度の両方が必要です。")
+
+    with tab5:
+        fi_for_cmp = fi if "fi" in dir() else None
+        if X is not None and not X.empty and fi_for_cmp is not None:
+            show_race_comparison(race_df, X, fi_for_cmp, feature_cols)
+        else:
+            st.info("馬比較ビューには特徴量データが必要です。")
+
+
+# ============================================================
+# v25本体への組み込みパッチ（差分コード）
+# ============================================================
+#
+# nyanko_keiba_v25.py の app_main() 内、
+# 「show_ticket_tabs(race_df ...)」の直後に以下を追加する:
+#
+# ──────────────────────────────────────────────────────────
+# # PKL本格AI分析（nyanko_ai_analyzer.py が同フォルダにある場合）
+# try:
+#     from nyanko_ai_analyzer import show_full_ai_analysis
+#     from nyanko_keiba_v25 import add_prior_stats_for_prediction
+#
+#     # 特徴量データを準備（予測前のenrichedデータ）
+#     pred_src_enriched = merge_target_features(pred_src)
+#     pred_src_enriched = add_prior_stats_for_prediction(pred_src_enriched)
+#     pred_src_enriched = add_running_style(pred_src_enriched)
+#
+#     # race_dfに対応する行を抽出
+#     race_feature_data = pred_src_enriched[
+#         pred_src_enriched["race_key"] == selected_race
+#     ].copy() if "race_key" in pred_src_enriched.columns else pred_src_enriched
+#
+#     show_full_ai_analysis(
+#         bundle,
+#         pred_df,
+#         race_df,
+#         feature_data=race_feature_data
+#     )
+# except ImportError:
+#     st.info("nyanko_ai_analyzer.py を同フォルダに置くとPKL詳細分析が使えます。")
+# except Exception as e:
+#     st.warning(f"AI分析モジュールエラー: {e}")
+# ──────────────────────────────────────────────────────────
+#
+# ============================================================
+
+
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI")
     st.success(f"起動版: {VERSION}")
@@ -3299,6 +4184,26 @@ def app_main():
 
             st.markdown("---")
             show_ticket_tabs(race_df, strategy_mode=strategy_mode)
+
+            # ============================================================
+            # 🧠 PKL本格AI分析ダッシュボード（全機能統合）
+            # ============================================================
+            try:
+                pred_src_enriched = merge_target_features(pred_src.copy())
+                pred_src_enriched = add_prior_stats_for_prediction(pred_src_enriched)
+                pred_src_enriched = add_running_style(pred_src_enriched)
+                if "race_key" in pred_src_enriched.columns:
+                    race_feat = pred_src_enriched[pred_src_enriched["race_key"] == selected_race].copy()
+                else:
+                    race_feat = pred_src_enriched.head(len(race_df)).copy()
+                # インデックスをrace_dfに合わせる
+                race_feat = race_feat.reset_index(drop=True)
+                race_df_reset = race_df.reset_index(drop=True)
+                race_feat.index = race_df_reset.index
+                show_full_ai_analysis(bundle, pred_df, race_df_reset, feature_data=race_feat)
+            except Exception as _ai_err:
+                st.warning(f"AI分析でエラーが発生しました: {_ai_err}")
+
             show_roi_strategy(race_df, strategy_mode=strategy_mode)
 
             # 2モード比較表示

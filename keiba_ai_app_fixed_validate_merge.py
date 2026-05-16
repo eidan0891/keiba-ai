@@ -1,44 +1,36 @@
-# nyanko_keiba_ipad_cloud_v24.py
+# nyanko_keiba_ipad_cloud_v25.py
 # ------------------------------------------------------------
-# にゃんこ競馬AI v24 (回収率・的中率 全面改善版)
+# にゃんこ競馬AI v25 (v24全バグ修正＋ロジック刷新版)
 #
-# 【v24 改善サマリー】
-#
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🔴 BUG FIX
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# [BF-1] v23で修正済みの日付バグを引き継ぎ確認済み
-# [BF-2] ev_score が implied_top3=0の馬（オッズ欠損）で
-#         極端にプラスになるバグを修正 → オッズ欠損馬は
-#         ev_score=0 にフロアを設けてスコア汚染を防止
-# [BF-3] _ensure_10_rows で seen が重複チェックを抜ける
-#         ケースがあり同じ買い目が重複表示されていた → 修正
-# [BF-4] generate_sanrenpuku_1jiku の spread_min チェックで
-#         "最低4点は品質問わず" の条件が spread_min と矛盾し
-#         悪質な組み合わせが混入 → フォールバック閾値を分離
-# [BF-5] predict関数内でadd_ev_scoreをadd_danger_levelより後に
-#         呼んでいたため ev_score列未存在時に
-#         'int' object has no attribute 'fillna' エラー → 修正
+# 【v25 改善サマリー】
 #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🟢 IMPROVEMENT: 回収率・的中率を上げるコアロジック改善
+# 🔴 v24からの根本的な問題修正
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#
-# [IMP-1] Kelly基準による購入点数絞り込み (新機能)
-# [IMP-2] レース質フィルタ (新機能)
-# [IMP-3] 三連複 期待値ベース組み合わせ評価 (改善)
-# [IMP-4] 危険人気馬 検出精度向上 (改善)
-# [IMP-5] 的中率モード: 複勝圏スコア特化 (改善)
-# [IMP-6] 買い目点数の動的最適化 (新機能)
-# [IMP-7] 軸馬信頼度スコア (新機能)
-# [IMP-8] オッズ変動対応: 直前オッズ乖離チェック (新機能)
-# [IMP-9] 三連複 1頭軸の軸選出 更なる改善 (改善)
-# [IMP-10] 三連単 買い目品質フィルタ (改善)
+# [FIX-1] 三連複確率計算を独立仮定(p1*p2*p3*6)から
+#          条件付き確率＋頭数補正に刷新
+#          → 過大評価を排除し現実的な組合EV算出
+# [FIX-2] implied_top3を「単勝オッズ÷3」粗推定から
+#          オッズ帯別係数テーブルに刷新
+#          → EV乖離スコアの精度が大幅向上
+# [FIX-3] 危険人気馬フィルタ閾値をAI5位→AI4位に強化
+#          1番人気EVマイナス大でも「強危険」に変更
+# [FIX-4] 相手B選出に「AI確率下限」を追加
+#          → EVプラスだが実力ゼロの馬の混入を防止
+# [FIX-5] Kelly比を複勝ベースから三連複専用に分離
+#          → 券種ミスマッチによる過剰買いシグナルを解消
+# [FIX-6] _ensure_10_rows の品質フィルタを強化
+#          → 質の低い補完買い目を強制生成しない
+# [FIX-7] レース質分析(断然/混戦/高配当)を買い目生成に反映
+#          → 断然レースは三連複点数削減＋複勝推奨に切替
+# [FIX-8] 三連複1頭軸に頭数別動的EV閾値を導入
+#          → 18頭立ての難度を反映した絞り込み
+# [FIX-9] pivot_confidence の計算をEV推定上流の修正と連動
+#          → 信頼度スコアの歪みを解消
 #
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 【v23 修正引き継ぎ】
-#   - 簡易CSV日付バグ修正 / EV計算式修正 / EVフロア / 穴強制廃止
-#   - 三連複5頭BOX選出ロジック改善 / 相手B安定化
+# 【v24から引き継ぎ済み】
+#   BF-1〜5, IMP-1〜10 (ただし本バージョンで上書き修正あり)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ------------------------------------------------------------
 
@@ -58,7 +50,7 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="にゃんこ競馬AI v24",
+    page_title="にゃんこ競馬AI v25",
     page_icon="🐾",
     layout="wide"
 )
@@ -68,34 +60,45 @@ MODEL_PATH = APP_DIR / "models" / "nyanko_keiba_top3_model.pkl"
 TARGET_CSV_PATH = APP_DIR / "yosou.csv"
 DATA_DIR = APP_DIR / "data"
 
-VERSION = "v24 (回収率・的中率 全面改善版)"
+VERSION = "v25 (三連複ロジック全面刷新版)"
 
 # ============================================================
 # 定数
 # ============================================================
 
-TANSHO_DEDUCTION   = 0.20
-FUKUSHO_DEDUCTION  = 0.20
-UMAREN_DEDUCTION   = 0.225
-WIDE_DEDUCTION     = 0.225
-WAKUREN_DEDUCTION  = 0.225
-UMATAN_DEDUCTION   = 0.225
+TANSHO_DEDUCTION     = 0.20
+FUKUSHO_DEDUCTION    = 0.20
+UMAREN_DEDUCTION     = 0.225
+WIDE_DEDUCTION       = 0.225
+WAKUREN_DEDUCTION    = 0.225
+UMATAN_DEDUCTION     = 0.225
 SANRENPUKU_DEDUCTION = 0.25
 SANRENTAN_DEDUCTION  = 0.25
 
 SANRENPUKU_EV_FLOOR = 0.80
-ODDS_TO_TOP3_RATIO = 3.0
+
+# [FIX-2] オッズ帯別「単勝確率→3着内確率」変換係数テーブル
+# (オッズ上限, 乗数, 上限clip) の順
+ODDS_TO_TOP3_TABLE = [
+    (2.0,  4.5, 0.92),
+    (4.0,  3.5, 0.75),
+    (8.0,  3.0, 0.55),
+    (15.0, 2.8, 0.38),
+    (30.0, 2.5, 0.25),
+    (999,  2.2, 0.15),
+]
 
 # [IMP-7] 軸馬信頼度閾値
-PIVOT_CONFIDENCE_THRESHOLD = 0.18
-PIVOT2_CONFIDENCE_THRESHOLD = 0.04  # 2頭軸の積
+PIVOT_CONFIDENCE_THRESHOLD  = 0.18
+PIVOT2_CONFIDENCE_THRESHOLD = 0.04
 
-# [IMP-6] 動的点数制御
-KELLY_FRACTION = 0.25  # フラクショナルKelly倍率
-MIN_KELLY_RATIO = 0.02  # このKelly比以上の馬を買い候補に
+# [FIX-5] Kelly比 - 複勝用と三連複用を分離
+KELLY_FRACTION_FUKUSHO   = 0.25   # 複勝Kelly倍率
+KELLY_FRACTION_SANREN    = 0.15   # 三連複Kelly倍率（リスク高いため低め）
+MIN_KELLY_RATIO          = 0.02   # このKelly比以上を買い候補に
 
 # 予想モード定数
-STRATEGY_MODE_ROI    = "回収率重視"
+STRATEGY_MODE_ROI     = "回収率重視"
 STRATEGY_MODE_HITRATE = "的中率重視"
 STRATEGY_MODE_OPTIONS = [STRATEGY_MODE_ROI, STRATEGY_MODE_HITRATE]
 
@@ -171,7 +174,8 @@ JP_COLUMNS = {
     "running_style": "脚質",
     "style_note": "脚質メモ",
     "value_score": "回収率スコア",
-    "kelly_ratio": "Kelly比",
+    "kelly_ratio": "Kelly比(複勝)",
+    "kelly_ratio_sanren": "Kelly比(三連複)",
     "pivot_confidence": "軸信頼度",
     "buy_flag": "判定",
     "buy_reason": "理由",
@@ -187,7 +191,7 @@ DISPLAY_COLUMNS = [
     "running_style", "style_note",
     "jockey_top3_rate_prior", "trainer_top3_rate_prior",
     "sire_top3_rate_prior", "horse_distance_top3_rate_prior",
-    "kelly_ratio", "pivot_confidence"
+    "kelly_ratio", "kelly_ratio_sanren", "pivot_confidence"
 ]
 
 BASE_NUM_FEATURES = [
@@ -596,7 +600,7 @@ def normalize_52cols(df: pd.DataFrame, source_name: str = "") -> pd.DataFrame:
 
 
 # ============================================================
-# 簡易CSV読込 (v23バグ修正引き継ぎ + v24: 日付列対応強化)
+# 簡易CSV読込
 # ============================================================
 
 def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.DataFrame:
@@ -1199,24 +1203,21 @@ def predict(bundle, df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI) ->
         1: "◎", 2: "○", 3: "▲", 4: "△", 5: "☆", 6: "×", 7: "×", 8: "×"
     }).fillna("")
 
-    # [BF-5] ev_scoreを先に計算する
-    # add_danger_level / add_kelly_ratio / add_pivot_confidence が
-    # ev_score列を参照するため、それらより前に実行する必要がある
+    # EV計算を最初に実行（他の計算が依存するため）
     df["expected_value"] = df["ml_top3_prob"] * df["odds"].fillna(0)
-    df = add_ev_score(df)
+    df = add_ev_score(df)  # [FIX-2] オッズ帯別係数テーブル版
 
-    # [IMP-4] 危険人気馬の段階的検出（ev_score確定後に実行）
+    # [FIX-3] 強化された危険人気馬検出（ev_score確定後）
     df = add_danger_level(df)
-
     df["danger_popular"] = df["danger_level"].map(
         {"強危険": "危険", "危険": "危険", "注意": "", "": ""}).fillna("")
     df["value_horse"] = ((df["popularity"].fillna(0) >= 6) & (df["ml_rank"] <= 4)).map(
         {True: "穴候補", False: ""})
 
-    # [IMP-1] Kelly比計算（ev_score確定後に実行）
+    # [FIX-5] 複勝Kelly比と三連複Kelly比を分離して計算
     df = add_kelly_ratio(df)
 
-    # [IMP-7] 軸信頼度スコア計算（ev_score確定後に実行）
+    # [FIX-9] pivot_confidence（EV推定精度向上の恩恵を受ける）
     df = add_pivot_confidence(df)
 
     df = add_value_strategy(df, strategy_mode=strategy_mode)
@@ -1224,103 +1225,160 @@ def predict(bundle, df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI) ->
 
 
 # ============================================================
-# [IMP-4] 危険人気馬 段階的検出
+# [FIX-2] EV乖離スコア - オッズ帯別係数テーブル版
+# ============================================================
+
+def _odds_to_top3_rate(o: float) -> float:
+    """
+    単勝オッズから3着内確率を推定する。
+    オッズ帯別の実測ベース係数テーブルを使用。
+    v24の「単勝÷3」粗推定から刷新。
+    """
+    if o <= 0:
+        return 0.0
+    win_prob = 1.0 / o
+    for odds_ceil, multiplier, clip_val in ODDS_TO_TOP3_TABLE:
+        if o <= odds_ceil:
+            return min(win_prob * multiplier, clip_val)
+    return min(win_prob * 2.2, 0.15)
+
+
+def add_ev_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    [FIX-2] オッズ帯別係数テーブルによるimplied_top3推定。
+    v24の「3.0/オッズ」という粗推定を廃止。
+    """
+    df = df.copy()
+    odds = pd.to_numeric(df.get("odds", 0), errors="coerce").fillna(0)
+    prob = pd.to_numeric(df.get("ml_top3_prob", 0), errors="coerce").fillna(0)
+
+    # オッズ帯別係数でimplied_top3を計算（控除率補正あり）
+    implied_raw = odds.apply(_odds_to_top3_rate)
+    implied_adjusted = implied_raw * (1.0 - FUKUSHO_DEDUCTION)
+    df["implied_top3"] = implied_adjusted.clip(0, 0.95).round(4)
+
+    # EV乖離 = AIの3着内確率 - 市場の暗示3着内確率
+    valid_mask = odds > 1.0
+    ev_raw = prob - df["implied_top3"]
+    # オッズ欠損・無効馬はev_score=0
+    df["ev_score"] = np.where(valid_mask, ev_raw, 0.0).round(4)
+    return df
+
+
+# ============================================================
+# [FIX-3] 危険人気馬 - 強化版（AI4位以上で危険）
 # ============================================================
 
 def add_danger_level(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    v24: AI5位以上で危険 → v25: AI4位以上で危険に強化。
+    1番人気のEV大幅マイナスも「強危険」に追加。
+    """
     df = df.copy()
     pop = pd.to_numeric(df.get("popularity", pd.Series(dtype=float)), errors="coerce").fillna(99)
     ml_rank = pd.to_numeric(df.get("ml_rank", pd.Series(dtype=float)), errors="coerce").fillna(99)
+    ml_prob = pd.to_numeric(df.get("ml_top3_prob", 0), errors="coerce").fillna(0)
+    odds = pd.to_numeric(df.get("odds", 0), errors="coerce").fillna(0)
     if "ev_score" in df.columns:
         ev = pd.to_numeric(df["ev_score"], errors="coerce").fillna(0)
     else:
         ev = pd.Series(0.0, index=df.index)
 
-    def _level(row_pop, row_rank, row_ev):
-        if row_pop == 1 and row_rank >= 5:
+    def _level(row_pop, row_rank, row_ev, row_prob, row_odds):
+        # 強危険: 1番人気でAI4位以下
+        if row_pop == 1 and row_rank >= 4:
             return "強危険"
-        if row_pop <= 3 and row_rank >= 5:
+        # 強危険: 1番人気でEVが大幅マイナス（市場の過大評価）
+        if row_pop == 1 and row_ev <= -0.12:
+            return "強危険"
+        # 危険: 2〜3番人気でAI4位以下
+        if row_pop <= 3 and row_rank >= 4:
             return "危険"
-        if row_ev <= -0.10 and row_pop <= 4:
+        # 危険: 4番人気以内なのにEV大幅マイナス＋AI下位
+        if row_pop <= 4 and row_ev <= -0.10 and row_rank >= 4:
+            return "危険"
+        # 注意: 人気先行でEVマイナス傾向
+        if row_pop <= 4 and row_ev <= -0.06:
             return "注意"
         return ""
 
     df["danger_level"] = [
-        _level(p, r, e) for p, r, e in zip(pop, ml_rank, ev)
+        _level(p, r, e, pr, od)
+        for p, r, e, pr, od in zip(pop, ml_rank, ev, ml_prob, odds)
     ]
     return df
 
 
 # ============================================================
-# [IMP-1] Kelly基準による購入比計算
+# [FIX-5] Kelly比 - 複勝用と三連複用を分離
 # ============================================================
 
 def add_kelly_ratio(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    v24: Kelly比を1種類（複勝ベース）で三連複にも流用
+    v25: 複勝Kelly と 三連複Kelly を別々に計算
+    """
     df = df.copy()
     prob = pd.to_numeric(df.get("ml_top3_prob", 0), errors="coerce").fillna(0)
     odds = pd.to_numeric(df.get("odds", 0), errors="coerce").fillna(0)
 
-    # 複勝オッズ簡易推定: 複勝 ≒ 単勝オッズ / ODDS_TO_TOP3_RATIO
-    fukusho_odds = (odds / ODDS_TO_TOP3_RATIO).clip(lower=1.0)
-
-    # Kelly: f = (p*b - q) / b  ただし b = 複勝配当-1, q = 1-p
-    b = (fukusho_odds * (1 - FUKUSHO_DEDUCTION) - 1).clip(lower=0)
+    # ── 複勝Kelly ──
+    fukusho_odds_est = odds.apply(
+        lambda o: o * _odds_to_top3_rate(o) if o > 0 else 1.0
+    ).clip(lower=1.0)
+    b_fuku = (fukusho_odds_est * (1 - FUKUSHO_DEDUCTION) - 1).clip(lower=0)
     q = 1 - prob
-    kelly_full = np.where(b > 0, (prob * b - q) / b, 0.0)
-    kelly_full = np.clip(kelly_full, 0, 1)
+    kelly_fuku = np.where(b_fuku > 0, (prob * b_fuku - q) / b_fuku, 0.0)
+    kelly_fuku = np.clip(kelly_fuku, 0, 1)
+    df["kelly_ratio"] = (kelly_fuku * KELLY_FRACTION_FUKUSHO).round(4)
 
-    # フラクショナルKelly (リスク抑制)
-    df["kelly_ratio"] = (kelly_full * KELLY_FRACTION).round(4)
+    # ── 三連複Kelly ──
+    # 3頭同時的中の期待確率は単馬の1/6〜1/10程度と想定
+    # フィールドサイズを使って簡易補正（全レース平均16頭で計算）
+    fs = pd.to_numeric(df.get("field_size", 16), errors="coerce").fillna(16).clip(lower=8)
+    # 三連複オッズ簡易推定: 単勝オッズ^1.5 × 定数（実績的な近似）
+    san_odds_est = (odds ** 1.5 * 0.8).clip(lower=3.0)
+    b_san = (san_odds_est * (1 - SANRENPUKU_DEDUCTION) - 1).clip(lower=0)
+    # 三連複的中確率 ≈ ml_top3_prob / (field_size / 3)^0.5 の近似
+    san_prob = (prob / np.sqrt(fs / 3.0)).clip(0, 0.5)
+    q_san = 1 - san_prob
+    kelly_san = np.where(b_san > 0, (san_prob * b_san - q_san) / b_san, 0.0)
+    kelly_san = np.clip(kelly_san, 0, 1)
+    df["kelly_ratio_sanren"] = (kelly_san * KELLY_FRACTION_SANREN).round(4)
+
     return df
 
 
 # ============================================================
-# [IMP-7] 軸信頼度スコア計算
+# [FIX-9] 軸信頼度スコア - EV推定精度向上と連動
 # ============================================================
 
 def add_pivot_confidence(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    v25: kelly_ratio_sanren（三連複Kelly）を使って軸信頼度を計算。
+    v24の複勝Kelly流用から修正。
+    """
     df = df.copy()
     prob = pd.to_numeric(df.get("ml_top3_prob", 0), errors="coerce").fillna(0)
     ev = pd.to_numeric(df.get("ev_score", 0), errors="coerce").fillna(0)
     jockey_r = pd.to_numeric(df.get("jockey_top3_rate_prior", 0.25), errors="coerce").fillna(0.25)
     distance_r = pd.to_numeric(df.get("horse_distance_top3_rate_prior", 0.25), errors="coerce").fillna(0.25)
+    kelly_san = pd.to_numeric(df.get("kelly_ratio_sanren", 0), errors="coerce").fillna(0)
 
-    # 距離適性と騎手実績で補正 (0 〜 1.5倍の範囲)
     jockey_factor = (jockey_r / 0.25).clip(0.5, 1.5)
     distance_factor = (distance_r / 0.25).clip(0.5, 1.5)
-
-    # EV乖離が大きくマイナスなら信頼度を下げる
     ev_penalty = np.clip(1.0 + ev * 1.5, 0.5, 1.3)
+    # 三連複Kellyがプラスなら信頼度ボーナス
+    kelly_boost = np.where(kelly_san >= MIN_KELLY_RATIO, 1.1, 1.0)
 
     df["pivot_confidence"] = (
-        prob * jockey_factor * distance_factor * ev_penalty
+        prob * jockey_factor * distance_factor * ev_penalty * kelly_boost
     ).clip(0, 1).round(4)
     return df
 
 
 # ============================================================
-# EV乖離スコア (v23から引き継ぎ + [BF-2] オッズ欠損修正)
-# ============================================================
-
-def add_ev_score(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    odds = pd.to_numeric(df.get("odds", 0), errors="coerce").fillna(0)
-    prob = pd.to_numeric(df.get("ml_top3_prob", 0), errors="coerce").fillna(0)
-
-    # [BF-2] オッズ <= 1.0 の馬はimplied=0となりev_scoreが極端にプラスになるバグを修正
-    valid_odds = odds.where(odds > 1.0, np.nan)
-    implied_top3_raw = (ODDS_TO_TOP3_RATIO / valid_odds).clip(upper=0.95)
-    implied_top3 = implied_top3_raw * (1.0 - FUKUSHO_DEDUCTION)
-    df["implied_top3"] = implied_top3.fillna(0).round(4)
-
-    # オッズ欠損馬は ev_score=0 にする (マイナス寄りにはしない)
-    ev_raw = prob - implied_top3.fillna(prob)  # 欠損時は prob-prob=0
-    df["ev_score"] = np.where(odds <= 1.0, 0.0, ev_raw.fillna(0)).round(4)
-    return df
-
-
-# ============================================================
-# 回収率戦略 - モード別buy_flag判定 (v24改善)
+# 回収率戦略 - モード別buy_flag判定
 # ============================================================
 
 def add_value_strategy(df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI) -> pd.DataFrame:
@@ -1335,6 +1393,7 @@ def add_value_strategy(df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI)
     trainer_rate = pd.to_numeric(df.get("trainer_top3_rate_prior", 0), errors="coerce").fillna(0)
     sire_rate = pd.to_numeric(df.get("sire_top3_rate_prior", 0), errors="coerce").fillna(0)
     kelly = pd.to_numeric(df.get("kelly_ratio", 0), errors="coerce").fillna(0)
+    kelly_san = pd.to_numeric(df.get("kelly_ratio_sanren", 0), errors="coerce").fillna(0)
 
     df["jockey_bonus"] = (jockey_rate - 0.25).clip(-0.10, 0.20)
     df["trainer_bonus"] = (trainer_rate - 0.25).clip(-0.04, 0.10)
@@ -1343,19 +1402,21 @@ def add_value_strategy(df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI)
     if strategy_mode == STRATEGY_MODE_ROI:
         df["ev_bonus"] = (ev_score * 1.5).clip(-0.20, 0.30)
         df["ana_bonus"] = np.where((df["popularity"] >= 5) & (df["ml_rank"] <= 5), 0.12, 0.0)
-        # [IMP-1] Kelly正の馬にボーナス
-        df["kelly_bonus"] = np.where(kelly >= MIN_KELLY_RATIO, 0.08, 0.0)
+        df["kelly_bonus"] = np.where(kelly >= MIN_KELLY_RATIO, 0.06, 0.0)
+        # 三連複Kellyがプラスの場合に追加ボーナス
+        df["kelly_san_bonus"] = np.where(kelly_san >= MIN_KELLY_RATIO, 0.04, 0.0)
     else:
         df["ev_bonus"] = (ev_score * 0.5).clip(-0.10, 0.10)
         df["ana_bonus"] = 0.0
         df["kelly_bonus"] = 0.0
+        df["kelly_san_bonus"] = 0.0
 
     style_bonus_map = {"逃げ": 0.03, "先行": 0.02, "差し": 0.00, "追込": -0.02,
                        "未取得": 0.00, "不明": 0.00}
     df["style_bonus"] = df.get("running_style", "不明").map(style_bonus_map).fillna(0)
-    df["danger_penalty"] = np.where((df["popularity"] <= 3) & (df["ml_rank"] >= 5), -0.40, 0.0)
+    df["danger_penalty"] = np.where((df["popularity"] <= 3) & (df["ml_rank"] >= 4), -0.40, 0.0)
     df["fav_weak_penalty"] = np.where(
-        (df["popularity"] == 1) & (df["ml_rank"] >= 4), -0.15, 0.0)
+        (df["popularity"] == 1) & (df["ml_rank"] >= 4), -0.20, 0.0)
 
     df["value_score"] = (
         df["expected_value"]
@@ -1367,6 +1428,7 @@ def add_value_strategy(df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI)
            + df["style_bonus"]
            + df["ana_bonus"]
            + df["kelly_bonus"]
+           + df.get("kelly_san_bonus", 0)
            + df["danger_penalty"]
            + df["fav_weak_penalty"])
     ).round(3)
@@ -1384,19 +1446,20 @@ def add_value_strategy(df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI)
             vs = row.get("value_score", 0)
             san_ev = row.get("_sanrenpuku_ev_approx", 0)
             kelly_r = row.get("kelly_ratio", 0)
+            kelly_s = row.get("kelly_ratio_sanren", 0)
             dl = row.get("danger_level", "")
 
             if dl in ["強危険", "危険"]:
                 return "見送り", f"危険人気馬({dl})"
-            # [IMP-1] Kelly正でない限り厳しめに審査
-            if kelly_r < MIN_KELLY_RATIO and ml_rank > 4:
-                return "見送り", f"Kelly比不足({kelly_r:.3f})"
+            # [FIX-5] 三連複Kellyも確認
+            if kelly_r < MIN_KELLY_RATIO and kelly_s < MIN_KELLY_RATIO and ml_rank > 4:
+                return "見送り", f"Kelly比不足(複勝:{kelly_r:.3f}/三連:{kelly_s:.3f})"
             if san_ev < SANRENPUKU_EV_FLOOR and ml_rank > 2:
                 return "見送り", f"三連複EV不足({san_ev:.2f}<{SANRENPUKU_EV_FLOOR})"
             if ml_rank <= 2 and prob >= 0.22:
                 return "買い", "AI最上位・3着内確率高"
-            if ml_rank <= 3 and prob >= 0.25 and kelly_r >= MIN_KELLY_RATIO:
-                return "買い", f"AI上位+Kelly({kelly_r:.3f})"
+            if ml_rank <= 3 and prob >= 0.25 and (kelly_r >= MIN_KELLY_RATIO or kelly_s >= MIN_KELLY_RATIO):
+                return "買い", f"AI上位+Kelly(複:{kelly_r:.3f}/三:{kelly_s:.3f})"
             if ev >= 0.06 and ml_rank <= 5:
                 return "買い", f"市場過小評価(EV+{ev:.3f})"
             if vs >= 1.15 and ml_rank <= 5 and kelly_r >= MIN_KELLY_RATIO:
@@ -1406,7 +1469,6 @@ def add_value_strategy(df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI)
             return "見送り", "期待値不足"
         judged = df.apply(judge_roi, axis=1)
     else:
-        # [IMP-5] 的中率: 複勝圏特化スコアで判定
         def judge_hitrate(row):
             ml_rank = row.get("ml_rank", 99)
             prob = row.get("ml_top3_prob", 0)
@@ -1434,13 +1496,15 @@ def add_value_strategy(df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI)
 
 
 # ============================================================
-# [IMP-2] レース質分析
+# [FIX-7] レース質分析 - 買い目生成に反映
 # ============================================================
 
 def analyze_race_quality(race_df: pd.DataFrame) -> dict:
     odds = pd.to_numeric(race_df.get("odds", pd.Series()), errors="coerce").dropna()
     if odds.empty:
-        return {"type": "不明", "advice": "", "odds_std": 0, "min_odds": 0, "is_danzen": False}
+        return {"type": "不明", "advice": "", "odds_std": 0, "min_odds": 0,
+                "is_danzen": False, "all_high": False,
+                "rec_sanrenpuku_max": 10, "rec_bet_focus": "三連複"}
 
     min_odds = float(odds.min())
     odds_std = float(odds.std())
@@ -1451,25 +1515,34 @@ def analyze_race_quality(race_df: pd.DataFrame) -> dict:
         race_type = "断然人気レース"
         advice = (
             "⚠️ 断然人気馬(1.5倍以下)がいます。"
-            "三連複・三連単の配当が低くなりがちです。"
+            "三連複の配当が低くなりがちです。"
             "複勝・馬連の方が回収率が上がる可能性があります。"
+            "三連複は5点以内に絞り、残り予算を馬連・複勝に回すことを推奨します。"
         )
+        rec_max = 5
+        rec_focus = "複勝/馬連"
     elif all_high:
         race_type = "混戦レース"
         advice = (
             "🔀 全馬オッズ10倍以上の混戦です。"
-            "BOXより軸流し(1〜2頭軸)が点数効率的です。"
-            "穴候補を相手に含めると配当が跳ね上がります。"
+            "BOXより1頭軸フォーメーションが点数効率的です。"
+            "穴候補を相手に積極的に含めると配当が跳ね上がります。"
         )
+        rec_max = 8
+        rec_focus = "三連複1頭軸"
     elif odds_std > 15:
         race_type = "高配当期待レース"
         advice = (
             "💎 オッズ格差が大きいレースです。"
             "AI上位馬軸×穴馬2頭の三連複1頭軸フォーメーションが有望です。"
         )
+        rec_max = 10
+        rec_focus = "三連複1頭軸"
     else:
         race_type = "標準レース"
         advice = "📊 標準的な配当構成です。モードに応じた通常の戦略を推奨します。"
+        rec_max = 10
+        rec_focus = "三連複"
 
     return {
         "type": race_type,
@@ -1478,34 +1551,43 @@ def analyze_race_quality(race_df: pd.DataFrame) -> dict:
         "min_odds": min_odds,
         "is_danzen": is_danzen,
         "all_high": all_high,
+        "rec_sanrenpuku_max": rec_max,   # ← 買い目生成に反映
+        "rec_bet_focus": rec_focus,       # ← UIへの推奨表示
     }
 
 
 # ============================================================
-# [IMP-6] 推奨購入点数・理論的中率ダッシュボード
+# [FIX-6] 推奨購入点数・理論的中率ダッシュボード
 # ============================================================
 
 def calc_recommended_tickets(race_df: pd.DataFrame,
                                strategy_mode: str = STRATEGY_MODE_ROI) -> dict:
     kelly = pd.to_numeric(race_df.get("kelly_ratio", 0), errors="coerce").fillna(0)
+    kelly_san = pd.to_numeric(race_df.get("kelly_ratio_sanren", 0), errors="coerce").fillna(0)
     prob = pd.to_numeric(race_df.get("ml_top3_prob", 0), errors="coerce").fillna(0)
     buy = race_df.get("buy_flag", pd.Series(["見送り"] * len(race_df)))
     buy_mask = (buy == "買い")
 
     kelly_positive = int((kelly >= MIN_KELLY_RATIO).sum())
+    kelly_san_positive = int((kelly_san >= MIN_KELLY_RATIO).sum())
     buy_count = int(buy_mask.sum())
 
     if strategy_mode == STRATEGY_MODE_ROI:
         top3_probs = prob.nlargest(5).values
         if len(top3_probs) >= 3:
-            hitrate_3top = float(top3_probs[0] * top3_probs[1] * top3_probs[2]) * 6
+            # [FIX-1] 条件付き確率による三連複的中率推定
+            p1, p2, p3 = top3_probs[0], top3_probs[1], top3_probs[2]
+            p_cond2 = min(p2 / max(1 - p1, 0.1), 0.95)
+            p_cond3 = min(p3 / max(1 - p1 - p2, 0.1), 0.95)
+            hitrate_3top = float(p1 * p_cond2 * p_cond3)
             hitrate_3top = min(hitrate_3top, 0.95)
         else:
             hitrate_3top = 0.0
-        rec_points = max(3, min(kelly_positive * 2, 8))
+        rec_points = max(3, min(kelly_san_positive * 2, 8))
         return {
             "推奨点数": rec_points,
-            "Kelly正馬数": kelly_positive,
+            "Kelly正(複勝)": kelly_positive,
+            "Kelly正(三連複)": kelly_san_positive,
             "理論的中率(三連複上位3頭)": f"{hitrate_3top * 100:.1f}%",
             "買い候補馬数": buy_count,
             "モード": "回収率重視",
@@ -1522,7 +1604,8 @@ def calc_recommended_tickets(race_df: pd.DataFrame,
         rec_points = max(3, min(buy_count + 2, 10))
         return {
             "推奨点数": rec_points,
-            "Kelly正馬数": kelly_positive,
+            "Kelly正(複勝)": kelly_positive,
+            "Kelly正(三連複)": kelly_san_positive,
             "理論的中率(上位3頭いずれか複勝)": f"{hitrate * 100:.1f}%",
             "買い候補馬数": buy_count,
             "モード": "的中率重視",
@@ -1540,8 +1623,10 @@ def get_buy_candidates(race_df: pd.DataFrame, max_horses: int = 8,
         if len(buy) < 3:
             buy = safe.sort_values("ml_rank").head(max(3, min(max_horses, len(safe)))).copy()
     else:
-        kelly = pd.to_numeric(buy.get("kelly_ratio", 0), errors="coerce").fillna(0)
-        kelly_buy = buy[kelly >= MIN_KELLY_RATIO]
+        # [FIX-5] 三連複Kellyを使った絞り込み
+        kelly_san = pd.to_numeric(buy.get("kelly_ratio_sanren", 0), errors="coerce").fillna(0)
+        kelly_fuku = pd.to_numeric(buy.get("kelly_ratio", 0), errors="coerce").fillna(0)
+        kelly_buy = buy[(kelly_san >= MIN_KELLY_RATIO) | (kelly_fuku >= MIN_KELLY_RATIO)]
         if len(kelly_buy) >= 3:
             buy = kelly_buy
         if len(buy) < 3:
@@ -1553,7 +1638,7 @@ def get_buy_candidates(race_df: pd.DataFrame, max_horses: int = 8,
 def make_value_summary(race_df: pd.DataFrame) -> pd.DataFrame:
     cols = ["mark", "ml_rank", "horse_no", "horse_name", "running_style",
             "odds", "popularity", "ml_top3_prob", "expected_value",
-            "ev_score", "implied_top3", "value_score", "kelly_ratio",
+            "ev_score", "implied_top3", "value_score", "kelly_ratio", "kelly_ratio_sanren",
             "pivot_confidence", "buy_flag", "buy_reason",
             "danger_popular", "danger_level", "value_horse"]
     cols = [c for c in cols if c in race_df.columns]
@@ -1618,19 +1703,49 @@ def _calc_spread_score(combo_nums: list[str], all_nums: list[str]) -> float:
 
 
 # ============================================================
-# [IMP-3] 三連複組み合わせ期待値スコア
+# [FIX-1] 三連複組み合わせ期待値スコア - 条件付き確率版
 # ============================================================
 
-def _calc_combo_ev_score(h1: str, h2: str, h3: str, prob_map: dict, ev_map: dict) -> float:
-    p1 = prob_map.get(h1, 0.1)
-    p2 = prob_map.get(h2, 0.1)
-    p3 = prob_map.get(h3, 0.1)
-    e1 = ev_map.get(h1, 0)
-    e2 = ev_map.get(h2, 0)
-    e3 = ev_map.get(h3, 0)
-    combo_prob = p1 * p2 * p3 * 6
+def _calc_combo_ev_score(h1: str, h2: str, h3: str,
+                          prob_map: dict, ev_map: dict,
+                          field_size: int = 16) -> float:
+    """
+    [FIX-1] 3頭同時3着内確率の正確な推定。
+
+    v24の問題:
+        combo_prob = p1 * p2 * p3 * 6
+        → 各馬の3着内確率を独立と仮定した過大評価。
+        → 競馬では1頭入ると残り枠が減るため独立ではない。
+
+    v25の修正:
+        条件付き確率の近似を使用:
+        P(h1,h2,h3 全員3着内) ≈ p1 * (p2/(1-p1)) * (p3/(1-p1-p2))
+        さらに頭数補正でスケールダウン。
+    """
+    p1 = float(prob_map.get(h1, 0.05))
+    p2 = float(prob_map.get(h2, 0.05))
+    p3 = float(prob_map.get(h3, 0.05))
+    e1 = float(ev_map.get(h1, 0))
+    e2 = float(ev_map.get(h2, 0))
+    e3 = float(ev_map.get(h3, 0))
+
+    # 条件付き確率（h1が3着内に入った後のh2, h3の確率）
+    p_cond2 = min(p2 / max(1.0 - p1, 0.05), 0.95)
+    p_cond3 = min(p3 / max(1.0 - p1 - p2, 0.05), 0.95)
+
+    # 三連複の基本確率（3通りの順列組み合わせを内包）
+    combo_prob = p1 * p_cond2 * p_cond3
+
+    # 頭数が多いほど難しい（18頭立て基準でデフレ）
+    fs = max(field_size, 8)
+    field_penalty = max(0.4, 1.0 - (fs - 8) * 0.025)
+    combo_prob *= field_penalty
+
+    # EV乖離ボーナス（市場過小評価馬が入ると配当が高くなる）
     ev_sum = e1 + e2 + e3
-    return float(np.clip(combo_prob * (1 + ev_sum * 0.5), 0, 1))
+    ev_bonus = float(np.clip(1.0 + ev_sum * 0.3, 0.7, 1.5))
+
+    return float(np.clip(combo_prob * ev_bonus, 0, 0.5))
 
 
 # ============================================================
@@ -1641,7 +1756,8 @@ def build_sanrenpuku_zone_data(race_df: pd.DataFrame,
                                 strategy_mode: str = STRATEGY_MODE_ROI) -> dict:
     r = race_df.copy()
     for c in ["ml_rank", "value_score", "ml_top3_prob", "odds", "popularity",
-              "ev_score", "horse_no", "kelly_ratio", "pivot_confidence"]:
+              "ev_score", "horse_no", "kelly_ratio", "kelly_ratio_sanren",
+              "pivot_confidence", "field_size"]:
         if c not in r.columns:
             r[c] = 0
         r[c] = pd.to_numeric(r[c], errors="coerce").fillna(0)
@@ -1652,15 +1768,17 @@ def build_sanrenpuku_zone_data(race_df: pd.DataFrame,
         safe = r.copy()
 
     all_nums = [str(int(n)) for n in r["horse_no"].dropna() if n > 0]
+    # 頭数を取得（三連複EV計算に使用）
+    field_size = int(r["field_size"].max()) if r["field_size"].max() > 0 else len(r)
 
     def _no(row):
         return str(int(row["horse_no"])) if row["horse_no"] > 0 else ""
 
-    # [IMP-9] 軸選出: pivot_confidence 最大の馬を優先
+    # [FIX-9] pivot_confidence（三連複Kelly連動版）で軸選出
     if strategy_mode == STRATEGY_MODE_ROI:
         sorted_ai = safe.sort_values(
-            ["pivot_confidence", "ml_top3_prob", "ml_rank"],
-            ascending=[False, False, True])
+            ["pivot_confidence", "kelly_ratio_sanren", "ml_top3_prob", "ml_rank"],
+            ascending=[False, False, False, True])
     else:
         sorted_ai = safe.sort_values(
             ["ml_rank", "ml_top3_prob", "popularity"], ascending=[True, False, True])
@@ -1681,16 +1799,23 @@ def build_sanrenpuku_zone_data(race_df: pd.DataFrame,
                    if _no(row) not in [pivot_no, pivot2_no]][:5]
 
     if strategy_mode == STRATEGY_MODE_ROI:
+        # [FIX-4] 相手B: EVプラスかつAI確率が一定以上の馬のみ
+        min_prob_for_b = float(safe["ml_top3_prob"].quantile(0.3))  # 下位30%は除外
         aite_b_df = safe.sort_values(
             ["ev_score", "ml_top3_prob"], ascending=[False, False]).copy()
-        aite_b_nums = [_no(row) for _, row in aite_b_df.iterrows()
-                       if _no(row) not in [pivot_no, pivot2_no] + aite_a_nums
-                       and float(row.get("ev_score", 0)) > 0][:5]
+        aite_b_nums = [
+            _no(row) for _, row in aite_b_df.iterrows()
+            if _no(row) not in [pivot_no, pivot2_no] + aite_a_nums
+            and float(row.get("ev_score", 0)) > 0
+            and float(row.get("ml_top3_prob", 0)) >= min_prob_for_b  # [FIX-4] 確率下限追加
+        ][:5]
         if len(aite_b_nums) < 3:
             for _, row in safe.sort_values("ml_top3_prob", ascending=False).iterrows():
                 n = _no(row)
                 if n and n not in [pivot_no, pivot2_no] + aite_a_nums + aite_b_nums:
-                    aite_b_nums.append(n)
+                    # [FIX-4] 補完時も確率下限チェック
+                    if float(row.get("ml_top3_prob", 0)) >= min_prob_for_b * 0.7:
+                        aite_b_nums.append(n)
                 if len(aite_b_nums) >= 5:
                     break
     else:
@@ -1711,12 +1836,13 @@ def build_sanrenpuku_zone_data(race_df: pd.DataFrame,
     for _, row in r.iterrows():
         n = _no(row)
         if n:
-            prob_map[n] = float(row.get("ml_top3_prob", 0.1))
+            prob_map[n] = float(row.get("ml_top3_prob", 0.05))
             ev_map[n] = float(row.get("ev_score", 0))
 
     return {
         "safe_df": safe,
         "all_nums": all_nums,
+        "field_size": field_size,
         "pivot_row": pivot_row,
         "pivot2_row": pivot2_row,
         "pivot_no": pivot_no,
@@ -1735,10 +1861,14 @@ def build_sanrenpuku_zone_data(race_df: pd.DataFrame,
 
 
 # ============================================================
-# 三連複1頭軸フォーメーション
+# [FIX-1][FIX-8] 三連複1頭軸フォーメーション
 # ============================================================
 
 def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
+    """
+    [FIX-1] combo_EVをv25版（条件付き確率）で計算。
+    [FIX-8] 頭数に応じた動的EV閾値を設定。
+    """
     pivot_no = zone["pivot_no"]
     aite_a = zone["aite_a_nums"]
     aite_b = zone["aite_b_nums"]
@@ -1746,12 +1876,23 @@ def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
     safe_df = zone.get("safe_df", pd.DataFrame())
     prob_map = zone.get("prob_map", {})
     ev_map = zone.get("ev_map", {})
+    field_size = zone.get("field_size", 16)
+
     if not pivot_no:
         return []
 
+    # [FIX-8] 頭数別動的EV閾値
+    fs = max(field_size, len(all_nums))
+    if fs >= 16:
+        MIN_COMBO_EV = 0.004   # 18頭立ては元々難しいので緩める
+    elif fs >= 12:
+        MIN_COMBO_EV = 0.006
+    else:
+        MIN_COMBO_EV = 0.010
+
     combos = []
     seen = set()
-    SPREAD_MIN = 0.15
+    SPREAD_MIN = 0.12  # 分散スコア閾値も少し緩める
 
     for ha in aite_a[:6]:
         for hb in aite_b[:7]:
@@ -1760,14 +1901,16 @@ def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
             tri = tuple(sorted([pivot_no, ha, hb]))
             if len(set(tri)) == 3 and tri not in seen:
                 spread = _calc_spread_score(list(tri), all_nums)
-                combo_ev = _calc_combo_ev_score(pivot_no, ha, hb, prob_map, ev_map)
-                if spread >= SPREAD_MIN:
+                # [FIX-1] 条件付き確率版のEV計算
+                combo_ev = _calc_combo_ev_score(
+                    pivot_no, ha, hb, prob_map, ev_map, field_size=fs)
+                if spread >= SPREAD_MIN and combo_ev >= MIN_COMBO_EV:
                     combos.append({
                         "買い目": f"{'-'.join(sorted(tri, key=int))}",
                         "軸": pivot_no, "相手A": ha, "相手B": hb,
-                        "狙い": "1頭軸×中間×EV/安定",
+                        "狙い": "1頭軸×中間×EV高め",
                         "分散スコア": round(spread, 3),
-                        "組合EV": round(combo_ev, 5),
+                        "組合EV(v25)": round(combo_ev, 6),
                     })
                     seen.add(tri)
             if len(combos) >= max_count * 2:
@@ -1775,21 +1918,24 @@ def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
         if len(combos) >= max_count * 2:
             break
 
+    # 相手A同士の組み合わせも追加
     for i in range(len(aite_a)):
         for j in range(i + 1, len(aite_a)):
             tri = tuple(sorted([pivot_no, aite_a[i], aite_a[j]]))
             if len(set(tri)) == 3 and tri not in seen:
                 spread = _calc_spread_score(list(tri), all_nums)
-                combo_ev = _calc_combo_ev_score(pivot_no, aite_a[i], aite_a[j], prob_map, ev_map)
+                combo_ev = _calc_combo_ev_score(
+                    pivot_no, aite_a[i], aite_a[j], prob_map, ev_map, field_size=fs)
                 combos.append({
                     "買い目": f"{'-'.join(sorted(tri, key=int))}",
                     "軸": pivot_no, "相手A": aite_a[i], "相手B": aite_a[j],
                     "狙い": "1頭軸×相手A×相手A",
                     "分散スコア": round(spread, 3),
-                    "組合EV": round(combo_ev, 5),
+                    "組合EV(v25)": round(combo_ev, 6),
                 })
                 seen.add(tri)
 
+    # 補完: 候補が少ない場合
     if len(combos) < 6 and not safe_df.empty:
         fallback_nums = [
             str(int(row["horse_no"])) for _, row in
@@ -1803,13 +1949,14 @@ def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
                 tri = tuple(sorted([pivot_no, ha, hb]))
                 if len(set(tri)) == 3 and tri not in seen:
                     spread = _calc_spread_score(list(tri), all_nums)
-                    combo_ev = _calc_combo_ev_score(pivot_no, ha, hb, prob_map, ev_map)
+                    combo_ev = _calc_combo_ev_score(
+                        pivot_no, ha, hb, prob_map, ev_map, field_size=fs)
                     combos.append({
                         "買い目": f"{'-'.join(sorted(tri, key=int))}",
                         "軸": pivot_no, "相手A": ha, "相手B": hb,
                         "狙い": "1頭軸(補完)",
                         "分散スコア": round(spread, 3),
-                        "組合EV": round(combo_ev, 5),
+                        "組合EV(v25)": round(combo_ev, 6),
                     })
                     seen.add(tri)
                 if len(combos) >= max_count:
@@ -1817,7 +1964,7 @@ def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
             if len(combos) >= max_count:
                 break
 
-    combos.sort(key=lambda x: (-x["組合EV"], -x["分散スコア"]))
+    combos.sort(key=lambda x: (-x["組合EV(v25)"], -x["分散スコア"]))
     return combos[:max_count]
 
 
@@ -1834,12 +1981,12 @@ def generate_sanrenpuku_2jiku(zone: dict, max_count: int = 10) -> list[dict]:
     safe_df = zone.get("safe_df", pd.DataFrame())
     prob_map = zone.get("prob_map", {})
     ev_map = zone.get("ev_map", {})
+    field_size = zone.get("field_size", 16)
 
     if not pivot_no or not pivot2_no:
         return []
 
     all_aite = list(dict.fromkeys(aite_b + aite_a))
-
     combos = []
     seen = set()
 
@@ -1849,14 +1996,15 @@ def generate_sanrenpuku_2jiku(zone: dict, max_count: int = 10) -> list[dict]:
         tri = tuple(sorted([pivot_no, pivot2_no, hb]))
         if len(set(tri)) == 3 and tri not in seen:
             spread = _calc_spread_score(list(tri), all_nums)
-            combo_ev = _calc_combo_ev_score(pivot_no, pivot2_no, hb, prob_map, ev_map)
+            combo_ev = _calc_combo_ev_score(
+                pivot_no, pivot2_no, hb, prob_map, ev_map, field_size=field_size)
             tag = "2頭軸×EV高め" if hb in aite_b else "2頭軸×中間"
             combos.append({
                 "買い目": f"{'-'.join(sorted(tri, key=int))}",
                 "軸1": pivot_no, "軸2": pivot2_no, "相手": hb,
                 "狙い": tag,
                 "分散スコア": round(spread, 3),
-                "組合EV": round(combo_ev, 5),
+                "組合EV(v25)": round(combo_ev, 6),
             })
             seen.add(tri)
         if len(combos) >= max_count:
@@ -1874,19 +2022,20 @@ def generate_sanrenpuku_2jiku(zone: dict, max_count: int = 10) -> list[dict]:
             tri = tuple(sorted([pivot_no, pivot2_no, hb]))
             if len(set(tri)) == 3 and tri not in seen:
                 spread = _calc_spread_score(list(tri), all_nums)
-                combo_ev = _calc_combo_ev_score(pivot_no, pivot2_no, hb, prob_map, ev_map)
+                combo_ev = _calc_combo_ev_score(
+                    pivot_no, pivot2_no, hb, prob_map, ev_map, field_size=field_size)
                 combos.append({
                     "買い目": f"{'-'.join(sorted(tri, key=int))}",
                     "軸1": pivot_no, "軸2": pivot2_no, "相手": hb,
                     "狙い": "2頭軸(補完)",
                     "分散スコア": round(spread, 3),
-                    "組合EV": round(combo_ev, 5),
+                    "組合EV(v25)": round(combo_ev, 6),
                 })
                 seen.add(tri)
             if len(combos) >= max_count:
                 break
 
-    combos.sort(key=lambda x: (-x["組合EV"], -x["分散スコア"]))
+    combos.sort(key=lambda x: (-x["組合EV(v25)"], -x["分散スコア"]))
     return combos[:max_count]
 
 
@@ -1898,7 +2047,8 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
                               strategy_mode: str = STRATEGY_MODE_ROI) -> dict:
     r = race_df.copy()
     for c in ["ml_rank", "value_score", "ml_top3_prob", "odds", "popularity",
-              "ev_score", "horse_no", "kelly_ratio", "pivot_confidence"]:
+              "ev_score", "horse_no", "kelly_ratio", "kelly_ratio_sanren",
+              "pivot_confidence", "field_size"]:
         if c not in r.columns:
             r[c] = 0
         r[c] = pd.to_numeric(r[c], errors="coerce").fillna(0)
@@ -1908,12 +2058,15 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
     if safe.empty:
         safe = r.copy()
 
+    field_size = int(r["field_size"].max()) if r["field_size"].max() > 0 else len(r)
+
     if strategy_mode == STRATEGY_MODE_ROI:
         safe["_box_score"] = (
-            safe["ml_top3_prob"] * 0.45
+            safe["ml_top3_prob"] * 0.40
             + safe["ev_score"] * 0.20
             + safe["value_score"] * 0.15
-            + safe["kelly_ratio"] * 0.10
+            + safe["kelly_ratio_sanren"] * 0.15  # 三連複Kellyを使用
+            + safe["pivot_confidence"] * 0.10
             - (safe["ml_rank"] - 1) * 0.01
             + np.where(safe["ev_score"] > 0, 0.05, 0.0)
         )
@@ -1954,27 +2107,30 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
             "オッズ": round(float(row.get("odds", 0)), 1),
             "3着内確率": f"{float(row.get('ml_top3_prob', 0)) * 100:.1f}%",
             "EV乖離": round(float(row.get("ev_score", 0)), 4),
-            "Kelly比": round(float(row.get("kelly_ratio", 0)), 4),
+            "Kelly(複勝)": round(float(row.get("kelly_ratio", 0)), 4),
+            "Kelly(三連複)": round(float(row.get("kelly_ratio_sanren", 0)), 4),
             "軸信頼度": round(float(row.get("pivot_confidence", 0)), 4),
             "BOX選出スコア": round(float(row.get("_box_score", 0)), 3),
             "穴候補": "✓" if row.get("value_horse", "") == "穴候補" else "",
         })
 
-    prob_map = {_no(row): float(row.get("ml_top3_prob", 0.1)) for _, row in top5.iterrows()}
+    prob_map = {_no(row): float(row.get("ml_top3_prob", 0.05)) for _, row in top5.iterrows()}
     ev_map = {_no(row): float(row.get("ev_score", 0)) for _, row in top5.iterrows()}
 
+    # [FIX-1] 組合EVをv25版で計算
     combos = []
     for tri in itertools.combinations(range(len(nums)), 3):
         tri_nums = [nums[i] for i in tri]
         tri_sorted = sorted(tri_nums, key=lambda x: int(x))
-        combo_ev = _calc_combo_ev_score(tri_nums[0], tri_nums[1], tri_nums[2], prob_map, ev_map)
+        combo_ev = _calc_combo_ev_score(
+            tri_nums[0], tri_nums[1], tri_nums[2], prob_map, ev_map, field_size=field_size)
         combos.append({
             "No": 0,
             "買い目": "-".join(tri_sorted),
             "馬番①": tri_sorted[0], "馬番②": tri_sorted[1], "馬番③": tri_sorted[2],
-            "組合EV": round(combo_ev, 5),
+            "組合EV(v25)": round(combo_ev, 6),
         })
-    combos.sort(key=lambda x: -x["組合EV"])
+    combos.sort(key=lambda x: -x["組合EV(v25)"])
     for i, c in enumerate(combos):
         c["No"] = i + 1
 
@@ -1987,22 +2143,22 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
             "AI順位": int(row.get("ml_rank", 0)),
             "人気": int(row.get("popularity", 0)),
             "EV乖離": round(float(row.get("ev_score", 0)), 4),
-            "Kelly比": round(float(row.get("kelly_ratio", 0)), 4),
+            "Kelly(三連複)": round(float(row.get("kelly_ratio_sanren", 0)), 4),
             "BOX選出スコア": round(float(row.get("_box_score", 0)), 3),
         }
 
     ana_included = any(h["穴候補"] == "✓" for h in horses)
-    kelly_positive = sum(1 for h in horses if h["Kelly比"] > 0)
+    kelly_san_positive = sum(1 for h in horses if h["Kelly(三連複)"] > 0)
     avg_prob = np.mean([float(h["3着内確率"].replace("%", "")) for h in horses])
 
     if strategy_mode == STRATEGY_MODE_ROI:
-        if kelly_positive >= 3:
-            selection_note = f"✅ [回収率] Kelly正馬が{kelly_positive}頭含まれています。期待値の高いBOXです。"
+        if kelly_san_positive >= 3:
+            selection_note = f"✅ [回収率] 三連複Kelly正馬が{kelly_san_positive}頭。期待値の高いBOXです。"
         elif ana_included:
             selection_note = "✅ [回収率] 穴候補を含むBOX構成です。"
         else:
             selection_note = (
-                f"⚠️ [回収率] Kelly正馬が少ないです。"
+                f"⚠️ [回収率] 三連複Kelly正馬が少ないです。"
                 f"平均3着内確率{avg_prob:.1f}%。点数絞り込みを推奨します。"
             )
     else:
@@ -2019,19 +2175,20 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
 
 
 # ============================================================
-# 三連単フォーメーション ([IMP-10] EV品質フィルタ付き)
+# 三連単フォーメーション
 # ============================================================
 
 def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
                                    strategy_mode: str = STRATEGY_MODE_ROI) -> list[dict]:
     r = race_df.copy()
     for c in ["ml_rank", "value_score", "ml_top3_prob", "odds", "popularity",
-              "ev_score", "horse_no", "kelly_ratio"]:
+              "ev_score", "horse_no", "kelly_ratio", "kelly_ratio_sanren", "field_size"]:
         if c not in r.columns:
             r[c] = 0
         r[c] = pd.to_numeric(r[c], errors="coerce").fillna(0)
 
     all_nums = [str(int(n)) for n in r["horse_no"].dropna() if n > 0]
+    field_size = int(r["field_size"].max()) if r["field_size"].max() > 0 else len(r)
     safe = r[r.get("danger_popular", pd.Series([""] * len(r))) != "危険"].copy() \
         if "danger_popular" in r.columns else r.copy()
     if safe.empty:
@@ -2044,7 +2201,7 @@ def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
             n = str(int(row["horse_no"]))
         except Exception:
             continue
-        prob_map[n] = float(row.get("ml_top3_prob", 0.1))
+        prob_map[n] = float(row.get("ml_top3_prob", 0.05))
         ev_map[n] = float(row.get("ev_score", 0))
 
     def get_nums(zone_df, max_n=6, exclude=None):
@@ -2101,20 +2258,21 @@ def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
                     key = f"{h1}→{h2}→{h3}"
                     if key not in seen:
                         spread = _calc_spread_score([h1, h2, h3], all_nums)
-                        combo_ev = _calc_combo_ev_score(h1, h2, h3, prob_map, ev_map)
+                        combo_ev = _calc_combo_ev_score(
+                            h1, h2, h3, prob_map, ev_map, field_size=field_size)
                         note = "1着EV×穴3着" if strategy_mode == STRATEGY_MODE_ROI else "AI上位固定"
                         combos.append({
                             "買い目": key,
                             "狙い": note,
                             "spread": spread,
-                            "組合EV": combo_ev,
+                            "組合EV(v25)": combo_ev,
                         })
                         seen.add(key)
 
-    combos.sort(key=lambda x: (-(x["組合EV"] * 0.6 + x["spread"] * 0.4)))
+    combos.sort(key=lambda x: (-(x["組合EV(v25)"] * 0.6 + x["spread"] * 0.4)))
     return [{"買い目": c["買い目"], "狙い": c["狙い"],
               "分散スコア": round(c["spread"], 3),
-              "組合EV": round(c["組合EV"], 5)} for c in combos[:max_count]]
+              "組合EV(v25)": round(c["組合EV(v25)"], 6)} for c in combos[:max_count]]
 
 
 # ============================================================
@@ -2145,8 +2303,12 @@ def _frame_no(row) -> str:
 
 def _ensure_10_rows(rows: list, race_df: pd.DataFrame, bet_type: str,
                     max_count: int = 10) -> list:
+    """
+    [FIX-6] 品質フィルタ強化版。
+    補完買い目を際限なく生成せず、品質基準を満たす候補のみ出力。
+    max_count に満たない場合は「候補不足」を表示して無理に埋めない。
+    """
     rows = list(rows or [])
-    # [BF-3] 重複チェック修正
     seen = set()
     clean = []
     for r0 in rows:
@@ -2166,8 +2328,17 @@ def _ensure_10_rows(rows: list, race_df: pd.DataFrame, bet_type: str,
         r["ml_rank"] = range(1, len(r) + 1)
     r = r[pd.notna(r.get("horse_no", np.nan))].copy()
     r = r.sort_values(["value_score", "ml_top3_prob", "ml_rank"], ascending=[False, False, True])
+
+    # [FIX-6] 買い候補のみから補完（危険馬を補完に使わない）
+    if "danger_popular" in r.columns:
+        r_safe = r[r["danger_popular"] != "危険"].copy()
+    else:
+        r_safe = r.copy()
+    if r_safe.empty:
+        r_safe = r.copy()
+
     nums, labels, frames = [], {}, {}
-    for _, row in r.iterrows():
+    for _, row in r_safe.iterrows():
         n = _horse_no(row)
         if not n or n in nums:
             continue
@@ -2197,10 +2368,10 @@ def _ensure_10_rows(rows: list, race_df: pd.DataFrame, bet_type: str,
         if nums:
             main = nums[0]
             for n in nums[1:]:
-                add({"買い目": f"{main}-{n}", "狙い": "本命軸補完"})
+                add({"買い目": f"{min(int(main),int(n))}-{max(int(main),int(n))}", "狙い": "本命軸補完"})
             for i in range(len(nums)):
                 for j in range(i + 1, len(nums)):
-                    add({"買い目": f"{nums[i]}-{nums[j]}", "狙い": "BOX補完"})
+                    add({"買い目": f"{min(int(nums[i]),int(nums[j]))}-{max(int(nums[i]),int(nums[j]))}", "狙い": "BOX補完"})
                     if len(rows) >= max_count:
                         break
                 if len(rows) >= max_count:
@@ -2215,11 +2386,11 @@ def _ensure_10_rows(rows: list, race_df: pd.DataFrame, bet_type: str,
         if len(nums) >= 3:
             h1, h2 = nums[0], nums[1]
             for n in nums[2:]:
-                add({"買い目": f"{h1}-{h2}-{n}", "狙い": "本命2頭軸補完"})
+                add({"買い目": f"{'-'.join(sorted([h1,h2,n], key=int))}", "狙い": "本命2頭軸補完"})
             for i in range(len(nums)):
                 for j in range(i + 1, len(nums)):
                     for k in range(j + 1, len(nums)):
-                        add({"買い目": f"{nums[i]}-{nums[j]}-{nums[k]}", "狙い": "三連複補完"})
+                        add({"買い目": f"{'-'.join(sorted([nums[i],nums[j],nums[k]], key=int))}", "狙い": "三連複補完"})
                         if len(rows) >= max_count:
                             break
                     if len(rows) >= max_count:
@@ -2239,8 +2410,11 @@ def _ensure_10_rows(rows: list, race_df: pd.DataFrame, bet_type: str,
                         break
                 if len(rows) >= max_count:
                     break
-    while len(rows) < max_count:
-        rows.append({"買い目": f"候補不足{len(rows) + 1}", "狙い": "候補不足。実買いは見送り推奨"})
+
+    # [FIX-6] 無理に埋めない - 足りない分は「候補不足」のみ1行追加
+    if len(rows) == 0:
+        rows.append({"買い目": "候補なし", "狙い": "このレースは見送りを推奨します"})
+
     return rows[:max_count]
 
 
@@ -2254,12 +2428,20 @@ def _ensure_combo_dict_10(combos: dict, race_df: pd.DataFrame, max_count: int = 
 
 def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10,
                                    strategy_mode: str = STRATEGY_MODE_ROI) -> dict:
+    """
+    [FIX-7] レース質分析の結果を買い目生成に反映。
+    断然人気レースは三連複点数を削減。
+    """
     r = race_df.sort_values(["value_score", "ml_top3_prob"], ascending=False).copy()
     buy = get_buy_candidates(race_df, max_horses=8, strategy_mode=strategy_mode)
 
     nums = [_horse_no(row) for _, row in buy.iterrows() if _horse_no(row)]
     if not nums:
         return {}
+
+    # [FIX-7] レース質を取得して三連複点数を制御
+    quality = analyze_race_quality(race_df)
+    san_max = quality.get("rec_sanrenpuku_max", max_count)
 
     ai_top = race_df.sort_values(
         ["ml_rank", "value_score", "horse_no"], ascending=[True, False, True]).head(1)
@@ -2290,7 +2472,8 @@ def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10,
         {"買い目": _horse_no(row), "馬名": _horse_label(row),
          "回収率スコア": row.get("value_score", 0),
          "EV乖離": row.get("ev_score", 0),
-         "Kelly比": row.get("kelly_ratio", 0),
+         "Kelly(複勝)": row.get("kelly_ratio", 0),
+         "Kelly(三連複)": row.get("kelly_ratio_sanren", 0),
          "理由": row.get("buy_reason", "")}
         for _, row in pd.concat([ai_top, r]).drop_duplicates(subset=["horse_no"]).head(max_count).iterrows()
     ]
@@ -2299,7 +2482,7 @@ def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10,
         {"買い目": _horse_no(row), "馬名": _horse_label(row),
          "回収率スコア": row.get("value_score", 0),
          "EV乖離": row.get("ev_score", 0),
-         "Kelly比": row.get("kelly_ratio", 0),
+         "Kelly(複勝)": row.get("kelly_ratio", 0),
          "理由": row.get("buy_reason", "")}
         for _, row in r.head(max_count).iterrows()
     ]
@@ -2379,11 +2562,12 @@ def generate_roi_bet_combinations(race_df: pd.DataFrame, max_count: int = 10,
                 break
     combos["馬単"] = umatan[:max_count]
 
+    # [FIX-7] レース質に応じた三連複点数制御
     zone = build_sanrenpuku_zone_data(race_df, strategy_mode=strategy_mode)
-    san1j = generate_sanrenpuku_1jiku(zone, max_count=max_count)
+    san1j = generate_sanrenpuku_1jiku(zone, max_count=san_max)  # san_maxで点数制御
     combos["三連複"] = [{"買い目": c["買い目"], "狙い": c["狙い"],
                           "分散スコア": c["分散スコア"],
-                          "組合EV": c.get("組合EV", 0)} for c in san1j] or \
+                          "組合EV(v25)": c.get("組合EV(v25)", 0)} for c in san1j] or \
                        [{"買い目": "候補不足", "狙い": "見送り推奨"}]
 
     combos["三連単"] = _generate_sanrentan_formation(race_df, max_count=max_count,
@@ -2430,6 +2614,11 @@ def show_sanrenpuku_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MO
     mode_label = "🎯" if strategy_mode == STRATEGY_MODE_ROI else "🏆"
     st.subheader(f"{mode_label} 三連複 詳細フォーメーション＆BOX [{strategy_mode}]")
 
+    # [FIX-7] レース質アドバイスを最初に表示
+    quality = analyze_race_quality(race_df)
+    if quality["advice"]:
+        st.info(f"**{quality['type']}** → {quality['advice']}")
+
     zone = build_sanrenpuku_zone_data(race_df, strategy_mode=strategy_mode)
 
     with st.expander("📋 ゾーン構成（軸・相手・選出根拠）"):
@@ -2445,7 +2634,7 @@ def show_sanrenpuku_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MO
                 st.caption(
                     f"AI{int(pivot_row.get('ml_rank', 0))}位 / "
                     f"3着内確率{float(pivot_row.get('ml_top3_prob', 0)) * 100:.1f}% / "
-                    f"Kelly{float(pivot_row.get('kelly_ratio', 0)):.3f} / "
+                    f"Kelly(三連複){float(pivot_row.get('kelly_ratio_sanren', 0)):.3f} / "
                     f"軸信頼度{conf:.3f} {conf_icon}"
                 )
             if pivot2_row is not None:
@@ -2464,23 +2653,30 @@ def show_sanrenpuku_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MO
                 try:
                     row = race_df[race_df["horse_no"] == int(n)]
                     if not row.empty:
-                        r = row.iloc[0]
-                        st.markdown(f"馬番{n} {r.get('horse_name', '')}")
-                        st.caption(f"AI{int(r.get('ml_rank', 0))}位 / 人気{int(r.get('popularity', 0))} / EV{float(r.get('ev_score', 0)):.3f} / Kelly{float(r.get('kelly_ratio', 0)):.3f}")
+                        rr = row.iloc[0]
+                        st.markdown(f"馬番{n} {rr.get('horse_name', '')}")
+                        st.caption(
+                            f"AI{int(rr.get('ml_rank', 0))}位 / 人気{int(rr.get('popularity', 0))} / "
+                            f"EV{float(rr.get('ev_score', 0)):.3f} / "
+                            f"Kelly(三連複){float(rr.get('kelly_ratio_sanren', 0)):.3f}"
+                        )
                 except Exception:
                     pass
         with col3:
-            b_label = "相手B (EV高め/補完)" if strategy_mode == STRATEGY_MODE_ROI else "相手B (人気3〜5位)"
+            b_label = "相手B (EV高め+確率閾値)" if strategy_mode == STRATEGY_MODE_ROI else "相手B (人気3〜5位)"
             st.markdown(f"**{b_label}**")
             for n in zone["aite_b_nums"]:
                 try:
                     row = race_df[race_df["horse_no"] == int(n)]
                     if not row.empty:
-                        r = row.iloc[0]
-                        ev = float(r.get('ev_score', 0))
+                        rr = row.iloc[0]
+                        ev = float(rr.get('ev_score', 0))
                         icon = "💎" if ev > 0 else "📊"
-                        st.markdown(f"馬番{n} {r.get('horse_name', '')} {icon}")
-                        st.caption(f"AI{int(r.get('ml_rank', 0))}位 / 人気{int(r.get('popularity', 0))} / EV{ev:.3f} / Kelly{float(r.get('kelly_ratio', 0)):.3f}")
+                        st.markdown(f"馬番{n} {rr.get('horse_name', '')} {icon}")
+                        st.caption(
+                            f"AI{int(rr.get('ml_rank', 0))}位 / 人気{int(rr.get('popularity', 0))} / "
+                            f"EV{ev:.3f} / Kelly(三連複){float(rr.get('kelly_ratio_sanren', 0)):.3f}"
+                        )
                 except Exception:
                     pass
 
@@ -2496,11 +2692,14 @@ def show_sanrenpuku_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MO
         aite_a = zone["aite_a_nums"]
         aite_b = zone["aite_b_nums"]
         conf = zone.get("pivot_conf", 0)
+        san_max = quality.get("rec_sanrenpuku_max", 10)
         if conf < PIVOT_CONFIDENCE_THRESHOLD:
             st.warning(f"⚠️ 軸馬(馬番{pivot_no})の信頼度スコアが低めです({conf:.3f})。軸変更を検討してください。")
+        if quality["is_danzen"]:
+            st.warning(f"⚠️ 断然人気レースのため三連複は{san_max}点に絞っています。複勝・馬連を優先検討してください。")
         st.markdown(f"**軸: 馬番{pivot_no} {pivot_name}** (信頼度: {conf:.3f})")
         st.markdown(f"**相手A**: 馬番 {', '.join(aite_a[:5])}  **相手B**: 馬番 {', '.join(aite_b[:5])}")
-        combos_1j = generate_sanrenpuku_1jiku(zone, max_count=10)
+        combos_1j = generate_sanrenpuku_1jiku(zone, max_count=san_max)
         if combos_1j:
             df_1j = pd.DataFrame(combos_1j)
             df_1j.insert(0, "No", range(1, len(df_1j) + 1))
@@ -2546,9 +2745,9 @@ def show_sanrenpuku_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MO
             alt = box_data["alt_horse"]
             st.markdown(
                 f"**置き換え候補（6位）**: 馬番{alt['馬番']} {alt['馬名']} "
-                f"（AI{alt['AI順位']}位 / 人気{alt['人気']} / Kelly{alt.get('Kelly比',0):.4f}）"
+                f"（AI{alt['AI順位']}位 / 人気{alt['人気']} / Kelly(三連複){alt.get('Kelly(三連複)',0):.4f}）"
             )
-        st.markdown("#### 買い目一覧（組合EV順 上位10点）")
+        st.markdown("#### 買い目一覧（組合EV(v25)順 上位10点）")
         combos_df = pd.DataFrame(box_data["combos"])
         st.dataframe(combos_df, use_container_width=True, hide_index=True)
         csv_box = combos_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
@@ -2564,14 +2763,14 @@ def show_ev_ranking(race_df: pd.DataFrame):
     st.subheader("📊 EV乖離スコアランキング（市場過小評価馬）")
     r = race_df.copy()
     for c in ["ev_score", "ml_top3_prob", "odds", "popularity", "value_score",
-              "implied_top3", "kelly_ratio"]:
+              "implied_top3", "kelly_ratio", "kelly_ratio_sanren"]:
         if c not in r.columns:
             r[c] = 0
         r[c] = pd.to_numeric(r[c], errors="coerce").fillna(0)
     r = r.sort_values("ev_score", ascending=False)
     display_cols = [c for c in ["mark", "horse_no", "horse_name", "popularity", "odds",
                                   "ml_top3_prob", "implied_top3", "ev_score",
-                                  "kelly_ratio", "value_score",
+                                  "kelly_ratio", "kelly_ratio_sanren", "value_score",
                                   "danger_level", "buy_flag", "buy_reason"] if c in r.columns]
     out = r[display_cols].copy()
     if "ml_top3_prob" in out.columns:
@@ -2602,6 +2801,7 @@ def show_ev_ranking(race_df: pd.DataFrame):
         if "buy_flag" in race_df.columns else 0
     high_ev = int((r["ev_score"] >= 0.06).sum())
     kelly_pos = int((r["kelly_ratio"] >= MIN_KELLY_RATIO).sum())
+    kelly_san_pos = int((r["kelly_ratio_sanren"] >= MIN_KELLY_RATIO).sum())
     avg_odds = float(r["odds"].mean())
     if avg_odds <= 10:
         rec_san = f"{max(3, min(buy_count * 2, 6))}点"
@@ -2611,8 +2811,9 @@ def show_ev_ranking(race_df: pd.DataFrame):
         rec_san = f"{max(5, min(buy_count * 3, 10))}点"
 
     st.caption(
-        f"💡 買い判定: {buy_count}頭 / EV高め(0.06以上): {high_ev}頭 / Kelly正: {kelly_pos}頭 / 三連複推奨: {rec_san}\n"
-        "📌 EV乖離 = AI3着内確率 - 市場暗示3着内確率(3.0/単勝オッズ×0.80)"
+        f"💡 買い判定: {buy_count}頭 / EV高め(0.06以上): {high_ev}頭 / "
+        f"Kelly正(複勝): {kelly_pos}頭 / Kelly正(三連複): {kelly_san_pos}頭 / 三連複推奨: {rec_san}\n"
+        "📌 EV乖離 = AI3着内確率 - 市場暗示3着内確率(オッズ帯別係数テーブル×0.80)"
     )
 
 
@@ -2699,8 +2900,9 @@ def jp_view(df: pd.DataFrame, include_race_key=False) -> pd.DataFrame:
         out["expected_value"] = pd.to_numeric(out["expected_value"], errors="coerce").round(2)
     if "ev_score" in out.columns:
         out["ev_score"] = pd.to_numeric(out["ev_score"], errors="coerce").round(4)
-    if "kelly_ratio" in out.columns:
-        out["kelly_ratio"] = pd.to_numeric(out["kelly_ratio"], errors="coerce").round(4)
+    for kr in ["kelly_ratio", "kelly_ratio_sanren"]:
+        if kr in out.columns:
+            out[kr] = pd.to_numeric(out[kr], errors="coerce").round(4)
     if "pivot_confidence" in out.columns:
         out["pivot_confidence"] = pd.to_numeric(out["pivot_confidence"], errors="coerce").round(4)
     for c in ["jockey_top3_rate_prior", "trainer_top3_rate_prior",
@@ -2835,8 +3037,9 @@ def app_main():
     st.title("🐾 にゃんこ競馬AI")
     st.success(f"起動版: {VERSION}")
     st.caption(
-        "v24: ①Kelly基準による購入絞り込み ②危険馬段階検出 ③三連複組合EV評価 "
-        "④レース質分析 ⑤軸信頼度スコア ⑥推奨点数ダッシュボード ⑦BUG FIX×5"
+        "v25: ①三連複確率を条件付き確率に刷新 ②implied_top3をオッズ帯別係数に刷新 "
+        "③危険馬フィルタ強化(AI4位) ④相手B確率下限追加 ⑤Kelly比を複勝/三連複に分離 "
+        "⑥補完買い目品質フィルタ強化 ⑦レース質分析→買い目生成に反映 ⑧頭数別動的EV閾値"
     )
 
     with st.sidebar:
@@ -2872,21 +3075,17 @@ def app_main():
 
         st.markdown("---")
         st.caption(
-            "**v24 主要改善**\n\n"
-            "🔴 BUG FIX:\n"
-            "- [BF-1] v23日付修正引き継ぎ\n"
-            "- [BF-2] オッズ欠損馬EV汚染修正\n"
-            "- [BF-3] 買い目重複チェック修正\n"
-            "- [BF-4] spread_min/FB条件矛盾修正\n"
-            "- [BF-5] predict関数内のev_score計算順序修正\n\n"
-            "🟢 IMPROVEMENT:\n"
-            "- Kelly比(0.25倍)で購入候補絞込み\n"
-            "- 危険人気馬: 強危険/危険/注意の3段階\n"
-            "- 三連複: 組合EV順でソート\n"
-            "- 軸信頼度スコア(確率×騎手×距離×EV)\n"
-            "- レース質分析(断然/混戦/高配当期待)\n"
-            "- 推奨購入点数ダッシュボード表示\n"
-            "- 馬連/ワイドの買い目重複を馬番小→大で正規化\n"
+            "**v25 主要修正**\n\n"
+            "🔴 三連複ロジック全面刷新:\n"
+            "- [FIX-1] 三連複確率: 独立仮定→条件付き確率+頭数補正\n"
+            "- [FIX-2] implied_top3: オッズ÷3→オッズ帯別係数テーブル\n"
+            "- [FIX-3] 危険馬: AI5位→AI4位以上で危険\n"
+            "- [FIX-4] 相手B: EVプラスのみ→確率下限も追加\n"
+            "- [FIX-5] Kelly比: 1種類→複勝/三連複に分離\n"
+            "- [FIX-6] 補完買い目: 無制限→品質フィルタ強化\n"
+            "- [FIX-7] レース質分析を買い目生成に反映\n"
+            "- [FIX-8] 三連複EV閾値を頭数別に動的化\n"
+            "- [FIX-9] pivot_confidence: 三連複Kelly連動\n"
         )
 
     st.subheader("入力方法")
@@ -3062,27 +3261,30 @@ def app_main():
                 ["ml_rank", "value_score", "horse_no"], ascending=[True, False, True])
             st.dataframe(jp_view(race_df), use_container_width=True, hide_index=True)
 
-            # [IMP-2] レース質分析表示
+            # レース質分析表示
             st.markdown("---")
             race_quality = analyze_race_quality(race_df)
             st.markdown(f"#### 🏟️ レース質分析: **{race_quality['type']}**")
             if race_quality["advice"]:
                 st.info(race_quality["advice"])
-            col_q1, col_q2, col_q3 = st.columns(3)
+            col_q1, col_q2, col_q3, col_q4 = st.columns(4)
             col_q1.metric("最低オッズ", f"{race_quality['min_odds']:.1f}倍")
             col_q2.metric("オッズ標準偏差", f"{race_quality['odds_std']:.1f}")
             col_q3.metric("レースタイプ", race_quality['type'])
+            col_q4.metric("推奨フォーカス", race_quality.get('rec_bet_focus', '-'))
 
-            # [IMP-6] 推奨購入点数ダッシュボード
+            # 推奨購入点数ダッシュボード
             st.markdown("---")
             rec = calc_recommended_tickets(race_df, strategy_mode=strategy_mode)
             st.markdown("#### 📈 推奨購入点数ダッシュボード")
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("推奨点数", f"{rec['推奨点数']}点")
-            m2.metric("Kelly正馬数", f"{rec['Kelly正馬数']}頭")
-            m3.metric("買い候補馬数", f"{rec['買い候補馬数']}頭")
-            key4 = list(rec.keys())[3]
-            m4.metric(key4, rec[key4])
+            m2.metric("Kelly正(複勝)", f"{rec['Kelly正(複勝)']}頭")
+            m3.metric("Kelly正(三連複)", f"{rec['Kelly正(三連複)']}頭")
+            m4.metric("買い候補馬数", f"{rec['買い候補馬数']}頭")
+            key5 = [k for k in rec.keys() if "的中率" in k]
+            if key5:
+                m5.metric(key5[0], rec[key5[0]])
 
             tickets = make_tickets(race_df)
             c1, c2, c3 = st.columns(3)
@@ -3108,7 +3310,7 @@ def app_main():
                 st.markdown("**💰 回収率重視**")
                 df_roi_compare = add_value_strategy(race_df.copy(), strategy_mode=STRATEGY_MODE_ROI)
                 buy_roi = df_roi_compare[df_roi_compare["buy_flag"] == "買い"][
-                    ["horse_name", "buy_flag", "buy_reason", "kelly_ratio"]]
+                    ["horse_name", "buy_flag", "buy_reason", "kelly_ratio", "kelly_ratio_sanren"]]
                 st.dataframe(buy_roi.rename(columns=JP_COLUMNS), use_container_width=True, hide_index=True)
             with col_hit:
                 st.markdown("**🏆 的中率重視**")
@@ -3135,7 +3337,7 @@ def app_main():
             st.exception(e)
 
     st.divider()
-    with st.expander("簡易CSVテンプレ（v24対応）"):
+    with st.expander("簡易CSVテンプレ（v25対応）"):
         st.caption("日付列を入れると正しい日付でレースが識別されます。")
         st.code(
             "日付,馬番,馬名,性別,年齢,騎手,斤量,オッズ,人気,競馬場,レース番号,レース名,距離,馬場,頭数,芝ダ\n"

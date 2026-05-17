@@ -1631,6 +1631,12 @@ def calibrate_prob(raw_prob: np.ndarray, method: str = "isotonic_approx") -> np.
     if s > 0:
         p_calibrated = p_calibrated * target_sum / s
 
+    # 同率による馬番昇順化を防ぐため、微小なノイズを加えるにゃ
+    # ノイズは 1e-6 オーダーなので実質的な確率に影響しないにゃ
+    np.random.seed(42)
+    noise = np.random.uniform(-1e-6, 1e-6, len(p_calibrated))
+    p_calibrated = p_calibrated + noise
+
     return np.clip(p_calibrated, 0.01, 0.95)
 
 
@@ -1655,8 +1661,24 @@ def predict(bundle, df, strategy_mode=STRATEGY_MODE_ROI):
     df["ml_top3_prob"] = calibrated
     df["calibrated_prob"] = calibrated  # 表示用にも保持にゃ
 
-    df["ml_rank"] = df.groupby("race_key")["ml_top3_prob"].rank(
-        ascending=False, method="first").fillna(1).astype(int)
+    # ml_rank計算にゃ: 同率タイブレークを「人気→オッズ→馬番」順で行うにゃ
+    # method="first"は行順（=馬番昇順）依存になるので使わないにゃ
+    # タイブレーク基準にゃ: 1.人気小(強いにゃ) 2.オッズ小(市場評価高いにゃ) 3.馬番小
+    _pop_tb  = pd.to_numeric(df["popularity"], errors="coerce").fillna(99)
+    _odds_tb = pd.to_numeric(df["odds"],       errors="coerce").fillna(999)
+    _hno_tb  = pd.to_numeric(df["horse_no"],   errors="coerce").fillna(99)
+    _tiebreak = (
+        (1.0 / _pop_tb.clip(lower=1))       * 1e-4
+        + (1.0 / _odds_tb.clip(lower=0.1))  * 1e-6
+        + (1.0 / _hno_tb.clip(lower=1))     * 1e-8
+    )
+    df["_composite_rank"] = df["ml_top3_prob"] + _tiebreak
+    df["ml_rank"] = (
+        df.groupby("race_key")["_composite_rank"]
+        .rank(ascending=False, method="first")
+        .fillna(1).astype(int)
+    )
+    df = df.drop(columns=["_composite_rank"])
     df["mark"] = df["ml_rank"].map({1:"◎",2:"○",3:"▲",4:"△",5:"☆",6:"×",7:"×",8:"×"}).fillna("")
     df["expected_value"] = df["ml_top3_prob"] * df["odds"].fillna(0)
 

@@ -2246,24 +2246,27 @@ def build_sanrenpuku_zone_data(race_df: pd.DataFrame,
                    if _no(row) not in [pivot_no, pivot2_no]][:5]
 
     if strategy_mode == STRATEGY_MODE_ROI:
-        # [FIX-4] 相手B: EVプラスかつAI確率が一定以上の馬のみ
-        min_prob_for_b = float(safe["ml_top3_prob"].quantile(0.3))  # 下位30%は除外
-        aite_b_df = safe.sort_values(
-            ["ev_score", "ml_top3_prob"], ascending=[False, False]).copy()
+        # 相手B: EV×確率×Kelly の複合スコアで選出にゃ（v26改善にゃ）
+        min_prob_for_b = float(safe["ml_top3_prob"].quantile(0.25))
+        safe_tmp = safe.copy()
+        safe_tmp["_aite_b_score"] = (
+            safe_tmp["ml_top3_prob"] * 0.50
+            + safe_tmp["ev_score"].clip(lower=0) * 0.30
+            + safe_tmp["kelly_ratio_sanren"].clip(lower=0) * 0.20
+        )
+        aite_b_df = safe_tmp.sort_values("_aite_b_score", ascending=False).copy()
         aite_b_nums = [
             _no(row) for _, row in aite_b_df.iterrows()
             if _no(row) not in [pivot_no, pivot2_no] + aite_a_nums
-            and float(row.get("ev_score", 0)) > 0
-            and float(row.get("ml_top3_prob", 0)) >= min_prob_for_b  # [FIX-4] 確率下限追加
-        ][:5]
+            and float(row.get("ml_top3_prob", 0)) >= min_prob_for_b
+        ][:6]
         if len(aite_b_nums) < 3:
             for _, row in safe.sort_values("ml_top3_prob", ascending=False).iterrows():
                 n = _no(row)
                 if n and n not in [pivot_no, pivot2_no] + aite_a_nums + aite_b_nums:
-                    # [FIX-4] 補完時も確率下限チェック
-                    if float(row.get("ml_top3_prob", 0)) >= min_prob_for_b * 0.7:
+                    if float(row.get("ml_top3_prob", 0)) >= min_prob_for_b * 0.6:
                         aite_b_nums.append(n)
-                if len(aite_b_nums) >= 5:
+                if len(aite_b_nums) >= 6:
                     break
     else:
         aite_b_df = safe[safe["popularity"].between(3, 5)].sort_values(
@@ -2352,9 +2355,12 @@ def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
                 combo_ev = _calc_combo_ev_score(
                     pivot_no, ha, hb, prob_map, ev_map, field_size=fs)
                 if spread >= SPREAD_MIN and combo_ev >= MIN_COMBO_EV:
+                    sorted_tri = sorted(tri, key=int)
                     combos.append({
-                        "買い目": f"{'-'.join(sorted(tri, key=int))}",
-                        "軸": pivot_no, "相手A": ha, "相手B": hb,
+                        "買い目": "-".join(sorted_tri),
+                        "軸馬番": pivot_no,
+                        "相手A": ha,
+                        "相手B": hb,
                         "狙い": "1頭軸×中間×EV高め",
                         "分散スコア": round(spread, 3),
                         "組合EV(v25)": round(combo_ev, 6),
@@ -2564,20 +2570,30 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
     prob_map = {_no(row): float(row.get("ml_top3_prob", 0.05)) for _, row in top5.iterrows()}
     ev_map = {_no(row): float(row.get("ev_score", 0)) for _, row in top5.iterrows()}
 
-    # [FIX-1] 組合EVをv25版で計算
+
+    # [v26] 組合EVを条件付き確率版で計算にゃ
+    # 確率上位馬が先頭に来る「AI推奨順」列も追加するにゃ
     combos = []
     for tri in itertools.combinations(range(len(nums)), 3):
-        tri_nums = [nums[i] for i in tri]
-        tri_sorted = sorted(tri_nums, key=lambda x: int(x))
-        combo_ev = _calc_combo_ev_score(
-            tri_nums[0], tri_nums[1], tri_nums[2], prob_map, ev_map, field_size=field_size)
+        tri_nums   = [nums[i] for i in tri]
+        # 購入票用: 馬番昇順にゃ
+        tri_sorted = sorted(tri_nums, key=lambda x: _safe_int(x, 0))
+        # AI推奨順: 確率の高い馬から並べるにゃ
+        tri_by_prob = sorted(tri_nums, key=lambda x: -prob_map.get(x, 0))
+        h1, h2, h3  = tri_by_prob[0], tri_by_prob[1], tri_by_prob[2]
+        combo_ev = _calc_combo_ev_score(h1, h2, h3, prob_map, ev_map, field_size=field_size)
+        p1 = prob_map.get(h1, 0.05)
+        p2 = prob_map.get(h2, 0.05)
+        p3 = prob_map.get(h3, 0.05)
+        order_score = p1 * min(p2/max(1.0-p1, 0.05), 0.95) * min(p3/max(1.0-p1-p2, 0.05), 0.95)
         combos.append({
             "No": 0,
-            "買い目": "-".join(tri_sorted),
-            "馬番①": tri_sorted[0], "馬番②": tri_sorted[1], "馬番③": tri_sorted[2],
-            "組合EV(v25)": round(combo_ev, 6),
+            "買い目(購入用)": "-".join(tri_sorted),
+            "AI推奨順": f"{h1}→{h2}→{h3}",
+            "組合EV(v26)": round(combo_ev, 6),
+            "順序スコア": round(order_score * 1000, 4),
         })
-    combos.sort(key=lambda x: -x["組合EV(v25)"])
+    combos.sort(key=lambda x: -(x["組合EV(v26)"] * 0.7 + x["順序スコア"] * 0.3))
     for i, c in enumerate(combos):
         c["No"] = i + 1
 
@@ -2625,37 +2641,62 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
 # 三連単フォーメーション
 # ============================================================
 
+
 def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
                                    strategy_mode: str = STRATEGY_MODE_ROI) -> list[dict]:
+    """
+    三連単フォーメーション生成にゃ（v26改善版にゃ）
+
+    【改善点にゃ】
+    - 1着/2着/3着の候補を「AI確率×着順ウェイト」でスコアリングにゃ
+    - 単純なfirst/second/thirdの固定割り当てをやめて
+      pivot_confidence順でフレキシブルにフォーメーションを組むにゃ
+    - 1着確率の近似 = ml_top3_prob × (1/popularity)^0.5 にゃ
+    - combo_ev × 着順スコア でソートするにゃ
+    """
     r = race_df.copy()
     for c in ["ml_rank", "value_score", "ml_top3_prob", "odds", "popularity",
-              "ev_score", "horse_no", "kelly_ratio", "kelly_ratio_sanren", "field_size"]:
+              "ev_score", "horse_no", "kelly_ratio", "kelly_ratio_sanren",
+              "field_size", "pivot_confidence"]:
         if c not in r.columns:
             r[c] = 0
         r[c] = pd.to_numeric(r[c], errors="coerce").fillna(0)
 
-    all_nums = [str(int(n)) for n in r["horse_no"].dropna() if n > 0]
-    field_size = _safe_int(r["field_size"].max(), len(r)) if pd.notna(r["field_size"].max()) and r["field_size"].max() > 0 else len(r)
-    safe = r[r.get("danger_popular", pd.Series([""] * len(r))) != "危険"].copy() \
-        if "danger_popular" in r.columns else r.copy()
+    all_nums = [str(_safe_int(n, 0)) for n in r["horse_no"].dropna() if n > 0]
+    field_size = _safe_int(r["field_size"].max(), len(r))         if pd.notna(r["field_size"].max()) and r["field_size"].max() > 0 else len(r)
+    safe = (r[r.get("danger_popular", pd.Series([""] * len(r))) != "危険"].copy()
+            if "danger_popular" in r.columns else r.copy())
     if safe.empty:
         safe = r.copy()
 
-    prob_map = {}
-    ev_map = {}
-    for _, row in r.iterrows():
-        try:
-            n = str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0)))
-        except Exception:
-            continue
-        prob_map[n] = float(row.get("ml_top3_prob", 0.05))
-        ev_map[n] = float(row.get("ev_score", 0))
+    # 着順別スコアを計算するにゃ
+    # 1着スコア: top3_prob × (1/popularity)^0.5 × pivot_confidence
+    # 2着スコア: top3_prob × pivot_confidence
+    # 3着スコア: top3_prob × ev_score_bonus（穴馬ボーナスにゃ）
+    pop_safe = safe["popularity"].clip(lower=1)
+    safe = safe.copy()
+    safe["score_1st"] = (
+        safe["ml_top3_prob"]
+        * (1.0 / pop_safe) ** 0.5
+        * safe["pivot_confidence"].clip(lower=0.01)
+    )
+    safe["score_2nd"] = (
+        safe["ml_top3_prob"]
+        * safe["pivot_confidence"].clip(lower=0.01)
+        * (1 + safe["ev_score"].clip(lower=0) * 0.5)
+    )
+    safe["score_3rd"] = (
+        safe["ml_top3_prob"]
+        * (1 + safe["ev_score"].clip(lower=0) * 1.5)  # 穴馬を3着に期待にゃ
+        * (1 + (safe["popularity"] >= 5).astype(float) * 0.3)
+    )
 
-    def get_nums(zone_df, max_n=6, exclude=None):
+    def get_nums_by_score(score_col, max_n=6, exclude=None):
+        df_sorted = safe.sort_values(score_col, ascending=False)
         nums = []
-        for _, row in zone_df.iterrows():
+        for _, row in df_sorted.iterrows():
             try:
-                n = str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0))) if row["horse_no"] > 0 else ""
+                n = str(_safe_int(row["horse_no"], 0))
             except Exception:
                 n = ""
             if n and n not in nums and (exclude is None or n not in exclude):
@@ -2664,67 +2705,92 @@ def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
                 break
         return nums
 
-    sorted_ai = safe.sort_values(["ml_rank", "ev_score"], ascending=[True, False])
+    prob_map = {}
+    ev_map   = {}
+    for _, row in r.iterrows():
+        try:
+            n = str(_safe_int(row["horse_no"], 0))
+        except Exception:
+            continue
+        prob_map[n] = float(row.get("ml_top3_prob", 0.05))
+        ev_map[n]   = float(row.get("ev_score", 0))
 
     if strategy_mode == STRATEGY_MODE_ROI:
-        sorted_ev = safe.sort_values("ev_score", ascending=False)
-        first_candidates = get_nums(sorted_ai, max_n=2)
-        ev_top = get_nums(sorted_ev, max_n=1)
-        if ev_top and ev_top[0] not in first_candidates:
-            first_candidates.insert(0, ev_top[0])
-        first_candidates = list(dict.fromkeys(first_candidates))[:2]
-        ana_zone = safe[(safe["popularity"] >= 5) | (safe.get("value_horse", pd.Series([""] * len(safe))) == "穴候補")]
-        second_candidates = get_nums(sorted_ai, max_n=5, exclude=set(first_candidates))
-        third_candidates = get_nums(
-            ana_zone.sort_values("ev_score", ascending=False),
-            max_n=6, exclude=set(first_candidates + second_candidates[:2])
-        )
-        if len(third_candidates) < 3:
-            third_candidates += get_nums(
-                sorted_ev, max_n=6, exclude=set(first_candidates + second_candidates[:2]))
-        third_candidates = list(dict.fromkeys(third_candidates))
+        # 回収率重視にゃ: EVが高い穴馬を3着に積極活用にゃ
+        first_candidates  = get_nums_by_score("score_1st", max_n=3)
+        second_candidates = get_nums_by_score("score_2nd", max_n=5,
+                                               exclude=set(first_candidates))
+        # 3着には穴馬を優先にゃ（EV高め）にゃ
+        third_candidates  = get_nums_by_score("score_3rd", max_n=7,
+                                               exclude=set(first_candidates))
     else:
-        first_candidates = get_nums(sorted_ai, max_n=2)
-        second_candidates = get_nums(
-            safe.sort_values(["popularity", "ml_rank"], ascending=[True, True]),
-            max_n=5, exclude=set(first_candidates))
-        third_candidates = get_nums(
-            safe.sort_values("ml_top3_prob", ascending=False),
-            max_n=6, exclude=set(first_candidates + second_candidates[:2]))
-        if len(third_candidates) < 3:
-            third_candidates += get_nums(
-                sorted_ai, max_n=6, exclude=set(first_candidates + second_candidates[:2]))
-        third_candidates = list(dict.fromkeys(third_candidates))
+        # 的中率重視にゃ: AI上位・人気馬で固めるにゃ
+        first_candidates  = get_nums_by_score("score_1st", max_n=2)
+        second_candidates = get_nums_by_score("score_2nd", max_n=4,
+                                               exclude=set(first_candidates))
+        third_candidates  = get_nums_by_score("ml_top3_prob", max_n=5,
+                                               exclude=set(first_candidates))
 
+    # フォーメーション生成にゃ
     combos = []
-    seen = set()
+    seen   = set()
+
     for h1 in first_candidates:
         for h2 in second_candidates:
+            if h2 == h1:
+                continue
             for h3 in third_candidates:
-                if len({h1, h2, h3}) == 3:
-                    key = f"{h1}→{h2}→{h3}"
-                    if key not in seen:
-                        spread = _calc_spread_score([h1, h2, h3], all_nums)
-                        combo_ev = _calc_combo_ev_score(
-                            h1, h2, h3, prob_map, ev_map, field_size=field_size)
-                        note = "1着EV×穴3着" if strategy_mode == STRATEGY_MODE_ROI else "AI上位固定"
-                        combos.append({
-                            "買い目": key,
-                            "狙い": note,
-                            "spread": spread,
-                            "組合EV(v25)": combo_ev,
-                        })
-                        seen.add(key)
+                if len({h1, h2, h3}) != 3:
+                    continue
+                key = f"{h1}→{h2}→{h3}"
+                if key in seen:
+                    continue
 
-    combos.sort(key=lambda x: (-(x["組合EV(v25)"] * 0.6 + x["spread"] * 0.4)))
-    return [{"買い目": c["買い目"], "狙い": c["狙い"],
-              "分散スコア": round(c["spread"], 3),
-              "組合EV(v25)": round(c["組合EV(v25)"], 6)} for c in combos[:max_count]]
+                spread   = _calc_spread_score([h1, h2, h3], all_nums)
+                combo_ev = _calc_combo_ev_score(
+                    h1, h2, h3, prob_map, ev_map, field_size=field_size)
 
+                # 三連単スコア = 1着確率 × 2着確率 × 3着確率 × EV補正にゃ
+                p1 = prob_map.get(h1, 0.05)
+                p2 = prob_map.get(h2, 0.05)
+                p3 = prob_map.get(h3, 0.05)
+                # 条件付き確率にゃ（h1→h2→h3の順序を考慮にゃ）
+                pc2 = min(p2 / max(1.0 - p1, 0.05), 0.95)
+                pc3 = min(p3 / max(1.0 - p1 - p2, 0.05), 0.95)
+                order_score = p1 * pc2 * pc3
 
-# ============================================================
-# 買い目生成 (その他券種)
-# ============================================================
+                ev_bonus = float(np.clip(
+                    1.0 + (ev_map.get(h1, 0) + ev_map.get(h3, 0)) * 0.5,
+                    0.7, 2.0))
+
+                combos.append({
+                    "買い目": key,
+                    "1着候補": h1,
+                    "2着候補": h2,
+                    "3着候補": h3,
+                    "狙い": (
+                        "AI上位→人気→穴" if strategy_mode == STRATEGY_MODE_ROI
+                        else "AI上位固定"
+                    ),
+                    "順序スコア": round(order_score * 1000, 4),
+                    "分散スコア": round(spread, 3),
+                    "組合EV(v25)": round(combo_ev, 6),
+                    "_sort_key": order_score * ev_bonus * (1 + spread * 0.2),
+                })
+                seen.add(key)
+
+    if not combos:
+        return []
+
+    # 順序スコア×EV×分散でソートにゃ
+    combos.sort(key=lambda x: -x["_sort_key"])
+
+    # _sort_key列を除去して返すにゃ
+    result = []
+    for c in combos[:max_count]:
+        c.pop("_sort_key", None)
+        result.append(c)
+    return result
 
 def _horse_no(row) -> str:
     try:

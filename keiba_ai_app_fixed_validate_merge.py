@@ -4799,334 +4799,413 @@ def show_pkl_ai_dashboard(bundle, race_df, pred_enriched_df=None):
                     st.success("💬 AI根拠サマリーにゃ: " + " / ".join(comments))
 
 
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI v26にゃ")
     st.success(f"起動版にゃ: {VERSION}にゃ")
     st.caption(
-        "v25: ①三連複確率を条件付き確率に刷新 ②implied_top3をオッズ帯別係数に刷新 "
-        "③危険馬フィルタ強化(AI4位) ④相手B確率下限追加 ⑤Kelly比を複勝/三連複に分離 "
-        "⑥補完買い目品質フィルタ強化 ⑦レース質分析→買い目生成に反映 ⑧頭数別動的EV閾値"
+        "v26にゃ: netkeibaスクレイピング統合 / 確率校正（過学習対策） / "
+        "三連複条件付き確率 / Kelly比分離 / PKL本格AI分析にゃ🐾"
     )
 
+    # ── サイドバーにゃ ──
     with st.sidebar:
-        st.header("設定")
-
-        st.markdown("### 🎯 予想モード")
+        st.header("設定にゃ🐾")
+        st.markdown("### 🎯 予想モードにゃ")
         strategy_mode = st.radio(
-            "モードを選択",
+            "モードを選択にゃ",
             STRATEGY_MODE_OPTIONS,
             index=0,
-            help=(
-                "**回収率重視**: Kelly基準+EV乖離で絞り込み。高配当狙い。\n\n"
-                "**的中率重視**: AI上位馬+軸信頼度で安定的中狙い。"
-            )
+            help="**回収率重視にゃ**: Kelly+EV高め狙いにゃ\n\n**的中率重視にゃ**: AI上位+軸信頼度で安定的中にゃ"
         )
         if strategy_mode == STRATEGY_MODE_ROI:
-            st.info("💰 回収率重視: Kelly正馬・EV高め馬を積極評価。高配当を狙います。")
+            st.info("💰 回収率重視にゃ: 高配当を狙いますにゃ🐾")
         else:
-            st.success("🏆 的中率重視: AI上位・軸信頼度重視で安定的中を狙います。")
-
+            st.success("🏆 的中率重視にゃ: 安定的中を狙いますにゃ🐾")
         st.markdown("---")
-        uploaded_model = st.file_uploader("学習済みモデルPKL", type=["pkl"])
-        csv_mode = st.radio("予想CSV形式", ["52列TARGET形式", "簡易CSV形式"], index=0)
-
+        uploaded_model = st.file_uploader("学習済みPKLにゃ", type=["pkl"])
+        csv_mode = st.radio("CSV形式にゃ", ["52列TARGET形式", "簡易CSV形式"], index=0)
         if MODEL_PATH.exists():
-            st.success(f"同梱PKLあり: {MODEL_PATH.name}")
+            st.success(f"同梱PKLあり: {MODEL_PATH.name}にゃ")
         else:
-            st.warning("同梱PKLなし。画面からPKLをアップロードしてください。")
+            st.warning("同梱PKLなしにゃ。アップロードが必要にゃ🐾")
         if TARGET_CSV_PATH.exists():
-            st.success(f"TARGET過去CSVあり: {TARGET_CSV_PATH.name}")
+            st.success(f"TARGET CSV: {TARGET_CSV_PATH.name}にゃ")
         else:
-            st.info("TARGET過去CSVなし: yosou.csv をリポジトリ直下に置くと補正します。")
-
+            st.info("TARGET CSV未配置にゃ（yosou.csvを直下に置くにゃ）")
         st.markdown("---")
         st.caption(
-            "**v25 主要修正**\n\n"
-            "🔴 三連複ロジック全面刷新:\n"
-            "- [FIX-1] 三連複確率: 独立仮定→条件付き確率+頭数補正\n"
-            "- [FIX-2] implied_top3: オッズ÷3→オッズ帯別係数テーブル\n"
-            "- [FIX-3] 危険馬: AI5位→AI4位以上で危険\n"
-            "- [FIX-4] 相手B: EVプラスのみ→確率下限も追加\n"
-            "- [FIX-5] Kelly比: 1種類→複勝/三連複に分離\n"
-            "- [FIX-6] 補完買い目: 無制限→品質フィルタ強化\n"
-            "- [FIX-7] レース質分析を買い目生成に反映\n"
-            "- [FIX-8] 三連複EV閾値を頭数別に動的化\n"
-            "- [FIX-9] pivot_confidence: 三連複Kelly連動\n"
+            "**v26 主要改善にゃ**\n\n"
+            "🔵 スクレイピングにゃ:\n- 開催日程自動取得にゃ\n"
+            "- リアルタイムオッズ取得にゃ\n\n"
+            "🔴 過学習対策にゃ:\n- 確率校正（合計→3.0）にゃ\n\n"
+            "🟢 ロジック改善にゃ:\n- 条件付き確率×頭数補正にゃ\n"
+            "- Kelly比分離にゃ\n- 危険馬AI4位以上にゃ\n\n"
+            "🧠 AI分析にゃ:\n- 置換法特徴量重要度にゃ\n"
+            "- 過学習診断にゃ\n- 個別馬根拠説明にゃ"
         )
 
+    # ── 入力方法にゃ ──
     st.subheader("入力方法にゃ🐾")
+    INPUT_NETKEIBA_AUTO  = "🌐 netkeiba自動取得（当日レース）にゃ"
+    INPUT_NETKEIBA_ID    = "🌐 netkeiba race_id/URL指定にゃ"
+    INPUT_CSV_SELECT     = "📁 事前CSVから選択にゃ"
+    INPUT_CSV_UPLOAD     = "📄 出馬表CSVアップロードにゃ"
+    INPUT_NETKEIBA_URL   = "🌐 netkeiba URL単発にゃ"
+
     input_method = st.radio(
         "入力方法を選択にゃ",
-        ["🌐 netkeiba自動取得（当日レース）",
-         "🌐 netkeiba race_id/URL指定",
-         "📁 事前CSVから選択",
-         "📄 出馬表CSVアップロード",
-         "netkeiba URL単発"],
-        horizontal=True, index=0
+        [INPUT_NETKEIBA_AUTO, INPUT_NETKEIBA_ID,
+         INPUT_CSV_SELECT, INPUT_CSV_UPLOAD, INPUT_NETKEIBA_URL],
+        horizontal=True, index=2  # デフォルトは事前CSVにゃ
     )
 
+    # ── 各入力方法のUI にゃ ──
     selected_preloaded_paths = []
-    uploaded_csv = None
-    race_url = ""
-    race_items = []
+    uploaded_csv  = None
+    race_url      = ""
+    race_items    = []
+    target_date   = None
+    update_odds   = True
+    sleep_sec     = 1.2
 
-    if input_method == "事前CSVから選択":
-        st.caption("GitHubの data/ フォルダに置いたCSVを選ぶだけで予想できます。")
-        preloaded_paths = list_preloaded_csv_files()
-        if not preloaded_paths:
-            st.warning("dataフォルダにCSVがありません。")
-        else:
-            labels = [make_preloaded_file_label(p) for p in preloaded_paths]
-            mode = st.radio("読み込み方法", ["1レースだけ選ぶ", "全部まとめて読む"], horizontal=True, index=0)
-            if mode == "1レースだけ選ぶ":
-                selected_label = st.selectbox("事前CSVを選択", labels)
-                selected_preloaded_paths = [preloaded_paths[labels.index(selected_label)]]
+    if input_method == INPUT_NETKEIBA_AUTO:
+        st.caption("今日（または指定日）の全レースを自動取得するにゃ🐾")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            use_today = st.checkbox("今日の日付を使うにゃ", value=True)
+        with col2:
+            if not use_today:
+                sel_date = st.date_input("開催日を指定にゃ", value=date.today())
+                target_date = sel_date.strftime("%Y%m%d")
             else:
-                selected_preloaded_paths = preloaded_paths
-                st.info(f"dataフォルダ内のCSVを全部読みます: {len(selected_preloaded_paths)}件")
-            with st.expander("検出した事前CSV"):
-                st.write([p.name for p in preloaded_paths])
+                target_date = date.today().strftime("%Y%m%d")
+                st.info(f"今日: {target_date}にゃ")
+        with col3:
+            update_odds = st.checkbox("リアルタイムオッズを取得するにゃ", value=True)
+        sleep_sec = st.slider("アクセス間隔（秒）にゃ", 0.5, 3.0, 1.2, 0.1)
 
-    elif input_method == "netkeiba一括取得→そのまま予想":
-        st.caption("race_id/URL一覧、または開催情報から一括取得して予想できます。")
-        make_mode = st.radio("一括取得方法", ["race_id / URL一覧", "開催情報から自動生成"],
-                              horizontal=True, index=0)
-        if make_mode == "race_id / URL一覧":
-            text = st.text_area("race_id または URLを1行ずつ入力",
-                                value="202605020111\n202605020112\n202605020113", height=120)
-            race_items = [x.strip() for x in text.splitlines() if x.strip()]
+    elif input_method == INPUT_NETKEIBA_ID:
+        st.caption("race_idまたはURLを指定して取得するにゃ🐾")
+        mk = st.radio("指定方法にゃ", ["race_id/URL一覧にゃ", "開催情報から自動生成にゃ"], horizontal=True)
+        if mk == "race_id/URL一覧にゃ":
+            txt = st.text_area(
+                "race_id/URLを1行ずつにゃ",
+                "202505040811\n202505040812\n202505040813", height=100
+            )
+            race_items = [x.strip() for x in txt.splitlines() if x.strip()]
         else:
             c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                year = st.number_input("年", min_value=2020, max_value=2035, value=2026, step=1)
-            with c2:
-                place_name = st.selectbox("競馬場", list(PLACE_CODE_MAP.keys()),
-                                          index=list(PLACE_CODE_MAP.keys()).index("東京"))
-            with c3:
-                kai = st.number_input("開催回", min_value=1, max_value=10, value=2, step=1)
-            with c4:
-                nichiji_text = st.text_input("日次（カンマ区切り）", value="1,2")
+            yr  = c1.number_input("年にゃ", 2020, 2035, date.today().year)
+            pn  = c2.selectbox("競馬場にゃ", list(PLACE_CODE_MAP.keys()))
+            kai = c3.number_input("開催回にゃ", 1, 10, 2)
+            nt  = c4.text_input("日次（カンマ区切り）にゃ", "1,2")
             c5, c6 = st.columns(2)
-            with c5:
-                race_start = st.number_input("開始R", min_value=1, max_value=12, value=1, step=1)
-            with c6:
-                race_end = st.number_input("終了R", min_value=1, max_value=12, value=12, step=1)
-            nichiji_list = [int(x.strip()) for x in nichiji_text.split(",") if x.strip().isdigit()]
-            race_items = build_race_ids(int(year), place_name, int(kai), nichiji_list,
-                                        int(race_start), int(race_end))
-        st.write("取得予定レース数:", len(race_items))
-        with st.expander("取得予定race_id"):
-            st.write([extract_race_id(x) for x in race_items if extract_race_id(x)])
-        sleep_sec = st.slider("アクセス間隔（秒）", min_value=0.2, max_value=3.0, value=0.8, step=0.1)
+            rs  = c5.number_input("開始Rにゃ", 1, 12, 1)
+            re_ = c6.number_input("終了Rにゃ", 1, 12, 12)
+            nl  = [int(x.strip()) for x in nt.split(",") if x.strip().isdigit()]
+            race_items = build_race_ids(int(yr), pn, int(kai), nl, int(rs), int(re_))
+        st.write(f"取得予定にゃ: {len(race_items)}レースにゃ")
+        update_odds = st.checkbox("リアルタイムオッズを取得するにゃ", value=True, key="upd2")
+        sleep_sec   = st.slider("アクセス間隔（秒）にゃ", 0.5, 3.0, 1.2, 0.1, key="sl2")
 
-    elif input_method == "出馬表CSV":
-        uploaded_csv = st.file_uploader("予想CSVをアップロード", type=["csv"])
-        st.caption("TARGET 52列CSV、または簡易CSVを使えます。")
+    elif input_method == INPUT_CSV_SELECT:
+        st.caption("data/ フォルダに置いたCSVを選ぶだけで予想できるにゃ🐾")
+        preloaded_paths = list_preloaded_csv_files()
+        if not preloaded_paths:
+            st.warning("dataフォルダにCSVがないにゃ")
+        else:
+            labels = [make_preloaded_file_label(p) for p in preloaded_paths]
+            mode = st.radio(
+                "読み込み方法にゃ",
+                ["1レースだけ選ぶにゃ", "全部まとめて読むにゃ"],
+                horizontal=True, index=0
+            )
+            if mode == "1レースだけ選ぶにゃ":
+                sl = st.selectbox("CSVを選択にゃ", labels)
+                selected_preloaded_paths = [preloaded_paths[labels.index(sl)]]
+            else:
+                selected_preloaded_paths = preloaded_paths
+                st.info(f"全{len(preloaded_paths)}件を読みますにゃ")
+            with st.expander("検出したCSVにゃ"):
+                st.write([p.name for p in preloaded_paths])
 
-    else:
+    elif input_method == INPUT_CSV_UPLOAD:
+        uploaded_csv = st.file_uploader("予想CSVをアップロードにゃ", type=["csv"])
+        st.caption("TARGET 52列CSV、または簡易CSVを使えるにゃ🐾")
+
+    else:  # INPUT_NETKEIBA_URL
         race_url = st.text_input(
-            "netkeiba 出馬表URL",
+            "netkeiba 出馬表URLにゃ",
             placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=202605020111"
         )
 
-    if input_method == "事前CSVから選択" and not selected_preloaded_paths:
-        st.info("dataフォルダにCSVを置くか、事前CSVを選択してください。")
-        return
-    if input_method == "netkeiba一括取得→そのまま予想" and not race_items:
-        st.info("race_id/URLを入力するか、開催情報を指定してください。")
-        return
-    if input_method == "出馬表CSV" and uploaded_csv is None:
-        st.info("出馬表CSVをアップロードしてください。")
-        return
-    if input_method == "netkeiba URL単発" and not (race_url and race_url.strip()):
-        st.info("netkeiba 出馬表URLを入力してください。")
-        return
+    # ── 入力チェックにゃ ──
+    if input_method == INPUT_NETKEIBA_AUTO and not target_date:
+        st.info("日付を設定するにゃ🐾"); return
+    if input_method == INPUT_NETKEIBA_ID and not race_items:
+        st.info("race_idを入力するにゃ🐾"); return
+    if input_method == INPUT_CSV_SELECT and not selected_preloaded_paths:
+        st.info("dataフォルダにCSVを置くか選択するにゃ🐾"); return
+    if input_method == INPUT_CSV_UPLOAD and uploaded_csv is None:
+        st.info("CSVをアップロードするにゃ🐾"); return
+    if input_method == INPUT_NETKEIBA_URL and not race_url.strip():
+        st.info("URLを入力するにゃ🐾"); return
 
-    if st.button("予想する", type="primary"):
+    # ── 予想ボタンにゃ ──
+    if st.button("🐾 予想するにゃ！", type="primary"):
         try:
             bundle, model_status = load_model_safely(uploaded_model)
             if bundle is None:
-                st.error("学習済みモデルPKLがありません。")
+                st.error("PKLがないにゃ！アップロードが必要にゃ🐾")
                 return
-            st.success(f"モデル読込: {model_status} / モード: {strategy_mode}")
+            st.success(f"モデル読込にゃ: {model_status} / モードにゃ: {strategy_mode}")
 
-            if input_method == "事前CSVから選択":
-                with st.spinner("事前CSVを読み込み中..."):
-                    pred_src = load_many_preloaded_entry_csv(selected_preloaded_paths, csv_mode)
-                st.success(f"取得: {pred_src['race_key'].nunique()}レース / {len(pred_src)}頭")
+            # ── データ取得にゃ ──
+            with st.spinner("データを取得中にゃ...🐾"):
+                if input_method == INPUT_NETKEIBA_AUTO:
+                    try:
+                        race_ids_today = fetch_today_race_ids(target_date)
+                        if not race_ids_today:
+                            st.error(f"{target_date}にレースが見つからなかったにゃ🐾")
+                            return
+                        st.success(f"{len(race_ids_today)}レースを発見したにゃ🐾")
+                        pred_src, errors = fetch_many_races(
+                            race_ids_today, sleep_sec=sleep_sec, update_odds=update_odds)
+                        if pred_src.empty:
+                            st.error("取得できなかったにゃ🐾")
+                            return
+                        if errors:
+                            st.warning(f"取得失敗にゃ: {len(errors)}件にゃ")
+                            st.dataframe(pd.DataFrame(errors))
+                    except Exception as e:
+                        st.error(f"自動取得エラーにゃ: {e}にゃ")
+                        st.info(
+                            "💡 ヒントにゃ: netkeibaはIP制限があるにゃ。\n"
+                            "- 開催日当日の朝〜夕方に試すにゃ\n"
+                            "- 代わりにCSVアップロードを使うにゃ"
+                        )
+                        return
 
-            elif input_method == "netkeiba一括取得→そのまま予想":
-                with st.spinner("netkeibaから一括取得中..."):
-                    pred_src, fetch_errors = fetch_many_netkeiba_to_52cols(race_items, sleep_sec=sleep_sec)
-                if pred_src.empty:
-                    st.error("1レースも取得できませんでした。")
-                    if not fetch_errors.empty:
-                        st.dataframe(fetch_errors, use_container_width=True, hide_index=True)
-                    return
-                st.success(f"取得: {pred_src['race_key'].nunique()}レース / {len(pred_src)}頭")
-                if not fetch_errors.empty:
-                    st.warning(f"取得失敗: {len(fetch_errors)}件")
-                    st.dataframe(fetch_errors, use_container_width=True, hide_index=True)
+                elif input_method == INPUT_NETKEIBA_ID:
+                    pred_src, errors = fetch_many_races(
+                        race_items, sleep_sec=sleep_sec, update_odds=update_odds)
+                    if pred_src.empty:
+                        st.error("取得できなかったにゃ🐾")
+                        return
+                    if errors:
+                        st.warning(f"取得失敗にゃ: {len(errors)}件にゃ")
+                        st.dataframe(pd.DataFrame(errors))
 
-            elif input_method == "netkeiba URL単発":
-                pred_src = fetch_netkeiba_race_to_52cols(race_url.strip())
-                st.success("netkeiba URLから取得しました。")
+                elif input_method == INPUT_CSV_SELECT:
+                    pred_src = load_many_preloaded_entry_csv(
+                        selected_preloaded_paths, csv_mode)
+                    st.success(f"取得にゃ: {pred_src['race_key'].nunique()}レース / {len(pred_src)}頭にゃ")
 
-            else:
-                pred_src = load_uploaded_entry_csv(uploaded_csv, csv_mode)
-                st.success("CSVから取得しました。")
+                elif input_method == INPUT_CSV_UPLOAD:
+                    pred_src = load_uploaded_entry_csv(uploaded_csv, csv_mode)
+                    st.success("CSVから取得したにゃ🐾")
 
+                else:  # INPUT_NETKEIBA_URL
+                    pred_src = fetch_netkeiba_race_to_52cols(race_url.strip())
+                    st.success("URLから取得したにゃ🐾")
+
+            # 出馬表DLにゃ
             export_simple = convert_52_to_simple_export(pred_src)
             st.download_button(
-                "読み込んだ出馬表CSV",
-                data=export_simple.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                "📥 出馬表CSVにゃ",
+                data=export_simple.to_csv(
+                    index=False, encoding="utf-8-sig").encode("utf-8-sig"),
                 file_name="entry_races.csv", mime="text/csv",
             )
 
+            # TARGET特徴量結合にゃ
             pred_src = merge_target_features(pred_src)
             if TARGET_CSV_PATH.exists():
                 try:
-                    _, _features_check = load_target_features_cached()
-                    if _features_check:
-                        st.success("TARGET過去CSV（yosou.csv）を結合しました。")
+                    _, fc_check = load_target_features_cached()
+                    if fc_check:
+                        st.success("TARGET CSV結合済みにゃ🐾")
                     else:
-                        st.info("yosou.csv はありますが着順なし→補正なしで予想します。")
+                        st.info("yosou.csv: 着順なし→補正なしにゃ")
                 except Exception:
-                    st.info("yosou.csv は利用できないため出馬表単体で予想します。")
+                    st.info("yosou.csv利用不可→出馬表単体にゃ")
             else:
-                st.info("TARGET過去CSV（yosou.csv）は未配置です。出馬表単体で予想します。")
+                st.info("TARGET CSV未配置→出馬表単体にゃ")
 
-            pred_df = predict(bundle, pred_src, strategy_mode=strategy_mode)
-            st.success(f"予想完了: {len(pred_df)}頭 [{strategy_mode}]")
+            # 予想にゃ
+            with st.spinner("AI予測中にゃ...🐾"):
+                pred_df = predict(bundle, pred_src, strategy_mode=strategy_mode)
+            st.success(f"予想完了にゃ: {len(pred_df)}頭 [{strategy_mode}]にゃ🐾")
 
+            # ── 予想結果表示にゃ ──
             st.markdown("---")
-            st.subheader("予想結果")
+            st.subheader("予想結果にゃ🐾")
             show_df = pred_df.sort_values(
-                ["race_key", "ml_rank"] if "race_key" in pred_df.columns else ["ml_rank"])
+                ["race_key", "ml_rank"]
+                if "race_key" in pred_df.columns else ["ml_rank"]
+            )
             try:
                 view = jp_view(show_df, include_race_key=False)
             except Exception:
                 view = show_df
             st.dataframe(view, use_container_width=True, hide_index=True)
             try:
-                csv_bytes = view.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-                st.download_button("予想結果CSV", data=csv_bytes,
-                                   file_name="nyanko_prediction_result.csv", mime="text/csv",
-                                   key="download_prediction_result")
-            except Exception as e:
-                st.caption(f"CSVダウンロード生成をスキップ: {e}")
+                st.download_button(
+                    "📥 予想結果CSVにゃ",
+                    data=view.to_csv(
+                        index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                    file_name="nyanko_v26_result.csv", mime="text/csv",
+                    key="dl_result"
+                )
+            except Exception:
+                pass
 
+            # 買い目候補にゃ
             show_bets(pred_df, key_prefix="main_bets", strategy_mode=strategy_mode)
 
+            # ── レース詳細にゃ ──
             st.markdown("---")
-            st.subheader("レース詳細")
+            st.subheader("レース詳細にゃ🐾")
             race_options = (
-                pred_df[["race_key", "race_label"]].drop_duplicates().sort_values("race_label")
+                pred_df[["race_key", "race_label"]]
+                .drop_duplicates()
+                .sort_values("race_label")
             )
-            label_map = dict(zip(race_options["race_label"], race_options["race_key"]))
-            selected_label = st.selectbox("レース選択", list(label_map.keys()))
-            selected_race = label_map[selected_label]
+            label_map = dict(
+                zip(race_options["race_label"], race_options["race_key"]))
+            selected_label = st.selectbox("レース選択にゃ", list(label_map.keys()))
+            selected_race  = label_map[selected_label]
 
             race_df = pred_df[pred_df["race_key"] == selected_race].sort_values(
-                ["ml_rank", "value_score", "horse_no"], ascending=[True, False, True])
+                ["ml_rank", "value_score", "horse_no"],
+                ascending=[True, False, True]
+            )
             st.dataframe(jp_view(race_df), use_container_width=True, hide_index=True)
 
-            # レース質分析表示
+            # レース質分析にゃ
             st.markdown("---")
             race_quality = analyze_race_quality(race_df)
-            st.markdown(f"#### 🏟️ レース質分析: **{race_quality['type']}**")
+            st.markdown(f"#### 🏟️ レース質分析にゃ: **{race_quality['type']}**")
             if race_quality["advice"]:
                 st.info(race_quality["advice"])
             col_q1, col_q2, col_q3, col_q4 = st.columns(4)
-            col_q1.metric("最低オッズ", f"{race_quality['min_odds']:.1f}倍")
-            col_q2.metric("オッズ標準偏差", f"{race_quality['odds_std']:.1f}")
-            col_q3.metric("レースタイプ", race_quality['type'])
-            col_q4.metric("推奨フォーカス", race_quality.get('rec_bet_focus', '-'))
+            col_q1.metric("最低オッズにゃ", f"{race_quality['min_odds']:.1f}倍")
+            col_q2.metric("オッズ標準偏差にゃ", f"{race_quality['odds_std']:.1f}")
+            col_q3.metric("レースタイプにゃ", race_quality["type"])
+            col_q4.metric("推奨フォーカスにゃ",
+                          race_quality.get("rec_bet_focus", "-"))
 
-            # 推奨購入点数ダッシュボード
+            # 推奨購入点数にゃ
             st.markdown("---")
             rec = calc_recommended_tickets(race_df, strategy_mode=strategy_mode)
-            st.markdown("#### 📈 推奨購入点数ダッシュボード")
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("推奨点数", f"{rec['推奨点数']}点")
-            m2.metric("Kelly正(複勝)", f"{rec['Kelly正(複勝)']}頭")
-            m3.metric("Kelly正(三連複)", f"{rec['Kelly正(三連複)']}頭")
-            m4.metric("買い候補馬数", f"{rec['買い候補馬数']}頭")
-            key5 = [k for k in rec.keys() if "的中率" in k]
-            if key5:
-                m5.metric(key5[0], rec[key5[0]])
+            st.markdown("#### 📈 推奨購入点数ダッシュボードにゃ")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("推奨点数にゃ", f"{rec['推奨点数']}点")
+            m2.metric("Kelly正馬数にゃ", f"{rec.get('Kelly正馬数', rec.get('Kelly正(複勝)', 0))}頭")
+            m3.metric("買い候補馬数にゃ", f"{rec['買い候補馬数']}頭")
+            key4 = [k for k in rec if "的中率" in k]
+            if key4:
+                m4.metric(key4[0], rec[key4[0]])
 
+            # 本命にゃ
             tickets = make_tickets(race_df)
             c1, c2, c3 = st.columns(3)
-            c1.metric("本命", tickets["本命"])
-            c2.metric("単勝", tickets["単勝"])
-            c3.metric("複勝", tickets["複勝"])
+            c1.metric("本命にゃ", tickets["本命"])
+            c2.metric("単勝にゃ",  tickets["単勝"])
+            c3.metric("複勝にゃ",  tickets["複勝"])
 
+            # EV乖離にゃ
+            st.markdown("---")
             show_ev_ranking(race_df)
 
+            # 三連複にゃ
             st.markdown("---")
             show_sanrenpuku_tabs(race_df, strategy_mode=strategy_mode)
 
+            # 馬券おすすめにゃ
             st.markdown("---")
             show_ticket_tabs(race_df, strategy_mode=strategy_mode)
 
-            # ============================================================
-            # 🧠 PKL本格AI分析ダッシュボード（HistGradientBoosting実測ベース）にゃ
-            # ============================================================
+            # 買い/見送り判定にゃ
+            st.markdown("---")
+            show_roi_strategy(race_df, strategy_mode=strategy_mode)
+
+            # 2モード比較にゃ
+            st.markdown("---")
+            st.subheader("📊 2モード比較にゃ")
+            cm1, cm2 = st.columns(2)
+            with cm1:
+                st.markdown("**💰 回収率重視にゃ**")
+                dr = add_value_strategy(
+                    race_df.copy(), strategy_mode=STRATEGY_MODE_ROI)
+                br = dr[dr["buy_flag"] == "買い"][[
+                    "horse_name", "buy_flag", "buy_reason",
+                    "kelly_ratio", "kelly_ratio_sanren"
+                ]]
+                st.dataframe(
+                    br.rename(columns=JP_COLUMNS),
+                    use_container_width=True, hide_index=True
+                )
+            with cm2:
+                st.markdown("**🏆 的中率重視にゃ**")
+                dh = add_value_strategy(
+                    race_df.copy(), strategy_mode=STRATEGY_MODE_HITRATE)
+                bh = dh[dh["buy_flag"] == "買い"][[
+                    "horse_name", "buy_flag", "buy_reason", "pivot_confidence"
+                ]]
+                st.dataframe(
+                    bh.rename(columns=JP_COLUMNS),
+                    use_container_width=True, hide_index=True
+                )
+
+            # 脚質にゃ
+            show_style_tabs(pred_df, race_df)
+
+            # 危険馬・穴候補にゃ
+            c4, c5 = st.columns(2)
+            c4.info(f"危険人気馬にゃ: {tickets.get('危険人気馬', 'なし')}")
+            c5.success(f"穴候補にゃ: {tickets.get('穴候補', 'なし')}")
+
+            # PKL本格AI分析にゃ
             try:
                 show_pkl_ai_dashboard(bundle, race_df)
             except Exception as _ai_err:
-                st.warning(f"AI分析でエラーが発生したにゃ: {_ai_err}")
-                import traceback
-                st.caption(traceback.format_exc())
+                st.warning(f"AI分析エラーにゃ: {_ai_err}にゃ")
 
-            show_roi_strategy(race_df, strategy_mode=strategy_mode)
-
-            # 2モード比較表示
+            # 全レースにゃ
             st.markdown("---")
-            st.subheader("📊 2モード比較（同一レース）")
-            st.caption("同じAIスコアから、モードによって買い判定がどう変わるか比較できます。")
-            col_roi, col_hit = st.columns(2)
-            with col_roi:
-                st.markdown("**💰 回収率重視**")
-                df_roi_compare = add_value_strategy(race_df.copy(), strategy_mode=STRATEGY_MODE_ROI)
-                buy_roi = df_roi_compare[df_roi_compare["buy_flag"] == "買い"][
-                    ["horse_name", "buy_flag", "buy_reason", "kelly_ratio", "kelly_ratio_sanren"]]
-                st.dataframe(buy_roi.rename(columns=JP_COLUMNS), use_container_width=True, hide_index=True)
-            with col_hit:
-                st.markdown("**🏆 的中率重視**")
-                df_hit_compare = add_value_strategy(race_df.copy(), strategy_mode=STRATEGY_MODE_HITRATE)
-                buy_hit = df_hit_compare[df_hit_compare["buy_flag"] == "買い"][
-                    ["horse_name", "buy_flag", "buy_reason", "pivot_confidence"]]
-                st.dataframe(buy_hit.rename(columns=JP_COLUMNS), use_container_width=True, hide_index=True)
-
-            show_style_tabs(pred_df, race_df)
-
-            c4, c5 = st.columns(2)
-            c4.info(f"危険人気馬: {tickets.get('危険人気馬', 'なし')}")
-            c5.success(f"穴候補: {tickets.get('穴候補', 'なし')}")
-
-            st.subheader("全レース")
-            all_jp = jp_view(pred_df.sort_values(["race_key", "ml_rank"]), include_race_key=True)
+            st.subheader("全レースにゃ🐾")
+            all_jp = jp_view(
+                pred_df.sort_values(["race_key", "ml_rank"]),
+                include_race_key=True
+            )
             st.dataframe(all_jp, use_container_width=True, hide_index=True)
-            csv_bytes = all_jp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button("日本語CSVダウンロード", data=csv_bytes,
-                               file_name="nyanko_keiba_prediction_jp.csv", mime="text/csv")
+            st.download_button(
+                "📥 全レース予想CSVにゃ",
+                data=all_jp.to_csv(
+                    index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="nyanko_v26_all.csv", mime="text/csv"
+            )
 
         except Exception as e:
-            st.error(f"予想できませんでした: {e}")
-            st.exception(e)
+            st.error(f"予想できなかったにゃ: {e}にゃ🐾")
+            with st.expander("エラー詳細にゃ"):
+                import traceback
+                st.code(traceback.format_exc())
 
     st.divider()
-    with st.expander("簡易CSVテンプレ（v25対応）"):
-        st.caption("日付列を入れると正しい日付でレースが識別されます。")
+    with st.expander("簡易CSVテンプレにゃ（v26対応にゃ）"):
+        st.caption("日付列を入れると正しい日付でレースが識別されるにゃ🐾")
         st.code(
-            "日付,馬番,馬名,性別,年齢,騎手,斤量,オッズ,人気,競馬場,レース番号,レース名,距離,馬場,頭数,芝ダ\n"
-            "20260510,1,サンプルホースA,牡,5,サンプル騎手A,58.0,2.8,1,東京,11,サンプルレース,2000,良,18,芝\n"
-            "20260510,2,サンプルホースB,牝,4,サンプル騎手B,56.0,8.5,5,東京,11,サンプルレース,2000,良,18,芝\n",
+            "日付,馬番,馬名,性別,年齢,騎手,斤量,オッズ,人気,競馬場,"
+            "レース番号,レース名,距離,馬場,頭数,芝ダ\n"
+            "20260510,1,サンプルAにゃ,牡,5,騎手Aにゃ,58.0,2.8,1,"
+            "東京,11,サンプルにゃ,2000,良,18,芝\n"
+            "20260510,2,サンプルBにゃ,牝,4,騎手Bにゃ,56.0,8.5,5,"
+            "東京,11,サンプルにゃ,2000,良,18,芝\n",
             language="csv"
         )
-        st.caption("日付列なしでも動作します（実行日付が自動で入ります）。")
 
 
 try:

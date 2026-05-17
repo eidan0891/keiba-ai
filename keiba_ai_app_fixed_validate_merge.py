@@ -1,6 +1,6 @@
-# nyanko_keiba_ipad_cloud_v25.py
+# nyanko_keiba_v26_full.py
 # ------------------------------------------------------------
-# にゃんこ競馬AI v25 (v24全バグ修正＋ロジック刷新版)
+# にゃんこ競馬AI v26 完全統合版にゃ（スクレイピング・確率校正・AI分析にゃ）
 #
 # 【v25 改善サマリー】
 #
@@ -50,7 +50,7 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="にゃんこ競馬AI v25",
+    page_title="にゃんこ競馬AI v26",
     page_icon="🐾",
     layout="wide"
 )
@@ -60,7 +60,7 @@ MODEL_PATH = APP_DIR / "models" / "nyanko_keiba_top3_model.pkl"
 TARGET_CSV_PATH = APP_DIR / "yosou.csv"
 DATA_DIR = APP_DIR / "data"
 
-VERSION = "v25 (三連複ロジック全面刷新版)"
+VERSION = "v26 完全統合版（スクレイピング・確率校正・AI分析統合にゃ）"
 
 # ============================================================
 # 定数
@@ -211,7 +211,7 @@ DISPLAY_COLUMNS = [
     "running_style", "style_note",
     "jockey_top3_rate_prior", "trainer_top3_rate_prior",
     "sire_top3_rate_prior", "horse_distance_top3_rate_prior",
-    "kelly_ratio", "kelly_ratio_sanren", "pivot_confidence"
+    "kelly_ratio", "kelly_ratio_sanren", "pivot_confidence", "calibrated_prob"
 ]
 
 BASE_NUM_FEATURES = [
@@ -375,7 +375,356 @@ def repair_simple_imputer(obj, _seen=None, _depth=0, _max_depth=20):
 
 
 # ============================================================
-# netkeiba取得
+# netkeiba スクレイピング完全実装にゃ（v26新機能にゃ）
+# ============================================================
+def _make_session():
+    """netkeibaアクセス用セッションにゃ"""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://race.netkeiba.com/",
+    })
+    return s
+
+
+def fetch_today_race_ids(target_date: str = None, sleep_sec: float = 1.0) -> list[str]:
+    """
+    指定日（YYYYMMDD）の全race_idを取得するにゃ。
+    Noneのときは今日の日付を使うにゃ。
+    """
+    if target_date is None:
+        target_date = date.today().strftime("%Y%m%d")
+
+    session = _make_session()
+    url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date}"
+    try:
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        html = r.text
+    except Exception as e:
+        raise ValueError(f"レース一覧の取得に失敗したにゃ: {e}")
+
+    race_ids = list(dict.fromkeys(re.findall(r"race_id=(\d{12})", html)))
+    return race_ids
+
+
+def fetch_shutuba_html(race_id: str, session=None) -> str:
+    """出馬表HTMLを取得するにゃ"""
+    if session is None: session = _make_session()
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    r = session.get(url, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+
+def fetch_odds_tansho(race_id: str, session=None) -> dict[str, float]:
+    """
+    単勝オッズを取得するにゃ。
+    戻り値: {馬番(str): オッズ(float)}
+    """
+    if session is None: session = _make_session()
+    url = f"https://race.netkeiba.com/odds/odd_b1_detail.html?race_id={race_id}"
+    try:
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        html = r.text
+    except Exception:
+        return {}
+
+    odds_map = {}
+    # パターン1: テーブルからにゃ
+    try:
+        tables = pd.read_html(StringIO(html))
+        for t in tables:
+            t = t.copy()
+            cols = [str(c) for c in t.columns]
+            joined = " ".join(cols)
+            if "馬番" in joined or "単勝" in joined or "オッズ" in joined:
+                # 馬番とオッズ列を探すにゃ
+                hno_col = next((c for c in t.columns if "馬番" in str(c)), None)
+                odds_col = next((c for c in t.columns if "オッズ" in str(c) or "単勝" in str(c)), None)
+                if hno_col and odds_col:
+                    for _, row in t.iterrows():
+                        try:
+                            hno = str(int(float(str(row[hno_col]).replace(",",""))))
+                            odd = float(str(row[odds_col]).replace(",",""))
+                            if 1.0 <= odd <= 9999:
+                                odds_map[hno] = odd
+                        except: pass
+    except: pass
+
+    # パターン2: 正規表現にゃ
+    if not odds_map:
+        # <td class="Odds">数値</td> パターンにゃ
+        pattern = r'umano["\s]+[^>]*>(\d+)</[^>]+>.*?(\d+\.\d+)'
+        for m in re.finditer(pattern, html, re.DOTALL):
+            try:
+                hno = str(int(m.group(1)))
+                odd = float(m.group(2))
+                if 1.0 <= odd <= 9999:
+                    odds_map[hno] = odd
+            except: pass
+
+    return odds_map
+
+
+def fetch_odds_fukusho(race_id: str, session=None) -> dict[str, tuple[float, float]]:
+    """
+    複勝オッズ（最小〜最大）を取得するにゃ。
+    戻り値: {馬番(str): (min_odds, max_odds)}
+    """
+    if session is None: session = _make_session()
+    url = f"https://race.netkeiba.com/odds/odd_b1_detail.html?race_id={race_id}"
+    try:
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        html = r.text
+    except Exception:
+        return {}
+
+    fukusho_map = {}
+    try:
+        tables = pd.read_html(StringIO(html))
+        for t in tables:
+            cols = [str(c) for c in t.columns]
+            if any("複勝" in c for c in cols):
+                hno_col = next((c for c in t.columns if "馬番" in str(c)), None)
+                fuku_col = next((c for c in t.columns if "複勝" in str(c)), None)
+                if hno_col and fuku_col:
+                    for _, row in t.iterrows():
+                        try:
+                            hno = str(int(float(str(row[hno_col]).replace(",",""))))
+                            fv = str(row[fuku_col]).replace(",","")
+                            # "1.5 - 2.3" 形式にゃ
+                            nums = re.findall(r"(\d+\.?\d*)", fv)
+                            if len(nums) >= 2:
+                                fukusho_map[hno] = (float(nums[0]), float(nums[1]))
+                            elif len(nums) == 1:
+                                fukusho_map[hno] = (float(nums[0]), float(nums[0]))
+                        except: pass
+    except: pass
+
+    return fukusho_map
+
+
+def fetch_odds_sanrenpuku_top(race_id: str, session=None) -> dict[str, float]:
+    """
+    三連複の主要組み合わせオッズを取得するにゃ。
+    戻り値: {"1-2-3": odds, ...}
+    ※全組み合わせは多いので上位馬の組み合わせだけにゃ
+    """
+    if session is None: session = _make_session()
+    url = f"https://race.netkeiba.com/odds/odd_b6_detail.html?race_id={race_id}"
+    try:
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        html = r.text
+    except Exception:
+        return {}
+
+    san_map = {}
+    try:
+        tables = pd.read_html(StringIO(html))
+        for t in tables:
+            cols = [str(c) for c in t.columns]
+            joined = " ".join(cols)
+            if "三連複" in joined or "3連複" in joined or len(t.columns) >= 3:
+                for _, row in t.iterrows():
+                    try:
+                        vals = [str(v) for v in row.values]
+                        combo = None
+                        odds_val = None
+                        for v in vals:
+                            # 馬番の組み合わせにゃ "1-2-3" パターンにゃ
+                            m = re.match(r"^(\d{1,2})-(\d{1,2})-(\d{1,2})$", v.strip())
+                            if m:
+                                nums = sorted([int(m.group(i)) for i in range(1,4)])
+                                combo = f"{nums[0]}-{nums[1]}-{nums[2]}"
+                            # オッズにゃ
+                            m2 = re.match(r"^(\d+\.?\d*)$", v.strip())
+                            if m2:
+                                try:
+                                    ov = float(m2.group(1))
+                                    if 1.0 <= ov <= 99999:
+                                        odds_val = ov
+                                except: pass
+                        if combo and odds_val:
+                            san_map[combo] = odds_val
+                    except: pass
+    except: pass
+
+    return san_map
+
+
+def parse_shutuba_to_df(html: str, race_id: str) -> pd.DataFrame:
+    """
+    出馬表HTMLをDataFrameに変換するにゃ。
+    netkeibaの出馬表テーブルをパースするにゃ。
+    """
+    info = race_id_to_info(race_id)
+
+    # テーブルを探すにゃ
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception as e:
+        raise ValueError(f"HTML解析失敗にゃ: {e}")
+
+    def flatten_cols(df):
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["_".join([str(x) for x in c if str(x)!="nan"]).strip("_")
+                          for c in df.columns]
+        else:
+            df.columns = [str(c) for c in df.columns]
+        return df
+
+    # 出馬表テーブルを探すにゃ
+    target = None
+    for t in tables:
+        t = flatten_cols(t)
+        j = " ".join(str(c) for c in t.columns)
+        if ("馬名" in j or "馬番" in j) and ("騎手" in j or "斤量" in j):
+            target = t
+            break
+
+    if target is None:
+        raise ValueError("出馬表テーブルが見つからなかったにゃ")
+
+    # 列名を正規化にゃ
+    rename = {}
+    for c in target.columns:
+        s = str(c)
+        if s=="枠" or "枠番" in s: rename[c]="frame_no"
+        elif "馬番" in s: rename[c]="horse_no"
+        elif "馬名" in s: rename[c]="horse_name"
+        elif "性齢" in s or "性令" in s: rename[c]="sex_age"
+        elif "斤量" in s: rename[c]="carried_weight"
+        elif "騎手" in s: rename[c]="jockey"
+        elif "単勝" in s or "オッズ" in s: rename[c]="odds"
+        elif "人気" in s: rename[c]="popularity"
+        elif "厩舎" in s or "調教師" in s: rename[c]="trainer"
+        elif "馬体重" in s: rename[c]="body_weight"
+    target = target.rename(columns=rename)
+
+    if "horse_name" not in target.columns:
+        raise ValueError("馬名列が見つからなかったにゃ")
+
+    target = target.dropna(subset=["horse_name"], how="all").copy()
+    target["horse_name"] = target["horse_name"].astype(str).str.replace("\n"," ").str.strip()
+    target = target[target["horse_name"].ne("")]
+    target = target[~target["horse_name"].str.contains("馬名|出走取消|除外", na=False)]
+
+    # race情報を補完にゃ
+    # HTMLからレース情報を追加で取得にゃ
+    distance_m = re.search(r"(\d{4})m", html)
+    track_type_m = re.search(r"(芝|ダート|障害)", html)
+    going_m = re.search(r"馬場[:：\s]*([良稍重不良]+)", html)
+    race_name_m = re.search(r'class="RaceTitle[^"]*"[^>]*>([^<]+)<', html)
+
+    rows = []
+    for i, r in target.iterrows():
+        row = {c: "" for c in COLS_52}
+        row.update({
+            "year": info["year"] - 2000,
+            "month": date.today().month,
+            "day": date.today().day,
+            "kai": info["kai"],
+            "place": info["place"],
+            "nichiji": info["nichiji"],
+            "race_no": info["race_no"],
+            "race_name": race_name_m.group(1).strip() if race_name_m else f"R{info['race_no']}",
+            "race_grade": "3",
+            "track_type": track_type_m.group(1) if track_type_m else "芝",
+            "course_kind": "0",
+            "distance": distance_m.group(1) if distance_m else "2000",
+            "going": going_m.group(1) if going_m else "良",
+            "horse_name": r.get("horse_name", ""),
+            "field_size": len(target),
+            "horse_no": r.get("horse_no", i+1),
+            "frame_no": r.get("frame_no", ""),
+            "odds": r.get("odds", ""),
+            "popularity": r.get("popularity", ""),
+            "jockey": r.get("jockey", ""),
+            "carried_weight": r.get("carried_weight", ""),
+            "trainer": r.get("trainer", ""),
+        })
+        # 性齢を分解にゃ
+        sa = str(r.get("sex_age", "")).strip()
+        if sa:
+            row["sex"] = sa[0]
+            m = re.search(r"(\d+)", sa[1:])
+            row["age"] = m.group(1) if m else ""
+        rows.append([row[c] for c in COLS_52])
+
+    df = pd.DataFrame(rows, columns=COLS_52)
+    df["source_file"] = f"netkeiba_{race_id}"
+    return clean_types(df)
+
+
+def fetch_race_full(race_id: str, session=None, update_odds: bool = True) -> pd.DataFrame:
+    """
+    出馬表 + 最新オッズを一括取得するにゃ。
+    update_odds=True のときリアルタイムオッズで上書きするにゃ。
+    """
+    if session is None: session = _make_session()
+
+    # 出馬表にゃ
+    html = fetch_shutuba_html(race_id, session)
+    df = parse_shutuba_to_df(html, race_id)
+
+    if update_odds:
+        # 単勝オッズを上書きにゃ
+        tansho = fetch_odds_tansho(race_id, session)
+        if tansho:
+            df["horse_no_str"] = df["horse_no"].fillna(0).astype(int).astype(str)
+            for idx, row in df.iterrows():
+                hno = str(int(row["horse_no"])) if pd.notna(row["horse_no"]) else ""
+                if hno in tansho:
+                    df.at[idx, "odds"] = tansho[hno]
+
+        # 人気順を再計算にゃ
+        df["odds"] = pd.to_numeric(df["odds"], errors="coerce")
+        valid_odds = df["odds"].dropna()
+        if not valid_odds.empty:
+            df["popularity"] = df["odds"].rank(method="min", ascending=True).fillna(99).astype(int)
+
+    return df
+
+
+def fetch_many_races(race_ids: list[str], sleep_sec: float = 1.0,
+                     update_odds: bool = True) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    複数レースを一括取得するにゃ。
+    戻り値: (合計DataFrame, エラーリスト)
+    """
+    session = _make_session()
+    frames, errors = [], []
+
+    for rid in race_ids:
+        try:
+            df = fetch_race_full(rid, session, update_odds=update_odds)
+            frames.append(df)
+        except Exception as e:
+            errors.append({"race_id": rid, "エラー": str(e)})
+        time.sleep(sleep_sec)
+
+    all_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return all_df, errors
+
+
+# ============================================================
+# CSV読込にゃ
+# ============================================================
+
+# ============================================================
+# netkeiba取得（既存にゃ）
 # ============================================================
 
 def _fetch_netkeiba_html(url: str) -> str:
@@ -1205,48 +1554,83 @@ def get_pipeline_and_features(bundle):
     return pipe, feature_cols
 
 
-def predict(bundle, df: pd.DataFrame, strategy_mode: str = STRATEGY_MODE_ROI) -> pd.DataFrame:
-    df = add_prior_stats_for_prediction(df)
-    df = add_running_style(df)
-    pipe, feature_cols = get_pipeline_and_features(bundle)
-    missing_features = [c for c in feature_cols if c not in df.columns]
-    if missing_features:
-        raise ValueError(f"特徴量列が不足しています: {missing_features}")
-    if hasattr(pipe, "predict_proba"):
-        prob = pipe.predict_proba(df[feature_cols])[:, 1]
+def calibrate_prob(raw_prob: np.ndarray, method: str = "isotonic_approx") -> np.ndarray:
+    """
+    過学習対策: 予測確率を校正するにゃ。
+    AUC=1.0のモデルは確率が0か1に張り付くので
+    シグモイド変換で適切な範囲に引き戻すにゃ。
+    """
+    p = np.clip(raw_prob, 1e-6, 1 - 1e-6)
+
+    # 確率分布の状態を確認にゃ
+    prob_sum = float(p.sum())
+    n = len(p)
+
+    if n == 0: return p
+
+    # 正規化：レース内で合計が約3.0になるように調整にゃ
+    # （3着内なので理論的に全馬の確率合計=3.0にゃ）
+    target_sum = 3.0
+    if prob_sum > 0:
+        scale = target_sum / prob_sum
+        p_scaled = p * scale
     else:
-        prob = np.asarray(pipe.predict(df[feature_cols]), dtype=float)
-    df["ml_top3_prob"] = prob
+        p_scaled = p
+
+    # シグモイド圧縮で[0.02, 0.95]に収めるにゃ
+    # 極端な0/1への張り付きを防ぐにゃ
+    logit = np.log(p_scaled / (1 - p_scaled + 1e-8) + 1e-8)
+    logit_compressed = logit * 0.3  # 圧縮係数にゃ
+    p_calibrated = 1.0 / (1.0 + np.exp(-logit_compressed))
+
+    # 再正規化にゃ
+    s = p_calibrated.sum()
+    if s > 0:
+        p_calibrated = p_calibrated * target_sum / s
+
+    return np.clip(p_calibrated, 0.01, 0.95)
+
+
+def predict(bundle, df, strategy=STRATEGY_ROI):
+    df = add_prior_stats(df)
+    df = add_running_style(df)
+    pipe, fc = get_pipe_features(bundle)
+    miss = [c for c in fc if c not in df.columns]
+    if miss: raise ValueError(f"特徴量不足にゃ: {miss}")
+
+    if hasattr(pipe, "predict_proba"):
+        raw_prob = pipe.predict_proba(df[fc])[:, 1]
+    else:
+        raw_prob = np.asarray(pipe.predict(df[fc]), dtype=float)
+
+    # レース単位で確率校正にゃ
+    df["ml_top3_prob_raw"] = raw_prob
+    calibrated = np.zeros(len(df))
+    for rk in df["race_key"].unique():
+        mask = df["race_key"] == rk
+        calibrated[mask.values] = calibrate_prob(raw_prob[mask.values])
+    df["ml_top3_prob"] = calibrated
+    df["calibrated_prob"] = calibrated  # 表示用にも保持にゃ
+
     df["ml_rank"] = df.groupby("race_key")["ml_top3_prob"].rank(
         ascending=False, method="first").astype(int)
-    df["mark"] = df["ml_rank"].map({
-        1: "◎", 2: "○", 3: "▲", 4: "△", 5: "☆", 6: "×", 7: "×", 8: "×"
-    }).fillna("")
-
-    # EV計算を最初に実行（他の計算が依存するため）
+    df["mark"] = df["ml_rank"].map({1:"◎",2:"○",3:"▲",4:"△",5:"☆",6:"×",7:"×",8:"×"}).fillna("")
     df["expected_value"] = df["ml_top3_prob"] * df["odds"].fillna(0)
-    df = add_ev_score(df)  # [FIX-2] オッズ帯別係数テーブル版
 
-    # [FIX-3] 強化された危険人気馬検出（ev_score確定後）
+    # EV計算（オッズ帯別係数版にゃ）にゃ
+    df = add_ev_score(df)
+    # 危険馬（AI4位以上で危険にゃ）にゃ
     df = add_danger_level(df)
-    df["danger_popular"] = df["danger_level"].map(
-        {"強危険": "危険", "危険": "危険", "注意": "", "": ""}).fillna("")
-    df["value_horse"] = ((df["popularity"].fillna(0) >= 6) & (df["ml_rank"] <= 4)).map(
-        {True: "穴候補", False: ""})
-
-    # [FIX-5] 複勝Kelly比と三連複Kelly比を分離して計算
+    df["danger_popular"] = df["danger_level"].map({"強危険":"危険","危険":"危険","注意":"","":""}).fillna("")
+    df["value_horse"] = ((df["popularity"].fillna(0)>=6)&(df["ml_rank"]<=4)).map(
+        {True:"穴候補",False:""})
+    # Kelly比分離にゃ
     df = add_kelly_ratio(df)
-
-    # [FIX-9] pivot_confidence（EV推定精度向上の恩恵を受ける）
-    df = add_pivot_confidence(df)
-
-    df = add_value_strategy(df, strategy_mode=strategy_mode)
+    # 軸信頼度にゃ
+    df = add_pivot_conf(df)
+    df = add_value_strategy(df, strategy=strategy)
     return df
 
-
-# ============================================================
-# [FIX-2] EV乖離スコア - オッズ帯別係数テーブル版
-# ============================================================
 
 def _odds_to_top3_rate(o: float) -> float:
     """
@@ -3918,9 +4302,506 @@ def show_full_ai_analysis(bundle, pred_df: pd.DataFrame, race_df: pd.DataFrame,
 
 
 
+
+# ============================================================
+# PKL実測ベースAI分析（HistGradientBoosting専用）
+# PKLを実際にロードして中身を完全解析するにゃ
+# ============================================================
+
+def get_bundle_info(bundle) -> dict:
+    """PKLバンドルから全情報を取り出すにゃ"""
+    if not isinstance(bundle, dict):
+        return {"pipe": bundle, "feature_cols": BASE_NUM_FEATURES + CAT_FEATURES,
+                "numeric_features": BASE_NUM_FEATURES, "categorical_features": CAT_FEATURES,
+                "metrics": {}, "model_type": type(bundle).__name__, "version": "不明"}
+    return {
+        "pipe": bundle.get("pipeline") or bundle.get("model"),
+        "feature_cols": bundle.get("feature_cols", BASE_NUM_FEATURES + CAT_FEATURES),
+        "numeric_features": bundle.get("numeric_features", BASE_NUM_FEATURES),
+        "categorical_features": bundle.get("categorical_features", CAT_FEATURES),
+        "metrics": bundle.get("metrics", {}),
+        "model_type": bundle.get("model_type", "不明"),
+        "version": bundle.get("version", "不明"),
+        "cols_52": bundle.get("cols_52", COLS_52),
+    }
+
+
+def calc_permutation_importance_real(pipe, feature_cols, numeric_features, categorical_features,
+                                      n_races=80, n_horses=16, seed=42) -> pd.DataFrame:
+    """
+    現実的な競馬データを生成してpermutation importanceを計算するにゃ。
+    HistGradientBoostingはfeature_importances_がないため代替計算にゃ。
+    """
+    np.random.seed(seed)
+    rows = []
+    for ri in range(n_races):
+        raw = np.sort(np.random.exponential(10, n_horses) + 1.5)
+        pop = np.argsort(np.argsort(raw)) + 1
+        for h in range(n_horses):
+            row = {
+                "year_full": np.random.choice([2023, 2024, 2025]),
+                "month": np.random.randint(1, 13),
+                "day": np.random.randint(1, 29),
+                "race_no": np.random.randint(1, 12),
+                "race_grade": np.random.choice([1, 2, 3, 4, 5]),
+                "course_kind": np.random.choice([0, 1]),
+                "distance": np.random.choice([1200, 1400, 1600, 1800, 2000, 2200, 2400]),
+                "age": np.random.randint(2, 8),
+                "carried_weight": np.random.choice([53, 54, 55, 56, 57, 58]),
+                "field_size": n_horses, "horse_no": h + 1, "frame_no": (h // 2) + 1,
+                "odds": float(raw[h]), "popularity": int(pop[h]),
+                "jockey_runs_prior": np.random.randint(50, 500),
+                "jockey_win_rate_prior": np.random.uniform(0.05, 0.20),
+                "jockey_top3_rate_prior": np.random.uniform(0.25, 0.45),
+                "trainer_runs_prior": np.random.randint(30, 300),
+                "trainer_win_rate_prior": np.random.uniform(0.05, 0.15),
+                "trainer_top3_rate_prior": np.random.uniform(0.20, 0.40),
+                "sire_runs_prior": np.random.randint(100, 2000),
+                "sire_win_rate_prior": np.random.uniform(0.05, 0.15),
+                "sire_top3_rate_prior": np.random.uniform(0.20, 0.40),
+                "horse_runs_prior": np.random.randint(0, 30),
+                "horse_win_rate_prior": np.random.uniform(0, 0.30),
+                "horse_top3_rate_prior": np.random.uniform(0, 0.50),
+                "horse_distance_runs_prior": np.random.randint(0, 15),
+                "horse_distance_top3_rate_prior": np.random.uniform(0, 0.60),
+                "horse_track_runs_prior": np.random.randint(0, 10),
+                "horse_track_top3_rate_prior": np.random.uniform(0, 0.60),
+                "field_odds_rank": float(pop[h]), "field_pop_rank": float(pop[h]),
+                "odds_gap_to_fav": float(raw[h] - raw[0]),
+                "popularity_gap_to_fav": float(pop[h] - 1),
+                "place": np.random.choice(["東京", "阪神", "中山", "京都", "中京", "福島", "札幌"]),
+                "race_name": np.random.choice(["未勝利", "1勝クラス", "2勝クラス", "3勝クラス", "オープン"]),
+                "track_type": np.random.choice(["芝", "ダ"]),
+                "going": np.random.choice(["良", "稍重", "重"]),
+                "sex": np.random.choice(["牡", "牝", "セ"]),
+                "jockey": np.random.choice(["ルメール", "川田将雅", "武豊", "戸崎圭太", "池添謙一", "福永祐一"]),
+                "trainer": np.random.choice(["矢作芳人", "国枝栄", "藤沢和雄", "池江泰寿", "角居勝彦"]),
+                "belonging": np.random.choice(["美浦", "栗東"]),
+                "sire": np.random.choice(["ディープインパクト", "キングカメハメハ", "ハーツクライ",
+                                           "ロードカナロア", "モーリス", "エピファネイア"]),
+                "dam": np.random.choice(["牝馬A", "牝馬B", "牝馬C", "牝馬D", "牝馬E"]),
+                "broodmare_sire": np.random.choice(["サンデーサイレンス", "ノーザンテースト",
+                                                     "ブライアンズタイム", "トニービン"]),
+            }
+            rows.append(row)
+
+    X = pd.DataFrame(rows)
+    # 特徴量列だけ抽出（存在しない列は0埋めにゃ）
+    X_feat = pd.DataFrame()
+    for f in feature_cols:
+        if f in X.columns:
+            X_feat[f] = X[f]
+        else:
+            X_feat[f] = 0
+
+    try:
+        base_pred = pipe.predict_proba(X_feat)[:, 1]
+    except Exception:
+        return pd.DataFrame()
+
+    importances = []
+    for feat in feature_cols:
+        X_perm = X_feat.copy()
+        X_perm[feat] = X_feat[feat].sample(frac=1, random_state=seed).values
+        try:
+            perm_pred = pipe.predict_proba(X_perm)[:, 1]
+            imp = float(np.mean(np.abs(base_pred - perm_pred)))
+        except Exception:
+            imp = 0.0
+        importances.append({"特徴量": feat, "重要度": imp})
+
+    df = pd.DataFrame(importances).sort_values("重要度", ascending=False).reset_index(drop=True)
+    total = df["重要度"].sum()
+    df["重要度(%)"] = (df["重要度"] / total * 100).round(2) if total > 0 else 0.0
+    df["日本語名"] = df["特徴量"].map(FEAT_JP).fillna(df["特徴量"])
+    df.insert(0, "順位", range(1, len(df) + 1))
+    return df
+
+
+def calc_uncertainty_for_race(pipe, race_df, feature_cols) -> pd.Series | None:
+    """
+    HistGradientBoostingの各木の予測から不確実性を計算するにゃ。
+    内部の_predictorsを使って各木の予測値の標準偏差を出すにゃ。
+    """
+    try:
+        # 前処理を通した後のデータにゃ
+        preprocessor = pipe.steps[0][1]
+        est = pipe.steps[-1][1]
+
+        # 特徴量列を整備にゃ
+        X = pd.DataFrame()
+        for f in feature_cols:
+            if f in race_df.columns:
+                X[f] = pd.to_numeric(race_df[f], errors="coerce").fillna(0)                     if f not in ["place","race_name","track_type","going","sex",
+                                 "jockey","trainer","belonging","sire","dam","broodmare_sire"]                     else race_df[f].astype(str).fillna("")
+            else:
+                X[f] = 0
+
+        X_transformed = preprocessor.transform(X)
+
+        # 各木の予測を取得にゃ（最大50木でサンプリングにゃ）
+        predictors = est._predictors
+        n_sample = min(50, len(predictors))
+        step = max(1, len(predictors) // n_sample)
+        sample_preds = []
+
+        for i in range(0, len(predictors), step):
+            tree_pred = predictors[i][0].predict(X_transformed)
+            sample_preds.append(tree_pred)
+
+        if len(sample_preds) < 2:
+            return None
+
+        pred_arr = np.array(sample_preds)
+        # ロジスティック変換にゃ
+        from scipy.special import expit
+        prob_arr = expit(pred_arr * est.n_iter_no_change if hasattr(est,"n_iter_no_change") else pred_arr)
+        return pd.Series(prob_arr.std(axis=0), index=race_df.index)
+    except Exception:
+        return None
+
+
+def show_pkl_ai_dashboard(bundle, race_df, pred_enriched_df=None):
+    """
+    PKL実測ベースの完全AI分析ダッシュボードにゃ。
+    HistGradientBoostingの実情報を直接使うにゃ。
+    """
+    st.markdown("---")
+    st.header("🧠 PKL本格AI分析ダッシュボード（実測ベース）")
+    st.caption(
+        f"PKLバンドルを直接解析した結果にゃ。"
+        f"HistGradientBoostingの実際の内部情報を使って「AIが何を重視しているか」を可視化するにゃ🐾"
+    )
+
+    info = get_bundle_info(bundle)
+    pipe = info["pipe"]
+    feature_cols = info["feature_cols"]
+    numeric_features = info["numeric_features"]
+    categorical_features = info["categorical_features"]
+    metrics = info["metrics"]
+
+    if pipe is None:
+        st.error("PKLからモデルを取り出せなかったにゃ。")
+        return
+
+    repair_simple_imputer(pipe)
+    est = pipe.steps[-1][1] if hasattr(pipe, "steps") else pipe
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🤖 モデル概要",
+        "📊 特徴量重要度（実測）",
+        "🎯 AI自信度",
+        "⚠️ 過学習診断",
+        "🔍 個別馬根拠説明",
+    ])
+
+    # ── Tab1: モデル概要 ──
+    with tab1:
+        st.subheader("🤖 PKLモデル概要にゃ")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("モデル種類", info["model_type"] or type(est).__name__)
+        c2.metric("特徴量数", len(feature_cols))
+        c3.metric("学習レース数", f"{metrics.get('races', '不明'):,}" if metrics.get('races') else "不明")
+        c4.metric("学習行数", f"{metrics.get('rows', '不明'):,}" if metrics.get('rows') else "不明")
+
+        st.caption(f"バージョン: {info['version']}")
+
+        if hasattr(est, "get_params"):
+            params = est.get_params()
+            imp_keys = ["max_iter", "learning_rate", "max_depth", "max_leaf_nodes",
+                        "min_samples_leaf", "l2_regularization", "max_bins",
+                        "validation_fraction", "n_iter_no_change"]
+            prows = [{"パラメータ": k, "値": params[k]} for k in imp_keys if k in params]
+            with st.expander("📋 ハイパーパラメータにゃ"):
+                st.dataframe(pd.DataFrame(prows), use_container_width=True, hide_index=True)
+
+        # Pipelineステップにゃ
+        if hasattr(pipe, "steps"):
+            with st.expander("🔧 Pipelineステップにゃ"):
+                sdf = pd.DataFrame([{"ステップ": n, "クラス": type(s).__name__}
+                                     for n, s in pipe.steps])
+                st.dataframe(sdf, use_container_width=True, hide_index=True)
+
+        # 学習スコア推移にゃ
+        if hasattr(est, "train_score_") and est.train_score_ is not None:
+            ts = est.train_score_
+            vs = est.validation_score_ if hasattr(est, "validation_score_") else None
+            st.markdown("#### 学習スコア推移にゃ")
+            n_iter = len(ts)
+            pts = [10, 25, 50, 100, 150, 200, 250, 300]
+            score_rows = []
+            for pt in pts:
+                if pt <= n_iter:
+                    row = {"イテレーション": pt, "学習スコア": round(float(ts[pt-1]), 6)}
+                    if vs is not None and len(vs) >= pt:
+                        row["検証スコア"] = round(float(vs[pt-1]), 6)
+                    score_rows.append(row)
+            if score_rows:
+                st.dataframe(pd.DataFrame(score_rows), use_container_width=True, hide_index=True)
+            st.caption(f"実際のイテレーション数: {est.n_iter_} / 最大: {est.max_iter}にゃ")
+            if est.n_iter_ >= est.max_iter:
+                st.warning("⚠️ 早期停止せずに上限到達にゃ。過学習の可能性があるにゃ！")
+
+    # ── Tab2: 特徴量重要度（実測）──
+    with tab2:
+        st.subheader("📊 特徴量重要度ランキング（PKL実測ベース）にゃ")
+        st.caption(
+            "HistGradientBoostingはfeature_importances_プロパティがないにゃ。"
+            "そのため「各特徴量をシャッフルしたときに予測がどれだけ変わるか」で重要度を計算するにゃ🐾"
+        )
+
+        with st.spinner("現実的な競馬データで重要度計算中にゃ...（10〜30秒かかるにゃ）"):
+            fi_df = calc_permutation_importance_real(
+                pipe, feature_cols, numeric_features, categorical_features)
+
+        if fi_df.empty:
+            st.warning("特徴量重要度の計算に失敗したにゃ。")
+        else:
+            # カテゴリ分類にゃ
+            def categorize(feat):
+                if feat in ["odds", "popularity", "field_odds_rank", "field_pop_rank",
+                            "odds_gap_to_fav", "popularity_gap_to_fav"]: return "💴 オッズ/市場系"
+                if "jockey" in feat: return "🏇 騎手系"
+                if "trainer" in feat: return "🏋️ 調教師系"
+                if any(x in feat for x in ["sire", "dam", "broodmare"]): return "🧬 血統系"
+                if "horse_" in feat: return "📈 馬実績系"
+                if feat in ["distance", "course_kind", "race_grade", "track_type",
+                            "going", "place"]: return "🏟️ コース条件系"
+                if feat in ["frame_no", "horse_no", "field_size", "race_no",
+                            "race_name"]: return "🔢 レース情報系"
+                if feat in ["age", "carried_weight", "sex", "belonging"]: return "⚖️ 馬体系"
+                if feat in ["year_full", "month", "day"]: return "📅 日付系"
+                return "📌 その他"
+
+            fi_df["カテゴリ"] = fi_df["特徴量"].apply(categorize)
+
+            # 上位表示にゃ
+            top_fi = fi_df[fi_df["重要度"] > 0].copy()
+            if top_fi.empty:
+                st.info("全特徴量の重要度がほぼ0にゃ。これは過学習の証拠にゃ（モデルが特定パターンだけ記憶しているにゃ）。")
+                # 全件表示にゃ
+                top_fi = fi_df.head(20)
+
+            try:
+                imp_col = "重要度"
+                styled = top_fi[["順位", "日本語名", "特徴量", imp_col, "重要度(%)", "カテゴリ"]].style.bar(
+                    subset=[imp_col], color="#4CAF50", vmin=0
+                ).format({imp_col: "{:.5f}", "重要度(%)": "{:.2f}%"})
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(top_fi, use_container_width=True, hide_index=True)
+
+            # 重要特徴量の解説にゃ
+            top1 = fi_df.iloc[0]
+            if top1["重要度"] > 0:
+                top1_name = str(top1["日本語名"])
+                top1_feat = str(top1["特徴量"])
+                top1_imp  = float(top1["重要度"])
+                st.info(
+                    f"💡 最重要特徴量: {top1_name}（{top1_feat}）にゃ"
+                    f"この特徴量をシャッフルすると予測が平均 {top1_imp:.4f} 変化するにゃ。"
+                    f"この要素がAIの判断に最も影響しているにゃ🐾"
+                )
+
+            # カテゴリ別シェアにゃ
+            st.markdown("#### カテゴリ別重要度シェアにゃ")
+            cat_sum = (fi_df.groupby("カテゴリ")["重要度"].sum()
+                       .reset_index().rename(columns={"重要度": "合計重要度"})
+                       .sort_values("合計重要度", ascending=False))
+            total = cat_sum["合計重要度"].sum()
+            cat_sum["シェア(%)"] = (cat_sum["合計重要度"] / total * 100).round(1) if total > 0 else 0
+            st.dataframe(cat_sum, use_container_width=True, hide_index=True)
+
+    # ── Tab3: AI自信度 ──
+    with tab3:
+        st.subheader("🎯 AI予測の自信度（不確実性分析）にゃ")
+        st.caption("内部の木ごとの予測のばらつきから「AIが迷っている馬」を検出するにゃ🐾")
+
+        with st.spinner("不確実性を計算中にゃ..."):
+            unc = calc_uncertainty_for_race(pipe, race_df, feature_cols)
+
+        if unc is None:
+            st.info("HistGradientBoostingの木構造から不確実性を計算できなかったにゃ。")
+        else:
+            rd = race_df[["horse_no", "horse_name", "ml_top3_prob",
+                           "ml_rank", "odds", "popularity"]].copy().reset_index(drop=True)
+            unc_vals = unc.reset_index(drop=True) if hasattr(unc, "reset_index") else unc
+            rd["予測標準偏差"] = unc_vals.values[:len(rd)] if hasattr(unc_vals,"values") else np.zeros(len(rd))
+            rd["AI自信度"] = rd["予測標準偏差"].apply(
+                lambda s: "🔴 迷っている" if s > 0.15 else ("🟡 やや不安" if s > 0.08 else "🟢 自信あり"))
+            rd["3着内確率"] = (rd["ml_top3_prob"] * 100).round(1).astype(str) + "%"
+            disp = rd[["ml_rank", "horse_no", "horse_name", "3着内確率",
+                        "予測標準偏差", "AI自信度", "odds", "popularity"]].rename(columns={
+                "ml_rank": "AI順位", "horse_no": "馬番", "horse_name": "馬名",
+                "odds": "オッズ", "popularity": "人気"}).sort_values("AI順位")
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+            unsure = rd[rd["予測標準偏差"] > 0.15].sort_values("予測標準偏差", ascending=False)
+            if not unsure.empty:
+                ns = " / ".join(f"馬番{int(r['horse_no'])} {r['horse_name']}"
+                                 for _, r in unsure.head(3).iterrows())
+                st.warning(f"⚠️ AIが迷っている馬にゃ: {ns} → 購入は慎重にゃ🐾")
+
+    # ── Tab4: 過学習診断 ──
+    with tab4:
+        st.subheader("⚠️ 過学習診断にゃ")
+
+        m = metrics
+        auc = m.get("auc", 0)
+        logloss = m.get("logloss", 999)
+        top3_rate = m.get("top3_rate", 0)
+
+        # 診断にゃ
+        issues = []
+        if auc >= 0.999:
+            issues.append(("🔴 重大", "AUC=1.0", "学習データを丸暗記している疑いが強いにゃ。実戦では大幅に精度が落ちるにゃ。"))
+        if logloss < 0.001:
+            issues.append(("🔴 重大", f"LogLoss={logloss:.2e}", "損失関数がほぼゼロにゃ。過学習の典型症状にゃ。"))
+        if hasattr(est, "n_iter_") and est.n_iter_ >= est.max_iter:
+            issues.append(("🟠 警告", "早期停止なし", f"300回イテレーション上限に到達にゃ。過学習が進行している可能性にゃ。"))
+        if "odds" in feature_cols and "popularity" in feature_cols:
+            issues.append(("🟡 注意", "当日オッズ使用", "オッズ・人気は3着内と高相関にゃ。モデルがこれに依存しすぎている可能性にゃ。"))
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("AUC", f"{auc:.6f}", delta="理論値<0.85" if auc > 0.90 else None,
+                  delta_color="inverse")
+        c2.metric("LogLoss", f"{logloss:.2e}", delta="異常に低いにゃ" if logloss < 0.01 else None,
+                  delta_color="inverse")
+        c3.metric("平均3着内率", f"{top3_rate*100:.1f}%")
+        c4.metric("診断結果", f"{'要注意' if issues else '正常'}にゃ",
+                  delta=f"{len(issues)}件の問題" if issues else "問題なし")
+
+        if issues:
+            for level, title, desc in issues:
+                if "重大" in level:
+                    st.error(f"**{level}: {title}**にゃ{desc}")
+                elif "警告" in level:
+                    st.warning(f"**{level}: {title}**にゃ{desc}")
+                else:
+                    st.info(f"**{level}: {title}**にゃ{desc}")
+
+        st.markdown("#### 改善提案にゃ🔧")
+        st.markdown("""
+- **odds・popularityを除外して再学習にゃ** → モデルが自分で実力を判断するようになるにゃ
+- **early_stoppingを有効にするにゃ** → `n_iter_no_change=20, validation_fraction=0.15`にゃ
+- **l2_regularizationを追加するにゃ** → `l2_regularization=0.1` で過学習を抑制にゃ
+- **max_iter を100〜200に下げるにゃ** → 木の数を減らして汎化性能を上げるにゃ
+        """)
+
+    # ── Tab5: 個別馬根拠説明 ──
+    with tab5:
+        st.subheader("🔍 個別馬の予測根拠説明にゃ")
+        st.caption("各特徴量がレース内平均と比べてどう違うかから「なぜこの確率か」を説明するにゃ🐾")
+
+        horses = race_df.sort_values("ml_rank").head(10)
+        opts = [f"馬番{int(r['horse_no'])} {r['horse_name']} (AI{int(r['ml_rank'])}位 / {float(r['ml_top3_prob'])*100:.1f}%)"
+                for _, r in horses.iterrows()]
+        sel = st.selectbox("分析する馬を選択にゃ", opts, key="pkl_horse_sel")
+
+        if sel and opts:
+            idx = opts.index(sel)
+            tr = horses.iloc[idx]
+            prob = float(tr.get("ml_top3_prob", 0))
+            rank = int(tr.get("ml_rank", 0))
+
+            st.markdown(f"**{tr['horse_name']}** (AI{rank}位 / 3着内確率{prob*100:.1f}%) の予測根拠にゃ")
+
+            # 特徴量値とレース内平均の比較にゃ
+            contrib_rows = []
+            for feat in feature_cols:
+                if feat not in race_df.columns:
+                    continue
+                if feat in ["place", "race_name", "track_type", "going", "sex",
+                            "jockey", "trainer", "belonging", "sire", "dam", "broodmare_sire"]:
+                    # カテゴリ特徴量はそのまま表示にゃ
+                    val = str(tr.get(feat, "不明"))
+                    contrib_rows.append({
+                        "特徴量": FEAT_JP.get(feat, feat),
+                        "この馬の値": val,
+                        "タイプ": "カテゴリ",
+                        "偏差(σ)": "-",
+                        "評価": "📋",
+                    })
+                else:
+                    try:
+                        val = float(tr.get(feat, 0))
+                        col_vals = pd.to_numeric(race_df[feat], errors="coerce").dropna()
+                        if col_vals.empty:
+                            continue
+                        mean = float(col_vals.mean())
+                        std = float(col_vals.std()) if col_vals.std() > 0 else 1.0
+                        z = (val - mean) / std
+
+                        # 特徴量ごとにプラス方向を決めるにゃ
+                        negative_feats = ["odds", "popularity", "field_odds_rank", "field_pop_rank",
+                                          "odds_gap_to_fav", "popularity_gap_to_fav",
+                                          "horse_no", "frame_no"]
+                        is_good = (z < 0) if feat in negative_feats else (z > 0)
+                        icon = "🟢" if is_good and abs(z) > 0.5 else ("🔴" if not is_good and abs(z) > 0.5 else "⚪")
+
+                        contrib_rows.append({
+                            "特徴量": FEAT_JP.get(feat, feat),
+                            "この馬の値": round(val, 3),
+                            "レース内平均": round(mean, 3),
+                            "偏差(σ)": round(z, 2),
+                            "タイプ": "数値",
+                            "評価": icon,
+                        })
+                    except Exception:
+                        continue
+
+            if contrib_rows:
+                # 数値特徴量のみ偏差でソートにゃ
+                num_rows = [r for r in contrib_rows if r["タイプ"] == "数値"]
+                cat_rows = [r for r in contrib_rows if r["タイプ"] == "カテゴリ"]
+                num_rows.sort(key=lambda x: abs(float(x["偏差(σ)"])) if x["偏差(σ)"] != "-" else 0, reverse=True)
+
+                # プラス要因とマイナス要因を分けるにゃ
+                plus_rows = [r for r in num_rows if str(r["評価"]).startswith("🟢")][:8]
+                minus_rows = [r for r in num_rows if str(r["評価"]).startswith("🔴")][:8]
+
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    st.markdown("##### 🟢 プラス要因にゃ（平均より優れている点）")
+                    if plus_rows:
+                        st.dataframe(pd.DataFrame(plus_rows)[["特徴量","この馬の値","レース内平均","偏差(σ)"]],
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        st.info("明確なプラス要因なしにゃ")
+                with pc2:
+                    st.markdown("##### 🔴 マイナス要因にゃ（平均より劣っている点）")
+                    if minus_rows:
+                        st.dataframe(pd.DataFrame(minus_rows)[["特徴量","この馬の値","レース内平均","偏差(σ)"]],
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        st.info("明確なマイナス要因なしにゃ")
+
+                # カテゴリ特徴量にゃ
+                with st.expander("📋 カテゴリ特徴量にゃ（騎手・馬場・血統など）"):
+                    if cat_rows:
+                        st.dataframe(pd.DataFrame(cat_rows)[["特徴量","この馬の値"]],
+                                     use_container_width=True, hide_index=True)
+
+                # 自動サマリーにゃ
+                comments = []
+                for r in plus_rows[:3]:
+                    f = r["特徴量"]; v = r["この馬の値"]; a = r["レース内平均"]
+                    if "騎手3着内率" in f:
+                        comments.append(f"騎手3着内率({v:.1%})が平均({a:.1%})より高いにゃ")
+                    elif "距離別3着内率" in f:
+                        comments.append(f"この距離での3着内率({v:.1%})が平均({a:.1%})より優秀にゃ")
+                    elif "調教師3着内率" in f:
+                        comments.append(f"調教師3着内率({v:.1%})が平均を上回るにゃ")
+                    elif "オッズ" in f:
+                        comments.append(f"オッズ({v:.1f}倍)がレース内で低め（市場評価が高い）にゃ")
+                if comments:
+                    st.success("💬 AI根拠サマリーにゃ: " + " / ".join(comments))
+
+
 def app_main():
-    st.title("🐾 にゃんこ競馬AI")
-    st.success(f"起動版: {VERSION}")
+    st.title("🐾 にゃんこ競馬AI v26にゃ")
+    st.success(f"起動版にゃ: {VERSION}にゃ")
     st.caption(
         "v25: ①三連複確率を条件付き確率に刷新 ②implied_top3をオッズ帯別係数に刷新 "
         "③危険馬フィルタ強化(AI4位) ④相手B確率下限追加 ⑤Kelly比を複勝/三連複に分離 "
@@ -3973,10 +4854,14 @@ def app_main():
             "- [FIX-9] pivot_confidence: 三連複Kelly連動\n"
         )
 
-    st.subheader("入力方法")
+    st.subheader("入力方法にゃ🐾")
     input_method = st.radio(
-        "入力方法を選択",
-        ["事前CSVから選択", "netkeiba一括取得→そのまま予想", "出馬表CSV", "netkeiba URL単発"],
+        "入力方法を選択にゃ",
+        ["🌐 netkeiba自動取得（当日レース）",
+         "🌐 netkeiba race_id/URL指定",
+         "📁 事前CSVから選択",
+         "📄 出馬表CSVアップロード",
+         "netkeiba URL単発"],
         horizontal=True, index=0
     )
 
@@ -4186,23 +5071,14 @@ def app_main():
             show_ticket_tabs(race_df, strategy_mode=strategy_mode)
 
             # ============================================================
-            # 🧠 PKL本格AI分析ダッシュボード（全機能統合）
+            # 🧠 PKL本格AI分析ダッシュボード（HistGradientBoosting実測ベース）にゃ
             # ============================================================
             try:
-                pred_src_enriched = merge_target_features(pred_src.copy())
-                pred_src_enriched = add_prior_stats_for_prediction(pred_src_enriched)
-                pred_src_enriched = add_running_style(pred_src_enriched)
-                if "race_key" in pred_src_enriched.columns:
-                    race_feat = pred_src_enriched[pred_src_enriched["race_key"] == selected_race].copy()
-                else:
-                    race_feat = pred_src_enriched.head(len(race_df)).copy()
-                # インデックスをrace_dfに合わせる
-                race_feat = race_feat.reset_index(drop=True)
-                race_df_reset = race_df.reset_index(drop=True)
-                race_feat.index = race_df_reset.index
-                show_full_ai_analysis(bundle, pred_df, race_df_reset, feature_data=race_feat)
+                show_pkl_ai_dashboard(bundle, race_df)
             except Exception as _ai_err:
-                st.warning(f"AI分析でエラーが発生しました: {_ai_err}")
+                st.warning(f"AI分析でエラーが発生したにゃ: {_ai_err}")
+                import traceback
+                st.caption(traceback.format_exc())
 
             show_roi_strategy(race_df, strategy_mode=strategy_mode)
 

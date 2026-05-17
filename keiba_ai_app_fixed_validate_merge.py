@@ -1591,10 +1591,10 @@ def calibrate_prob(raw_prob: np.ndarray, method: str = "isotonic_approx") -> np.
     return np.clip(p_calibrated, 0.01, 0.95)
 
 
-def predict(bundle, df, strategy=STRATEGY_ROI):
-    df = add_prior_stats(df)
+def predict(bundle, df, strategy_mode=STRATEGY_MODE_ROI):
+    df = add_prior_stats_for_prediction(df)
     df = add_running_style(df)
-    pipe, fc = get_pipe_features(bundle)
+    pipe, fc = get_pipeline_and_features(bundle)
     miss = [c for c in fc if c not in df.columns]
     if miss: raise ValueError(f"特徴量不足にゃ: {miss}")
 
@@ -1627,8 +1627,8 @@ def predict(bundle, df, strategy=STRATEGY_ROI):
     # Kelly比分離にゃ
     df = add_kelly_ratio(df)
     # 軸信頼度にゃ
-    df = add_pivot_conf(df)
-    df = add_value_strategy(df, strategy=strategy)
+    df = add_pivot_confidence(df)
+    df = add_value_strategy(df, strategy_mode=strategy_mode)
     return df
 
 

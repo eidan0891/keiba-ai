@@ -102,6 +102,49 @@ STRATEGY_MODE_ROI     = "回収率重視"
 STRATEGY_MODE_HITRATE = "的中率重視"
 STRATEGY_MODE_OPTIONS = [STRATEGY_MODE_ROI, STRATEGY_MODE_HITRATE]
 
+# ============================================================
+# 安全な型変換ヘルパーにゃ（NA/inf対策にゃ）
+# ============================================================
+
+def _safe_int(val, default=0) -> int:
+    """NA/inf/None を受け取っても安全にintに変換するにゃ"""
+    try:
+        v = float(val)
+        if v != v or v == float('inf') or v == float('-inf'):  # NaN/inf チェックにゃ
+            return default
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+def _safe_float(val, default=0.0) -> float:
+    """NA/inf/None を受け取っても安全にfloatに変換するにゃ"""
+    try:
+        v = float(val)
+        if v != v or v == float('inf') or v == float('-inf'):
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
+
+def _safe_hno(row) -> str:
+    """馬番を安全に文字列変換するにゃ"""
+    try:
+        v = row.get("horse_no", None) if hasattr(row, "get") else row
+        return str(_safe_int(v, 0)) if _safe_int(v, -1) > 0 else ""
+    except Exception:
+        return ""
+
+def _safe_hlabel(row) -> str:
+    """馬番+馬名ラベルを安全に生成するにゃ"""
+    try:
+        hno  = _safe_int(row.get("horse_no", 0) if hasattr(row, "get") else 0, 0)
+        name = str(row.get("horse_name", "") if hasattr(row, "get") else "")
+        return f"{hno} {name}" if hno > 0 else name
+    except Exception:
+        return ""
+
+
+
 # 特徴量日本語名マップ（AI分析用）
 FEAT_JP = {
     "odds":"単勝オッズ","popularity":"人気順位",
@@ -685,7 +728,7 @@ def fetch_race_full(race_id: str, session=None, update_odds: bool = True) -> pd.
         if tansho:
             df["horse_no_str"] = df["horse_no"].fillna(0).astype(int).astype(str)
             for idx, row in df.iterrows():
-                hno = str(int(row["horse_no"])) if pd.notna(row["horse_no"]) else ""
+                hno = str(_safe_int(row["horse_no"], 0)) if pd.notna(row.get("horse_no")) and _safe_int(row["horse_no"], 0) > 0 else ""
                 if hno in tansho:
                     df.at[idx, "odds"] = tansho[hno]
 
@@ -693,7 +736,7 @@ def fetch_race_full(race_id: str, session=None, update_odds: bool = True) -> pd.
         df["odds"] = pd.to_numeric(df["odds"], errors="coerce")
         valid_odds = df["odds"].dropna()
         if not valid_odds.empty:
-            df["popularity"] = df["odds"].rank(method="min", ascending=True).fillna(99).astype(int)
+            df["popularity"] = df["odds"].rank(method="min", ascending=True).fillna(99).round(0).astype(int)
 
     return df
 
@@ -918,12 +961,12 @@ def clean_types(df: pd.DataFrame) -> pd.DataFrame:
     df["day"] = pd.to_numeric(df.get("day", 1), errors="coerce").fillna(1)
     df["race_no"] = pd.to_numeric(df.get("race_no", 11), errors="coerce").fillna(11)
     df["year_full"] = df["year"].apply(
-        lambda x: int(x) + 2000 if pd.notna(x) and int(x) < 100 else int(x)
+        lambda x: _safe_int(x) + 2000 if pd.notna(x) and _safe_int(x) < 100 else _safe_int(x)
     )
     df["date_int"] = (
-        df["year_full"].fillna(0).astype(int) * 10000
-        + df["month"].fillna(0).astype(int) * 100
-        + df["day"].fillna(0).astype(int)
+        df["year_full"].fillna(0).replace([float("inf"), float("-inf")], 0).astype(int) * 10000
+        + df["month"].fillna(0).replace([float("inf"), float("-inf")], 0).astype(int) * 100
+        + df["day"].fillna(0).replace([float("inf"), float("-inf")], 0).astype(int)
     )
     if "source_file" not in df.columns:
         df["source_file"] = ""
@@ -931,13 +974,13 @@ def clean_types(df: pd.DataFrame) -> pd.DataFrame:
     df["race_key"] = (
         df["date_int"].astype(str) + "_"
         + df.get("place", "").astype(str) + "_"
-        + df["race_no"].fillna(0).astype(int).astype(str).str.zfill(2) + "_"
+        + df["race_no"].fillna(0).replace([float("inf"), float("-inf")], 0).astype(int).astype(str).str.zfill(2) + "_"
         + df["source_file"].astype(str)
     )
     df["race_label"] = (
         df["date_int"].astype(str) + " "
         + df.get("place", "").astype(str) + " "
-        + df["race_no"].fillna(0).astype(int).astype(str) + "R "
+        + df["race_no"].fillna(0).replace([float("inf"), float("-inf")], 0).astype(int).astype(str) + "R "
         + df.get("race_name", "").astype(str)
     )
     return df
@@ -1613,7 +1656,7 @@ def predict(bundle, df, strategy_mode=STRATEGY_MODE_ROI):
     df["calibrated_prob"] = calibrated  # 表示用にも保持にゃ
 
     df["ml_rank"] = df.groupby("race_key")["ml_top3_prob"].rank(
-        ascending=False, method="first").astype(int)
+        ascending=False, method="first").fillna(1).astype(int)
     df["mark"] = df["ml_rank"].map({1:"◎",2:"○",3:"▲",4:"△",5:"☆",6:"×",7:"×",8:"×"}).fillna("")
     df["expected_value"] = df["ml_top3_prob"] * df["odds"].fillna(0)
 
@@ -2066,7 +2109,7 @@ def make_tickets(race_df: pd.DataFrame) -> dict:
 
     def horse_label(row):
         try:
-            return f"{int(row['horse_no'])} {row['horse_name']}"
+            return f"{_safe_int(row.get('horse_no', 0))} {row.get('horse_name', '')}"
         except Exception:
             return str(row.get("horse_name", ""))
 
@@ -2173,10 +2216,10 @@ def build_sanrenpuku_zone_data(race_df: pd.DataFrame,
 
     all_nums = [str(int(n)) for n in r["horse_no"].dropna() if n > 0]
     # 頭数を取得（三連複EV計算に使用）
-    field_size = int(r["field_size"].max()) if r["field_size"].max() > 0 else len(r)
+    field_size = _safe_int(r["field_size"].max(), len(r)) if pd.notna(r["field_size"].max()) and r["field_size"].max() > 0 else len(r)
 
     def _no(row):
-        return str(int(row["horse_no"])) if row["horse_no"] > 0 else ""
+        return str(_safe_int(row["horse_no"], 0)) if _safe_int(row.get("horse_no", 0), 0) > 0 else ""
 
     # [FIX-9] pivot_confidence（三連複Kelly連動版）で軸選出
     if strategy_mode == STRATEGY_MODE_ROI:
@@ -2342,7 +2385,7 @@ def generate_sanrenpuku_1jiku(zone: dict, max_count: int = 10) -> list[dict]:
     # 補完: 候補が少ない場合
     if len(combos) < 6 and not safe_df.empty:
         fallback_nums = [
-            str(int(row["horse_no"])) for _, row in
+            str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0))) for _, row in
             safe_df.sort_values("ml_top3_prob", ascending=False).iterrows()
             if row["horse_no"] > 0
         ]
@@ -2416,7 +2459,7 @@ def generate_sanrenpuku_2jiku(zone: dict, max_count: int = 10) -> list[dict]:
 
     if len(combos) < 6 and not safe_df.empty:
         fallback_nums = [
-            str(int(row["horse_no"])) for _, row in
+            str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0))) for _, row in
             safe_df.sort_values("ml_top3_prob", ascending=False).iterrows()
             if row["horse_no"] > 0
         ]
@@ -2462,7 +2505,7 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
     if safe.empty:
         safe = r.copy()
 
-    field_size = int(r["field_size"].max()) if r["field_size"].max() > 0 else len(r)
+    field_size = _safe_int(r["field_size"].max(), len(r)) if pd.notna(r["field_size"].max()) and r["field_size"].max() > 0 else len(r)
 
     if strategy_mode == STRATEGY_MODE_ROI:
         safe["_box_score"] = (
@@ -2488,13 +2531,13 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
 
     def _label(row):
         try:
-            return f"{int(row['horse_no'])} {row['horse_name']}"
+            return f"{_safe_int(row.get('horse_no', 0))} {row.get('horse_name', '')}"
         except Exception:
             return str(row.get("horse_name", ""))
 
     def _no(row):
         try:
-            return str(int(row["horse_no"]))
+            return str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0)))
         except Exception:
             return str(row.get("horse_no", ""))
 
@@ -2506,8 +2549,8 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
         horses.append({
             "馬番": n,
             "馬名": row.get("horse_name", ""),
-            "AI順位": int(row.get("ml_rank", 0)),
-            "人気": int(row.get("popularity", 0)),
+            "AI順位": _safe_int(row.get("ml_rank", 0), 0),
+            "人気": _safe_int(row.get("popularity", 0), 0),
             "オッズ": round(float(row.get("odds", 0)), 1),
             "3着内確率": f"{float(row.get('ml_top3_prob', 0)) * 100:.1f}%",
             "EV乖離": round(float(row.get("ev_score", 0)), 4),
@@ -2544,8 +2587,8 @@ def generate_sanrenpuku_5box(race_df: pd.DataFrame,
         row = remaining.iloc[0]
         alt_horse = {
             "馬番": _no(row), "馬名": row.get("horse_name", ""),
-            "AI順位": int(row.get("ml_rank", 0)),
-            "人気": int(row.get("popularity", 0)),
+            "AI順位": _safe_int(row.get("ml_rank", 0), 0),
+            "人気": _safe_int(row.get("popularity", 0), 0),
             "EV乖離": round(float(row.get("ev_score", 0)), 4),
             "Kelly(三連複)": round(float(row.get("kelly_ratio_sanren", 0)), 4),
             "BOX選出スコア": round(float(row.get("_box_score", 0)), 3),
@@ -2592,7 +2635,7 @@ def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
         r[c] = pd.to_numeric(r[c], errors="coerce").fillna(0)
 
     all_nums = [str(int(n)) for n in r["horse_no"].dropna() if n > 0]
-    field_size = int(r["field_size"].max()) if r["field_size"].max() > 0 else len(r)
+    field_size = _safe_int(r["field_size"].max(), len(r)) if pd.notna(r["field_size"].max()) and r["field_size"].max() > 0 else len(r)
     safe = r[r.get("danger_popular", pd.Series([""] * len(r))) != "危険"].copy() \
         if "danger_popular" in r.columns else r.copy()
     if safe.empty:
@@ -2602,7 +2645,7 @@ def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
     ev_map = {}
     for _, row in r.iterrows():
         try:
-            n = str(int(row["horse_no"]))
+            n = str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0)))
         except Exception:
             continue
         prob_map[n] = float(row.get("ml_top3_prob", 0.05))
@@ -2612,7 +2655,7 @@ def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
         nums = []
         for _, row in zone_df.iterrows():
             try:
-                n = str(int(row["horse_no"])) if row["horse_no"] > 0 else ""
+                n = str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0))) if row["horse_no"] > 0 else ""
             except Exception:
                 n = ""
             if n and n not in nums and (exclude is None or n not in exclude):
@@ -2685,14 +2728,14 @@ def _generate_sanrentan_formation(race_df: pd.DataFrame, max_count: int = 10,
 
 def _horse_no(row) -> str:
     try:
-        return str(int(row["horse_no"]))
+        return str(_safe_int(row.get("horse_no", row["horse_no"] if "horse_no" in row.index else 0)))
     except Exception:
         return str(row.get("horse_no", ""))
 
 
 def _horse_label(row) -> str:
     try:
-        return f"{int(row['horse_no'])} {row['horse_name']}"
+        return f"{_safe_int(row.get('horse_no', 0))} {row.get('horse_name', '')}"
     except Exception:
         return str(row.get("horse_name", ""))
 
@@ -3036,7 +3079,7 @@ def show_sanrenpuku_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MO
                 conf_icon = "✅" if conf >= PIVOT_CONFIDENCE_THRESHOLD else "⚠️"
                 st.markdown(f"◎ 馬番{zone['pivot_no']} {pivot_row.get('horse_name', '')}")
                 st.caption(
-                    f"AI{int(pivot_row.get('ml_rank', 0))}位 / "
+                    f"AI{_safe_int(pivot_row.get('ml_rank', 0))}位 / "
                     f"3着内確率{float(pivot_row.get('ml_top3_prob', 0)) * 100:.1f}% / "
                     f"Kelly(三連複){float(pivot_row.get('kelly_ratio_sanren', 0)):.3f} / "
                     f"軸信頼度{conf:.3f} {conf_icon}"
@@ -3047,7 +3090,7 @@ def show_sanrenpuku_tabs(race_df: pd.DataFrame, strategy_mode: str = STRATEGY_MO
                 ok_icon = "✅" if two_ok else "⚠️低"
                 st.markdown(f"○ 馬番{zone['pivot2_no']} {pivot2_row.get('horse_name', '')} {ok_icon}")
                 st.caption(
-                    f"AI{int(pivot2_row.get('ml_rank', 0))}位 / "
+                    f"AI{_safe_int(pivot2_row.get('ml_rank', 0))}位 / "
                     f"3着内確率{float(pivot2_row.get('ml_top3_prob', 0)) * 100:.1f}% / "
                     f"軸信頼度{conf2:.3f}"
                 )
@@ -3203,7 +3246,7 @@ def show_ev_ranking(race_df: pd.DataFrame):
 
     buy_count = int((race_df.get("buy_flag", pd.Series()) == "買い").sum()) \
         if "buy_flag" in race_df.columns else 0
-    high_ev = int((r["ev_score"] >= 0.06).sum())
+    high_ev = _safe_int((r["ev_score"] >= 0.06).sum())
     kelly_pos = int((r["kelly_ratio"] >= MIN_KELLY_RATIO).sum())
     kelly_san_pos = int((r["kelly_ratio_sanren"] >= MIN_KELLY_RATIO).sum())
     avg_odds = float(r["odds"].mean())
@@ -3921,7 +3964,7 @@ def show_prediction_uncertainty(pipe, X: pd.DataFrame, race_df: pd.DataFrame):
         "予測標準偏差(不確実性)", ascending=False)
     if not unsure.empty:
         names = " / ".join(
-            f"馬番{int(r['horse_no'])} {r['horse_name']}"
+            f"馬番{_safe_int(r.get('horse_no',0))} {r.get('horse_name','')}"
             for _, r in unsure.head(3).iterrows()
         )
         st.warning(
@@ -3940,7 +3983,7 @@ def show_prediction_uncertainty(pipe, X: pd.DataFrame, race_df: pd.DataFrame):
         ]
         if not confident_ev.empty:
             names2 = " / ".join(
-                f"馬番{int(r['horse_no'])} {r['horse_name']}(EV+{r['ev_score']:.3f})"
+                f"馬番{_safe_int(r.get('horse_no',0))} {r.get('horse_name','')}(EV+{_safe_float(r.get('ev_score',0)):.3f})"
                 for _, r in confident_ev.iterrows()
             )
             st.success(f"✅ **AI自信×EV高め**: {names2} → 三連複の軸候補として有望")
@@ -3960,7 +4003,7 @@ def show_local_explanation(pipe, X: pd.DataFrame, race_df: pd.DataFrame,
 
     horses = race_df.sort_values("ml_rank").head(8)
     horse_options = [
-        f"馬番{int(r['horse_no'])} {r['horse_name']} (AI{int(r['ml_rank'])}位)"
+        f"馬番{_safe_int(r.get('horse_no',0))} {r.get('horse_name','')} (AI{_safe_int(r.get('ml_rank',0))}位)"
         for _, r in horses.iterrows()
     ]
     selected = st.selectbox("分析する馬を選択", horse_options, key="local_exp_select")
@@ -4639,7 +4682,7 @@ def show_pkl_ai_dashboard(bundle, race_df, pred_enriched_df=None):
 
             unsure = rd[rd["予測標準偏差"] > 0.15].sort_values("予測標準偏差", ascending=False)
             if not unsure.empty:
-                ns = " / ".join(f"馬番{int(r['horse_no'])} {r['horse_name']}"
+                ns = " / ".join(f"馬番{_safe_int(r.get('horse_no',0))} {r.get('horse_name','')}"
                                  for _, r in unsure.head(3).iterrows())
                 st.warning(f"⚠️ AIが迷っている馬にゃ: {ns} → 購入は慎重にゃ🐾")
 
@@ -4695,7 +4738,7 @@ def show_pkl_ai_dashboard(bundle, race_df, pred_enriched_df=None):
         st.caption("各特徴量がレース内平均と比べてどう違うかから「なぜこの確率か」を説明するにゃ🐾")
 
         horses = race_df.sort_values("ml_rank").head(10)
-        opts = [f"馬番{int(r['horse_no'])} {r['horse_name']} (AI{int(r['ml_rank'])}位 / {float(r['ml_top3_prob'])*100:.1f}%)"
+        opts = [f"馬番{_safe_int(r.get('horse_no',0))} {r.get('horse_name','')} (AI{_safe_int(r.get('ml_rank',0))}位 / {float(r['ml_top3_prob'])*100:.1f}%)"
                 for _, r in horses.iterrows()]
         sel = st.selectbox("分析する馬を選択にゃ", opts, key="pkl_horse_sel")
 

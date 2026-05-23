@@ -35,6 +35,7 @@
 # ------------------------------------------------------------
 
 import io
+import traceback
 import os
 import re
 import itertools
@@ -1694,6 +1695,14 @@ def predict(bundle, df, strategy_mode=STRATEGY_MODE_ROI):
     # 軸信頼度にゃ
     df = add_pivot_confidence(df)
     df = add_value_strategy(df, strategy_mode=strategy_mode)
+    # ── S級強化処理にゃ（展開予測・多次元EV・見送り判定・最終スコアにゃ）──
+    try:
+        df = add_pace_advantage(df)
+        df = add_ev_score_v2(df)
+        df = add_pass_score(df, strategy_mode=strategy_mode)
+        df = add_final_score(df, strategy_mode=strategy_mode)
+    except Exception as _s_err:
+        pass  # S級計算失敗しても旧版で動くにゃ
     return df
 
 
@@ -4931,6 +4940,1222 @@ def show_pkl_ai_dashboard(bundle, race_df, pred_enriched_df=None):
 
 
 
+
+
+# ============================================================
+# ============================================================
+# バックテストモジュールにゃ（v26追加にゃ）
+# ============================================================
+# ============================================================
+
+def run_backtest(bundle, history_df: pd.DataFrame,
+                 strategy_mode: str = STRATEGY_MODE_ROI,
+                 min_odds: float = 1.0,
+                 max_odds: float = 9999.0) -> dict:
+    import traceback as _tb
+    """
+    過去レース結果データでバックテストを実行するにゃ。
+
+    history_df には以下の列が必要にゃ:
+      - COLS_52 の全列（finish列に着順が入っているにゃ）
+      - または簡易CSV（finish列付きにゃ）
+
+    戻り値にゃ:
+      的中率・回収率・券種別成績・レース別成績などにゃ
+    """
+    if history_df is None or history_df.empty:
+        return {}
+
+    # finishがない場合はバックテスト不可にゃ
+    if "finish" not in history_df.columns:
+        return {"error": "finish（着順）列がないにゃ。結果CSVが必要にゃ。"}
+
+    df = history_df.copy()
+    df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
+    df = df[df["finish"].notna() & (df["finish"] > 0)].copy()
+
+    if df.empty:
+        return {"error": "有効な着順データがないにゃ"}
+
+    # 予想を実行するにゃ
+    # バックテスト用: merge_target_featuresは省略し軽量化するにゃ
+    try:
+        df_for_pred = add_prior_stats_for_prediction(df)
+        df_for_pred = add_running_style(df_for_pred)
+        pipe, fc = get_pipeline_and_features(bundle)
+        miss = [c for c in fc if c not in df_for_pred.columns]
+        if miss:
+            # 不足特徴量を0で補完にゃ
+            for c in miss:
+                df_for_pred[c] = 0.0
+        if hasattr(pipe, "predict_proba"):
+            raw_prob = pipe.predict_proba(df_for_pred[fc])[:, 1]
+        else:
+            raw_prob = np.asarray(pipe.predict(df_for_pred[fc]), dtype=float)
+        # 確率校正にゃ
+        calibrated = np.zeros(len(df_for_pred))
+        for rk in df_for_pred["race_key"].unique():
+            mask = df_for_pred["race_key"] == rk
+            calibrated[mask.values] = calibrate_prob(raw_prob[mask.values])
+        df["ml_top3_prob"] = calibrated
+        # タイブレーク付きランク計算にゃ
+        _pop_tb  = pd.to_numeric(df["popularity"], errors="coerce").fillna(99)
+        _odds_tb = pd.to_numeric(df["odds"],       errors="coerce").fillna(999)
+        _hno_tb  = pd.to_numeric(df["horse_no"],   errors="coerce").fillna(99)
+        _tb = ((1.0/_pop_tb.clip(lower=1))*1e-4
+               + (1.0/_odds_tb.clip(lower=0.1))*1e-6
+               + (1.0/_hno_tb.clip(lower=1))*1e-8)
+        df["_comp"] = df["ml_top3_prob"] + _tb
+        df["ml_rank"] = (df.groupby("race_key")["_comp"]
+                          .rank(ascending=False, method="first")
+                          .fillna(1).astype(int))
+        df = df.drop(columns=["_comp"])
+        df = add_ev_score(df)
+        df = add_kelly_ratio(df)
+        df = add_value_strategy(df, strategy_mode=strategy_mode)
+        pred_df = df
+    except Exception as e:
+        return {"error": f"予想実行エラーにゃ: {e}\n詳細にゃ: {_tb.format_exc()}"}
+
+    # 実際の着順をマージするにゃ
+    finish_map = {}
+    for _, row in df.iterrows():
+        key = (str(row.get("race_key", "")), str(_safe_int(row.get("horse_no", 0), 0)))
+        finish_map[key] = _safe_int(row.get("finish", 99), 99)
+
+    pred_df["actual_finish"] = pred_df.apply(
+        lambda r: finish_map.get(
+            (str(r.get("race_key", "")), str(_safe_int(r.get("horse_no", 0), 0))), 99),
+        axis=1
+    )
+    pred_df["is_win"]   = pred_df["actual_finish"] == 1
+    pred_df["is_top2"]  = pred_df["actual_finish"] <= 2
+    pred_df["is_top3"]  = pred_df["actual_finish"] <= 3
+
+    # ── 券種別集計にゃ ──
+    results = {}
+    race_keys = pred_df["race_key"].dropna().unique()
+    n_races = len(race_keys)
+
+    # 単勝・複勝・馬連・三連複・三連単の成績にゃ
+    tansho_hits = 0;  tansho_bets = 0;  tansho_return = 0.0
+    fukusho_hits = 0; fukusho_bets = 0; fukusho_return = 0.0
+    umaren_hits = 0;  umaren_bets = 0;  umaren_return = 0.0
+    san3_hits = 0;    san3_bets = 0;    san3_return = 0.0
+    san1_hits = 0;    san1_bets = 0;    san1_return = 0.0
+
+    race_records = []
+
+    for rk in race_keys:
+        rdf = pred_df[pred_df["race_key"] == rk].copy()
+        if rdf.empty:
+            continue
+
+        # 予算: 1レース100円×買い目数にゃ
+        buy_df = rdf[rdf["buy_flag"] == "買い"].copy() if "buy_flag" in rdf.columns \
+            else rdf.head(3).copy()
+
+        if buy_df.empty:
+            continue
+
+        # 実際の1着・2着・3着馬にゃ
+        winner  = rdf[rdf["actual_finish"] == 1]
+        second  = rdf[rdf["actual_finish"] == 2]
+        third   = rdf[rdf["actual_finish"] == 3]
+        w_no    = str(_safe_int(winner["horse_no"].iloc[0],  0)) if not winner.empty  else ""
+        s_no    = str(_safe_int(second["horse_no"].iloc[0],  0)) if not second.empty  else ""
+        t_no    = str(_safe_int(third["horse_no"].iloc[0],   0)) if not third.empty   else ""
+        top3_set = {w_no, s_no, t_no} - {"0", ""}
+
+        buy_nos = set(str(_safe_int(r["horse_no"], 0)) for _, r in buy_df.iterrows())
+
+        # ── 単勝にゃ ──
+        # AI1位馬を単勝購入にゃ
+        ai1 = rdf.sort_values("ml_rank").iloc[0] if not rdf.empty else None
+        if ai1 is not None:
+            ai1_no = str(_safe_int(ai1["horse_no"], 0))
+            odds_ai1 = _safe_float(ai1.get("odds", 0), 0)
+            if min_odds <= odds_ai1 <= max_odds:
+                tansho_bets += 100
+                if ai1_no == w_no:
+                    ret = int(100 * odds_ai1 * (1 - 0.20))
+                    tansho_hits += 1
+                    tansho_return += ret
+                # 外れは0にゃ
+
+        # ── 複勝にゃ（買い判定馬を全部複勝にゃ）──
+        for _, brow in buy_df.iterrows():
+            bno  = str(_safe_int(brow["horse_no"], 0))
+            bods = _safe_float(brow.get("odds", 0), 0)
+            if min_odds <= bods <= max_odds:
+                fukusho_bets += 100
+                if bno in top3_set:
+                    # 複勝オッズの簡易推定にゃ（単勝×0.3 + フロアにゃ）
+                    fuku_est = max(1.1, bods * 0.3)
+                    ret = int(100 * fuku_est * (1 - 0.20))
+                    fukusho_hits += 1
+                    fukusho_return += ret
+
+        # ── 馬連にゃ（AI上位2頭の組み合わせにゃ）──
+        top2 = rdf.sort_values("ml_rank").head(2)
+        if len(top2) == 2:
+            t2_nos = [str(_safe_int(r["horse_no"], 0)) for _, r in top2.iterrows()]
+            t2_odds = [_safe_float(r["odds"], 0) for _, r in top2.iterrows()]
+            avg_odds = sum(t2_odds) / 2
+            if min_odds <= avg_odds <= max_odds:
+                umaren_bets += 100
+                if set(t2_nos) <= top3_set and w_no in t2_nos:
+                    # 馬連オッズの簡易推定にゃ
+                    umaren_est = max(2.0, t2_odds[0] * t2_odds[1] * 0.15)
+                    ret = int(100 * umaren_est * (1 - 0.225))
+                    umaren_hits += 1
+                    umaren_return += ret
+
+        # ── 三連複にゃ（AI上位3頭BOXにゃ）──
+        top3_pred = rdf.sort_values("ml_rank").head(3)
+        if len(top3_pred) >= 3:
+            t3_nos = set(str(_safe_int(r["horse_no"], 0)) for _, r in top3_pred.iterrows())
+            t3_odds_list = [_safe_float(r["odds"], 0) for _, r in top3_pred.iterrows()]
+            avg_o3 = sum(t3_odds_list) / 3
+            if min_odds <= avg_o3 <= max_odds:
+                san3_bets += 100
+                if t3_nos == top3_set:
+                    # 三連複オッズの簡易推定にゃ
+                    san3_est = max(5.0,
+                        t3_odds_list[0] * t3_odds_list[1] * t3_odds_list[2] * 0.05)
+                    ret = int(100 * san3_est * (1 - 0.25))
+                    san3_hits += 1
+                    san3_return += ret
+
+        # ── 三連単にゃ（AI1位→2位→3位にゃ）──
+        top3_san = rdf.sort_values("ml_rank").head(3)
+        if len(top3_san) >= 3:
+            ts_nos = [str(_safe_int(r["horse_no"], 0)) for _, r in top3_san.iterrows()]
+            ts_odds = [_safe_float(r["odds"], 0) for _, r in top3_san.iterrows()]
+            avg_ts = sum(ts_odds) / 3
+            if min_odds <= avg_ts <= max_odds:
+                san1_bets += 100
+                if ts_nos[0]==w_no and ts_nos[1]==s_no and ts_nos[2]==t_no:
+                    san1_est = max(10.0,
+                        ts_odds[0]*ts_odds[1]*ts_odds[2]*0.15)
+                    ret = int(100 * san1_est * (1 - 0.25))
+                    san1_hits += 1
+                    san1_return += ret
+
+        # レース記録にゃ
+        race_records.append({
+            "レースにゃ": rdf["race_label"].iloc[0] if "race_label" in rdf.columns else rk,
+            "1着にゃ": f"馬番{w_no}" if w_no else "-",
+            "2着にゃ": f"馬番{s_no}" if s_no else "-",
+            "3着にゃ": f"馬番{t_no}" if t_no else "-",
+            "AI1位にゃ": f"馬番{ai1_no}" if ai1 is not None else "-",
+            "AI1位単勝にゃ": "✅" if (ai1 is not None and ai1_no == w_no) else "❌",
+            "複勝的中にゃ": "✅" if any(
+                str(_safe_int(r["horse_no"],0)) in top3_set
+                for _,r in buy_df.iterrows()
+            ) else "❌",
+            "三連複的中にゃ": "✅" if (
+                len(top3_pred)>=3 and
+                set(str(_safe_int(r["horse_no"],0)) for _,r in top3_pred.iterrows())==top3_set
+            ) else "❌",
+        })
+
+    def pct(h, b):
+        return f"{h/b*100:.1f}%" if b > 0 else "0.0%"
+
+    def roi(r, b):
+        return f"{r/b*100:.1f}%" if b > 0 else "0.0%"
+
+    results = {
+        "総レース数にゃ": n_races,
+        "券種別成績にゃ": pd.DataFrame([
+            {
+                "券種にゃ": "単勝にゃ（AI1位固定にゃ）",
+                "購入回数にゃ": tansho_bets // 100,
+                "的中回数にゃ": tansho_hits,
+                "的中率にゃ":    pct(tansho_hits, tansho_bets // 100),
+                "投資額にゃ":    f"¥{tansho_bets:,}",
+                "回収額にゃ":    f"¥{int(tansho_return):,}",
+                "回収率にゃ":    roi(tansho_return, tansho_bets),
+            },
+            {
+                "券種にゃ": "複勝にゃ（買い判定馬にゃ）",
+                "購入回数にゃ": fukusho_bets // 100,
+                "的中回数にゃ": fukusho_hits,
+                "的中率にゃ":    pct(fukusho_hits, fukusho_bets // 100),
+                "投資額にゃ":    f"¥{fukusho_bets:,}",
+                "回収額にゃ":    f"¥{int(fukusho_return):,}",
+                "回収率にゃ":    roi(fukusho_return, fukusho_bets),
+            },
+            {
+                "券種にゃ": "馬連にゃ（AI上位2頭にゃ）",
+                "購入回数にゃ": umaren_bets // 100,
+                "的中回数にゃ": umaren_hits,
+                "的中率にゃ":    pct(umaren_hits, umaren_bets // 100),
+                "投資額にゃ":    f"¥{umaren_bets:,}",
+                "回収額にゃ":    f"¥{int(umaren_return):,}",
+                "回収率にゃ":    roi(umaren_return, umaren_bets),
+            },
+            {
+                "券種にゃ": "三連複にゃ（AI上位3頭BOXにゃ）",
+                "購入回数にゃ": san3_bets // 100,
+                "的中回数にゃ": san3_hits,
+                "的中率にゃ":    pct(san3_hits, san3_bets // 100),
+                "投資額にゃ":    f"¥{san3_bets:,}",
+                "回収額にゃ":    f"¥{int(san3_return):,}",
+                "回収率にゃ":    roi(san3_return, san3_bets),
+            },
+            {
+                "券種にゃ": "三連単にゃ（AI順1→2→3にゃ）",
+                "購入回数にゃ": san1_bets // 100,
+                "的中回数にゃ": san1_hits,
+                "的中率にゃ":    pct(san1_hits, san1_bets // 100),
+                "投資額にゃ":    f"¥{san1_bets:,}",
+                "回収額にゃ":    f"¥{int(san1_return):,}",
+                "回収率にゃ":    roi(san1_return, san1_bets),
+            },
+        ]),
+        "レース別成績にゃ": pd.DataFrame(race_records),
+        "raw": {
+            "tansho":  (tansho_hits,  tansho_bets,  tansho_return),
+            "fukusho": (fukusho_hits, fukusho_bets, fukusho_return),
+            "umaren":  (umaren_hits,  umaren_bets,  umaren_return),
+            "san3":    (san3_hits,    san3_bets,    san3_return),
+            "san1":    (san1_hits,    san1_bets,    san1_return),
+        }
+    }
+    return results
+
+
+def show_backtest_tab(bundle, strategy_mode: str = STRATEGY_MODE_ROI):
+    """
+    バックテストタブのUI にゃ。
+    過去データをアップロードして的中率・回収率を自動計算するにゃ🐾
+    """
+    st.header("📊 バックテスト（実績検証）にゃ🐾")
+    st.caption(
+        "過去の出馬表＋着順データをアップロードすると、"
+        "実際の的中率・回収率を自動計算するにゃ🐾\n"
+        "**yosou.csv**（TARGET形式・着順列付き）または"
+        "簡易CSV（finish列付き）を使うにゃ。"
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        bt_file = st.file_uploader(
+            "過去データCSVにゃ（finish列必須にゃ）",
+            type=["csv"], key="bt_upload"
+        )
+    with col2:
+        use_yosou = st.checkbox(
+            f"yosou.csv を使うにゃ（{TARGET_CSV_PATH.name}）",
+            value=TARGET_CSV_PATH.exists()
+        )
+        min_o = st.number_input("最低オッズにゃ（対象レースにゃ）", 1.0, 10.0, 1.0, 0.5)
+        max_o = st.number_input("最高オッズにゃ（対象レースにゃ）", 10.0, 9999.0, 9999.0, 10.0)
+
+    # データ読み込みにゃ
+    hist_df = None
+    if bt_file is not None:
+        raw = bt_file.read()
+        try:
+            hist_df = normalize_52cols(read_csv_bytes(raw), bt_file.name)
+        except Exception:
+            try:
+                hist_df = read_simple_csv_to_52(raw, bt_file.name)
+            except Exception as e:
+                st.error(f"CSVを読めなかったにゃ: {e}")
+
+    elif use_yosou and TARGET_CSV_PATH.exists():
+        hist_df = read_target_history_csv(TARGET_CSV_PATH)
+
+    if hist_df is None:
+        st.info(
+            "📂 過去データをアップロードするか、"
+            "yosou.csv を配置するにゃ🐾\n\n"
+            "**必要な列にゃ**: 馬名・馬番・オッズ・人気・finish（着順）にゃ"
+        )
+        with st.expander("バックテスト用CSVのサンプルにゃ"):
+            st.code(
+                "日付,馬番,馬名,オッズ,人気,finish,競馬場,レース番号\n"
+                "20260101,1,サンプルAにゃ,2.8,1,1,東京,11\n"
+                "20260101,2,サンプルBにゃ,8.5,5,3,東京,11\n"
+                "20260101,3,サンプルCにゃ,5.1,2,2,東京,11\n",
+                language="csv"
+            )
+        return
+
+    # finish列の確認にゃ
+    if "finish" not in hist_df.columns:
+        st.error("❌ finish（着順）列がないにゃ。着順入りCSVをアップロードするにゃ🐾")
+        return
+
+    valid_rows = hist_df["finish"].notna().sum()
+    total_rows = len(hist_df)
+    n_races_est = hist_df["race_key"].nunique() if "race_key" in hist_df.columns else "?"
+    st.success(
+        f"✅ データ読み込み完了にゃ: {total_rows}行 / 有効着順: {valid_rows}行 / "
+        f"推定レース数: {n_races_est}にゃ"
+    )
+
+    if st.button("🐾 バックテスト実行にゃ！", type="primary", key="bt_run"):
+        with st.spinner("バックテスト実行中にゃ...（レース数が多いと時間がかかるにゃ🐾）"):
+            results = run_backtest(
+                bundle, hist_df,
+                strategy_mode=strategy_mode,
+                min_odds=min_o, max_odds=max_o
+            )
+
+        if "error" in results:
+            st.error(f"❌ {results['error']}")
+            return
+
+        st.markdown("---")
+        st.subheader(f"📈 バックテスト結果にゃ（{results['総レース数にゃ']}レース分にゃ）")
+
+        # ── サマリーメトリクスにゃ ──
+        raw = results["raw"]
+        m1,m2,m3,m4,m5 = st.columns(5)
+        m1.metric(
+            "単勝的中率にゃ",
+            f"{raw['tansho'][0]/max(raw['tansho'][1]//100,1)*100:.1f}%",
+            f"回収率にゃ {raw['tansho'][2]/max(raw['tansho'][1],1)*100:.1f}%"
+        )
+        m2.metric(
+            "複勝的中率にゃ",
+            f"{raw['fukusho'][0]/max(raw['fukusho'][1]//100,1)*100:.1f}%",
+            f"回収率にゃ {raw['fukusho'][2]/max(raw['fukusho'][1],1)*100:.1f}%"
+        )
+        m3.metric(
+            "馬連的中率にゃ",
+            f"{raw['umaren'][0]/max(raw['umaren'][1]//100,1)*100:.1f}%",
+            f"回収率にゃ {raw['umaren'][2]/max(raw['umaren'][1],1)*100:.1f}%"
+        )
+        m4.metric(
+            "三連複的中率にゃ",
+            f"{raw['san3'][0]/max(raw['san3'][1]//100,1)*100:.1f}%",
+            f"回収率にゃ {raw['san3'][2]/max(raw['san3'][1],1)*100:.1f}%"
+        )
+        m5.metric(
+            "三連単的中率にゃ",
+            f"{raw['san1'][0]/max(raw['san1'][1]//100,1)*100:.1f}%",
+            f"回収率にゃ {raw['san1'][2]/max(raw['san1'][1],1)*100:.1f}%"
+        )
+
+        # 回収率の判定にゃ
+        fuku_roi = raw['fukusho'][2] / max(raw['fukusho'][1], 1) * 100
+        san3_roi = raw['san3'][2]    / max(raw['san3'][1],    1) * 100
+
+        st.markdown("---")
+        if fuku_roi >= 80:
+            st.success(f"✅ 複勝回収率 {fuku_roi:.1f}% にゃ！良好にゃ🐾")
+        elif fuku_roi >= 60:
+            st.warning(f"⚠️ 複勝回収率 {fuku_roi:.1f}% にゃ。改善の余地ありにゃ")
+        else:
+            st.error(f"🔴 複勝回収率 {fuku_roi:.1f}% にゃ。モデルの再学習を推奨するにゃ")
+
+        if san3_roi >= 100:
+            st.success(f"🎉 三連複回収率 {san3_roi:.1f}% にゃ！プラスにゃ！すごいにゃ🐾")
+        elif san3_roi >= 70:
+            st.info(f"📊 三連複回収率 {san3_roi:.1f}% にゃ。まずまずにゃ")
+        else:
+            st.warning(f"⚠️ 三連複回収率 {san3_roi:.1f}% にゃ。買い目を絞るにゃ")
+
+        # ── 券種別詳細にゃ ──
+        st.markdown("#### 🎯 券種別成績にゃ")
+        st.dataframe(
+            results["券種別成績にゃ"],
+            use_container_width=True, hide_index=True
+        )
+
+        # ── レース別成績にゃ ──
+        if not results["レース別成績にゃ"].empty:
+            st.markdown("#### 📋 レース別成績にゃ")
+            race_rec = results["レース別成績にゃ"]
+
+            # 色付きにゃ
+            def color_row(row):
+                if row.get("三連複的中にゃ") == "✅":
+                    return ["background-color:#d4edda"] * len(row)
+                if row.get("複勝的中にゃ") == "✅":
+                    return ["background-color:#fff3cd"] * len(row)
+                return [""] * len(row)
+
+            try:
+                st.dataframe(
+                    race_rec.style.apply(color_row, axis=1),
+                    use_container_width=True, hide_index=True
+                )
+            except Exception:
+                st.dataframe(race_rec, use_container_width=True, hide_index=True)
+
+            # CSVダウンロードにゃ
+            st.download_button(
+                "📥 バックテスト結果CSVにゃ",
+                data=race_rec.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="backtest_result.csv", mime="text/csv"
+            )
+
+        # ── 分析サマリーにゃ ──
+        st.markdown("---")
+        st.markdown("#### 💡 改善提案にゃ")
+        tan_rate = raw['tansho'][0]  / max(raw['tansho'][1]  // 100, 1) * 100
+        san3_rate= raw['san3'][0]    / max(raw['san3'][1]    // 100, 1) * 100
+        tips = []
+        if tan_rate < 15:
+            tips.append("🔴 単勝的中率が低いにゃ → AIの1位予想精度が低いにゃ。PKLの再学習を検討にゃ")
+        if san3_rate > 15:
+            tips.append("🟢 三連複的中率が高いにゃ → 配当を上げるため穴馬を相手に加えるにゃ")
+        if fuku_roi < 70:
+            tips.append("⚠️ 回収率が低いにゃ → 買い判定の閾値を上げて点数を絞るにゃ")
+        if san3_roi > 100:
+            tips.append("🎉 三連複がプラスにゃ → このロジックは有効にゃ！点数を増やすにゃ")
+        if not tips:
+            tips.append("📊 まずはデータ数を増やして傾向を掴むにゃ🐾")
+        for tip in tips:
+            st.info(tip)
+
+
+
+
+# ============================================================
+# ============================================================
+# S級強化モジュールにゃ（期待値・見送り・展開 完全刷新にゃ）
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# 【S級-1】 展開予測エンジンにゃ
+# 当日メンバー全体の脚質バランスを分析して
+# 各馬への展開利不利スコアを計算するにゃ
+# ============================================================
+
+# 距離帯別の有利脚質テーブルにゃ
+DIST_STYLE_ADVANTAGE = {
+    # (距離下限, 距離上限): {脚質: 基本スコアにゃ}
+    (0,    1400): {"逃げ": 1.30, "先行": 1.15, "差し": 0.90, "追込": 0.70, "未取得": 1.00},
+    (1401, 1800): {"逃げ": 1.15, "先行": 1.10, "差し": 1.05, "追込": 0.85, "未取得": 1.00},
+    (1801, 2200): {"逃げ": 1.00, "先行": 1.05, "差し": 1.10, "追込": 1.00, "未取得": 1.00},
+    (2201, 9999): {"逃げ": 0.85, "先行": 1.00, "差し": 1.15, "追込": 1.10, "未取得": 1.00},
+}
+
+# コース種別×脚質の有利テーブルにゃ
+TRACK_STYLE_ADVANTAGE = {
+    # 芝にゃ（差し・追込が有利にゃ）
+    "芝": {"逃げ": 0.95, "先行": 1.00, "差し": 1.08, "追込": 1.05, "未取得": 1.00},
+    # ダートにゃ（先行・逃げが有利にゃ）
+    "ダ": {"逃げ": 1.20, "先行": 1.15, "差し": 0.90, "追込": 0.75, "未取得": 1.00},
+    "ダート": {"逃げ": 1.20, "先行": 1.15, "差し": 0.90, "追込": 0.75, "未取得": 1.00},
+}
+
+# 馬場状態×脚質の有利テーブルにゃ
+GOING_STYLE_ADVANTAGE = {
+    "良":   {"逃げ": 1.00, "先行": 1.00, "差し": 1.00, "追込": 1.00, "未取得": 1.00},
+    "稍重": {"逃げ": 1.05, "先行": 1.05, "差し": 0.98, "追込": 0.95, "未取得": 1.00},
+    "重":   {"逃げ": 1.10, "先行": 1.08, "差し": 0.95, "追込": 0.88, "未取得": 1.00},
+    "不良": {"逃げ": 1.15, "先行": 1.10, "差し": 0.90, "追込": 0.80, "未取得": 1.00},
+}
+
+# 枠順×脚質の有利テーブルにゃ（内枠=逃げ先行有利にゃ）
+def _frame_style_bonus(frame_no: int, field_size: int, style: str) -> float:
+    """枠番と脚質の組み合わせボーナスにゃ"""
+    if field_size <= 0:
+        return 1.0
+    frame_ratio = frame_no / max(field_size / 2, 1)  # 内枠=低い、外枠=高いにゃ
+    if style in ["逃げ", "先行"]:
+        # 内枠ほど有利にゃ
+        return 1.0 + (1.0 - min(frame_ratio, 2.0)) * 0.08
+    elif style in ["差し", "追込"]:
+        # 外枠の方がやや有利にゃ（包まれにくいにゃ）
+        return 1.0 + min(frame_ratio - 1.0, 1.0) * 0.04
+    return 1.0
+
+
+def analyze_pace(race_df: pd.DataFrame) -> dict:
+    """
+    当日メンバーのペース予測にゃ。
+    逃げ・先行馬の頭数からハイペース/スローを推定するにゃ。
+    """
+    if "running_style" not in race_df.columns:
+        return {"pace": "不明", "escape_count": 0, "front_count": 0,
+                "pace_score": 0.5, "pace_note": "脚質データなしにゃ"}
+
+    styles = race_df["running_style"].fillna("未取得")
+    escape_count = int((styles == "逃げ").sum())
+    senkou_count = int((styles == "先行").sum())
+    sashi_count  = int((styles == "差し").sum())
+    oikomi_count = int((styles == "追込").sum())
+    front_count  = escape_count + senkou_count
+    field_size   = max(len(race_df), 1)
+
+    front_ratio = front_count / field_size
+
+    # ペース判定にゃ
+    if escape_count >= 3 or front_ratio >= 0.45:
+        pace = "ハイペース"
+        pace_score = 0.8   # 差し・追込有利スコアにゃ
+        pace_note = f"逃げ{escape_count}頭・先行{senkou_count}頭でハイペース濃厚にゃ"
+    elif escape_count == 0 or (escape_count == 1 and senkou_count <= 2):
+        pace = "スローペース"
+        pace_score = 0.2   # 逃げ・先行有利スコアにゃ
+        pace_note = f"逃げ{escape_count}頭・先行{senkou_count}頭でスロー濃厚にゃ"
+    elif escape_count == 1 and front_ratio <= 0.35:
+        pace = "ミドルペース"
+        pace_score = 0.5
+        pace_note = f"逃げ1頭でミドルペース想定にゃ"
+    else:
+        pace = "流動的"
+        pace_score = 0.5
+        pace_note = f"逃げ{escape_count}頭・先行{senkou_count}頭で流動的にゃ"
+
+    return {
+        "pace": pace,
+        "escape_count": escape_count,
+        "senkou_count": senkou_count,
+        "sashi_count": sashi_count,
+        "oikomi_count": oikomi_count,
+        "front_count": front_count,
+        "field_size": field_size,
+        "pace_score": pace_score,
+        "pace_note": pace_note,
+    }
+
+
+def add_pace_advantage(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    各馬にペース適性スコアを付与するにゃ。
+    展開利不利を総合スコア化するにゃ。
+
+    【スコア体系にゃ】
+    pace_advantage: 展開有利度（高いほど有利にゃ）にゃ
+    pace_note_detail: 展開メモにゃ
+    """
+    df = df.copy()
+    if "running_style" not in df.columns:
+        df = add_running_style(df)
+
+    # レース情報を取得にゃ
+    pace_info   = analyze_pace(df)
+    pace_score  = pace_info["pace_score"]   # 0=逃げ先行有利, 1=差し追込有利にゃ
+    pace        = pace_info["pace"]
+    distance    = _safe_int(df["distance"].iloc[0] if "distance" in df.columns else 2000, 2000)
+    track_type  = str(df["track_type"].iloc[0] if "track_type" in df.columns else "芝").strip()
+    going       = str(df["going"].iloc[0] if "going" in df.columns else "良").strip()
+    field_size  = _safe_int(df["field_size"].max() if "field_size" in df.columns else len(df), len(df))
+
+    # 距離帯別有利テーブルにゃ
+    dist_table = {1.0: 1.0}
+    for (lo, hi), tbl in DIST_STYLE_ADVANTAGE.items():
+        if lo <= distance <= hi:
+            dist_table = tbl
+            break
+
+    track_table = TRACK_STYLE_ADVANTAGE.get(track_type, TRACK_STYLE_ADVANTAGE["芝"])
+    going_table = GOING_STYLE_ADVANTAGE.get(going, GOING_STYLE_ADVANTAGE["良"])
+
+    advantages = []
+    for _, row in df.iterrows():
+        style    = str(row.get("running_style", "未取得"))
+        frame_no = _safe_int(row.get("frame_no", 1), 1)
+
+        # 基本スコアにゃ（距離・トラック・馬場にゃ）
+        dist_adv  = dist_table.get(style, 1.0)
+        track_adv = track_table.get(style, 1.0)
+        going_adv = going_table.get(style, 1.0)
+
+        # ペース適性にゃ
+        if style == "逃げ":
+            # スローなら超有利、ハイなら超不利にゃ
+            pace_adv = 1.0 + (0.5 - pace_score) * 0.6
+            n_escape = pace_info["escape_count"]
+            if n_escape >= 2:
+                pace_adv *= 0.80  # 逃げ馬が多いと競合するにゃ
+        elif style == "先行":
+            pace_adv = 1.0 + (0.5 - pace_score) * 0.3
+        elif style == "差し":
+            pace_adv = 1.0 + (pace_score - 0.5) * 0.4
+        elif style == "追込":
+            pace_adv = 1.0 + (pace_score - 0.5) * 0.6
+        else:
+            pace_adv = 1.0
+
+        # 枠順ボーナスにゃ
+        frame_adv = _frame_style_bonus(frame_no, field_size, style)
+
+        # 総合展開スコアにゃ（各要素の積にゃ）
+        total = dist_adv * track_adv * going_adv * pace_adv * frame_adv
+
+        # メモにゃ
+        note_parts = []
+        if pace_adv > 1.05:
+            note_parts.append(f"{pace}有利にゃ")
+        elif pace_adv < 0.95:
+            note_parts.append(f"{pace}不利にゃ")
+        if dist_adv > 1.05:
+            note_parts.append("距離適性◎にゃ")
+        elif dist_adv < 0.95:
+            note_parts.append("距離適性△にゃ")
+        if going_adv > 1.05:
+            note_parts.append(f"馬場{going}○にゃ")
+        elif going_adv < 0.95:
+            note_parts.append(f"馬場{going}×にゃ")
+        if frame_adv > 1.05:
+            note_parts.append(f"枠{frame_no}番有利にゃ")
+        elif frame_adv < 0.95:
+            note_parts.append(f"枠{frame_no}番不利にゃ")
+
+        advantages.append({
+            "pace_advantage": round(float(total), 4),
+            "pace_adv_detail": "・".join(note_parts) if note_parts else "展開中立にゃ",
+            "pace_dist_adv": round(float(dist_adv), 3),
+            "pace_track_adv": round(float(track_adv), 3),
+            "pace_going_adv": round(float(going_adv), 3),
+            "pace_pace_adv": round(float(pace_adv), 3),
+            "pace_frame_adv": round(float(frame_adv), 3),
+        })
+
+    adv_df = pd.DataFrame(advantages, index=df.index)
+    for col in adv_df.columns:
+        df[col] = adv_df[col]
+
+    df["pace_summary"] = pace_info["pace"]
+    df["pace_note"]    = pace_info["pace_note"]
+    return df
+
+
+# ============================================================
+# 【S級-2】 多次元期待値計算エンジンにゃ
+# 単純な「AI確率 - 市場確率」だけでなく
+# 展開・騎手・距離・馬場・枠順を全部考慮するにゃ
+# ============================================================
+
+def add_ev_score_v2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    S級期待値計算にゃ（v26強化版にゃ）
+
+    【計算式にゃ】
+    ev_score_v2 = (AI確率 × 展開スコア × 騎手ボーナス) - 市場暗示確率
+    ev_composite = ev_score_v2 × オッズ（実質期待値にゃ）
+
+    展開スコアで「展開有利な馬の期待値を上積み」するにゃ🐾
+    """
+    df = df.copy()
+
+    # 既存のev_scoreがないなら計算するにゃ
+    if "ev_score" not in df.columns:
+        df = add_ev_score(df)
+
+    if "pace_advantage" not in df.columns:
+        df = add_pace_advantage(df)
+
+    prob   = pd.to_numeric(df["ml_top3_prob"], errors="coerce").fillna(0)
+    odds   = pd.to_numeric(df["odds"],         errors="coerce").fillna(0)
+    implied= pd.to_numeric(df["implied_top3"], errors="coerce").fillna(0)
+    pace   = pd.to_numeric(df["pace_advantage"],errors="coerce").fillna(1.0)
+    jr     = pd.to_numeric(df.get("jockey_top3_rate_prior", 0.25), errors="coerce").fillna(0.25)
+    dr     = pd.to_numeric(df.get("horse_distance_top3_rate_prior", 0.25), errors="coerce").fillna(0.25)
+    tr     = pd.to_numeric(df.get("trainer_top3_rate_prior", 0.25), errors="coerce").fillna(0.25)
+
+    # 騎手ボーナス（平均より上回っていればプラスにゃ）
+    jockey_bonus = ((jr / 0.28) - 1.0).clip(-0.15, 0.20)
+
+    # 距離適性ボーナス（過去の距離実績にゃ）
+    dist_bonus = ((dr / 0.28) - 1.0).clip(-0.10, 0.15)
+
+    # 展開補正済みAI確率にゃ
+    prob_adjusted = (prob * pace.clip(0.7, 1.4)).clip(0, 0.95)
+
+    # 多次元EV計算にゃ
+    valid = odds > 1.0
+    ev_v2_raw = prob_adjusted - implied + jockey_bonus * 0.3 + dist_bonus * 0.2
+    df["ev_score_v2"]    = np.where(valid, ev_v2_raw, 0.0).round(4)
+
+    # 実質期待値にゃ（回収率ベースにゃ）
+    df["ev_composite"]   = np.where(
+        valid,
+        (prob_adjusted * odds * (1 - FUKUSHO_DEDUCTION) - 1.0).round(4),
+        0.0
+    )
+
+    # EV信頼度にゃ（騎手・距離・展開が全部プラスのときS評価にゃ）
+    def ev_grade(row):
+        ev2  = _safe_float(row.get("ev_score_v2",  0), 0)
+        evc  = _safe_float(row.get("ev_composite", 0), 0)
+        pace_a = _safe_float(row.get("pace_advantage", 1.0), 1.0)
+        if ev2 >= 0.10 and evc >= 0.20 and pace_a >= 1.05: return "S"
+        if ev2 >= 0.06 and evc >= 0.10:                    return "A"
+        if ev2 >= 0.02 and evc >= 0.00:                    return "B"
+        if ev2 >= -0.03:                                    return "C"
+        return "D"
+
+    df["ev_grade"] = df.apply(ev_grade, axis=1)
+
+    return df
+
+
+# ============================================================
+# 【S級-3】 見送り判定エンジン（完全刷新にゃ）
+# 単純なKelly比不足・危険馬判定から
+# 多角的な「見送り理由スコア」に進化にゃ
+# ============================================================
+
+# 見送り判定の各要素にゃ
+PASS_WEIGHTS = {
+    "危険人気馬": 100,   # 即見送りにゃ
+    "展開大不利": 60,
+    "EV大幅マイナス": 50,
+    "AI圏外": 40,
+    "Kelly不足": 30,
+    "距離適性不良": 25,
+    "馬場適性不良": 20,
+    "外枠不利": 15,
+    "逃げ頭数多い": 10,
+}
+
+def add_pass_score(df: pd.DataFrame,
+                   strategy_mode: str = STRATEGY_MODE_ROI) -> pd.DataFrame:
+    """
+    S級見送り判定にゃ。
+    各馬に「見送りスコア」を付けて多角的に判定するにゃ。
+    スコアが高いほど見送り理由が多いにゃ。
+    """
+    df = df.copy()
+
+    for col, dv in [("ml_top3_prob", 0), ("ml_rank", 99), ("odds", 0),
+                    ("popularity", 99), ("ev_score_v2", 0), ("ev_composite", 0),
+                    ("pace_advantage", 1.0), ("kelly_ratio", 0),
+                    ("kelly_ratio_sanren", 0), ("danger_level", ""),
+                    ("pivot_confidence", 0)]:
+        if col not in df.columns:
+            df[col] = dv
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(dv) \
+            if col not in ["danger_level"] else df[col].fillna("")
+
+    pass_scores  = []
+    pass_reasons = []
+    buy_flags_v2 = []
+    buy_reasons_v2 = []
+
+    for _, row in df.iterrows():
+        score   = 0
+        reasons = []
+
+        ml_rank  = _safe_int(row.get("ml_rank",  99), 99)
+        pop      = _safe_int(row.get("popularity",99), 99)
+        ev2      = _safe_float(row.get("ev_score_v2",  0), 0)
+        evc      = _safe_float(row.get("ev_composite", 0), 0)
+        pace_a   = _safe_float(row.get("pace_advantage", 1.0), 1.0)
+        kf       = _safe_float(row.get("kelly_ratio", 0), 0)
+        ks       = _safe_float(row.get("kelly_ratio_sanren", 0), 0)
+        dl       = str(row.get("danger_level", ""))
+        dr       = _safe_float(row.get("horse_distance_top3_rate_prior", 0.25), 0.25)
+        jt       = _safe_float(row.get("jockey_top3_rate_prior", 0.25), 0.25)
+        prob     = _safe_float(row.get("ml_top3_prob", 0), 0)
+        ev_grade = str(row.get("ev_grade", "C"))
+
+        # ── 見送り要因チェックにゃ ──
+        if dl in ["強危険", "危険"]:
+            score += PASS_WEIGHTS["危険人気馬"]
+            reasons.append(f"⚠️危険人気馬({dl})にゃ")
+
+        if pace_a < 0.85:
+            score += PASS_WEIGHTS["展開大不利"]
+            reasons.append(f"🌪️展開大不利({pace_a:.2f})にゃ")
+        elif pace_a < 0.92:
+            score += PASS_WEIGHTS["展開大不利"] // 2
+            reasons.append(f"🌪️展開不利({pace_a:.2f})にゃ")
+
+        if ev2 < -0.10:
+            score += PASS_WEIGHTS["EV大幅マイナス"]
+            reasons.append(f"📉EV大幅マイナス({ev2:.3f})にゃ")
+        elif ev2 < -0.05:
+            score += PASS_WEIGHTS["EV大幅マイナス"] // 2
+            reasons.append(f"📉EVマイナス({ev2:.3f})にゃ")
+
+        if ml_rank > 6:
+            score += PASS_WEIGHTS["AI圏外"]
+            reasons.append(f"🤖AI{ml_rank}位（圏外）にゃ")
+        elif ml_rank > 4 and strategy_mode == STRATEGY_MODE_ROI:
+            score += PASS_WEIGHTS["AI圏外"] // 2
+            reasons.append(f"🤖AI{ml_rank}位（回収率重視では厳しいにゃ）")
+
+        if kf < MIN_KELLY_RATIO and ks < MIN_KELLY_RATIO:
+            score += PASS_WEIGHTS["Kelly不足"]
+            reasons.append(f"📊Kelly不足(複:{kf:.3f}/三:{ks:.3f})にゃ")
+
+        if dr < 0.15:
+            score += PASS_WEIGHTS["距離適性不良"]
+            reasons.append(f"📏距離適性不良({dr:.1%})にゃ")
+
+        # ── 買い判定にゃ ──
+        if score >= PASS_WEIGHTS["危険人気馬"]:
+            # 即見送りにゃ
+            buy_v2 = "見送り"
+            buy_r  = "・".join(reasons[:2])
+        elif strategy_mode == STRATEGY_MODE_ROI:
+            # 回収率重視: EV+展開両方OKにゃ
+            if score <= 10 and ev2 >= 0.05 and pace_a >= 1.00 and ml_rank <= 5:
+                buy_v2 = "◎買い"
+                buy_r  = f"EV{ev2:.3f}・展開{pace_a:.2f}・AI{ml_rank}位にゃ"
+            elif score <= 20 and ev2 >= 0.02 and ml_rank <= 4:
+                buy_v2 = "○買い"
+                buy_r  = f"EV{ev2:.3f}・AI{ml_rank}位にゃ"
+            elif score <= 30 and ev_grade in ["S","A"] and prob >= 0.20:
+                buy_v2 = "▲買い"
+                buy_r  = f"EVグレード{ev_grade}・確率{prob:.1%}にゃ"
+            elif score >= 50:
+                buy_v2 = "見送り"
+                buy_r  = "・".join(reasons[:2]) if reasons else "総合スコア不足にゃ"
+            else:
+                buy_v2 = "△検討"
+                buy_r  = f"スコア{score}点にゃ"
+        else:
+            # 的中率重視: AI上位+確率重視にゃ
+            if score <= 15 and ml_rank <= 3 and prob >= 0.22:
+                buy_v2 = "◎買い"
+                buy_r  = f"AI{ml_rank}位・確率{prob:.1%}にゃ"
+            elif score <= 25 and ml_rank <= 5 and pop <= 5:
+                buy_v2 = "○買い"
+                buy_r  = f"AI{ml_rank}位・人気{pop}にゃ"
+            elif score >= 60:
+                buy_v2 = "見送り"
+                buy_r  = "・".join(reasons[:2]) if reasons else "総合スコア不足にゃ"
+            else:
+                buy_v2 = "△検討"
+                buy_r  = f"スコア{score}点にゃ"
+
+        pass_scores.append(score)
+        pass_reasons.append("・".join(reasons) if reasons else "問題なしにゃ")
+        buy_flags_v2.append(buy_v2)
+        buy_reasons_v2.append(buy_r)
+
+    df["pass_score"]     = pass_scores
+    df["pass_reason"]    = pass_reasons
+    df["buy_flag_v2"]    = buy_flags_v2
+    df["buy_reason_v2"]  = buy_reasons_v2
+
+    return df
+
+
+# ============================================================
+# 【S級-4】 総合予想スコア（全要素を統合にゃ）
+# ============================================================
+
+def add_final_score(df: pd.DataFrame,
+                    strategy_mode: str = STRATEGY_MODE_ROI) -> pd.DataFrame:
+    """
+    全要素を統合した最終スコアにゃ。
+
+    final_score = AI確率(40%) + EV複合(25%) + 展開適性(20%) + 実績(15%)
+    """
+    df = df.copy()
+
+    prob  = pd.to_numeric(df.get("ml_top3_prob",  0), errors="coerce").fillna(0)
+    ev2   = pd.to_numeric(df.get("ev_score_v2",   0), errors="coerce").fillna(0)
+    evc   = pd.to_numeric(df.get("ev_composite",  0), errors="coerce").fillna(0)
+    pace  = pd.to_numeric(df.get("pace_advantage",1), errors="coerce").fillna(1.0)
+    jr    = pd.to_numeric(df.get("jockey_top3_rate_prior",  0.25), errors="coerce").fillna(0.25)
+    dr    = pd.to_numeric(df.get("horse_distance_top3_rate_prior", 0.25), errors="coerce").fillna(0.25)
+    tr    = pd.to_numeric(df.get("trainer_top3_rate_prior", 0.25), errors="coerce").fillna(0.25)
+    kf    = pd.to_numeric(df.get("kelly_ratio",          0), errors="coerce").fillna(0)
+    ks    = pd.to_numeric(df.get("kelly_ratio_sanren",   0), errors="coerce").fillna(0)
+    pconf = pd.to_numeric(df.get("pivot_confidence",     0), errors="coerce").fillna(0)
+    pscr  = pd.to_numeric(df.get("pass_score",          99), errors="coerce").fillna(99)
+
+    # 各要素を0〜1に正規化にゃ
+    ai_score     = prob.clip(0, 1)
+    ev_score_n   = (ev2 * 2 + 0.5).clip(0, 1)
+    pace_score_n = (pace - 0.7).clip(0, 0.6) / 0.6
+    jitsuryoku   = (jr/0.35*0.4 + dr/0.35*0.35 + tr/0.35*0.25).clip(0, 1)
+
+    if strategy_mode == STRATEGY_MODE_ROI:
+        final = (
+            ai_score   * 0.35
+            + ev_score_n * 0.30
+            + pace_score_n * 0.20
+            + jitsuryoku * 0.15
+        )
+    else:
+        final = (
+            ai_score   * 0.45
+            + pace_score_n * 0.20
+            + jitsuryoku * 0.20
+            + ev_score_n * 0.15
+        )
+
+    # 見送りペナルティにゃ
+    penalty = (pscr / 200).clip(0, 0.5)
+    final   = (final - penalty).clip(0, 1)
+
+    df["final_score"] = final.round(4)
+
+    # 最終印にゃ（final_scoreベースにゃ）
+    def final_mark(row):
+        fs = _safe_float(row.get("final_score", 0), 0)
+        bv = str(row.get("buy_flag_v2", ""))
+        if "見送り" in bv:
+            return "×"
+        if fs >= 0.65: return "◎"
+        if fs >= 0.50: return "○"
+        if fs >= 0.38: return "▲"
+        if fs >= 0.25: return "△"
+        return "×"
+
+    df["final_mark"] = df.apply(final_mark, axis=1)
+    return df
+
+
+# ============================================================
+# 【S級-5】 展開表示にゃ
+# ============================================================
+
+def show_pace_analysis(race_df: pd.DataFrame):
+    """展開予測タブの表示にゃ"""
+    st.subheader("🌪️ 展開予測＆有利不利分析にゃ")
+
+    if "pace_advantage" not in race_df.columns:
+        st.warning("展開データが計算されていないにゃ。予想を再実行するにゃ🐾")
+        return
+
+    pace_info = analyze_pace(race_df)
+    pace      = pace_info["pace"]
+    pace_icon = {"ハイペース":"🔥","スローペース":"💤","ミドルペース":"⚡","流動的":"🌀"}.get(pace,"❓")
+
+    # ペース概要にゃ
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("予想ペースにゃ", f"{pace_icon} {pace}")
+    c2.metric("逃げ馬数にゃ",   f"{pace_info['escape_count']}頭にゃ")
+    c3.metric("先行馬数にゃ",   f"{pace_info['senkou_count']}頭にゃ")
+    c4.metric("差し馬数にゃ",   f"{pace_info['sashi_count']}頭にゃ")
+    c5.metric("追込馬数にゃ",   f"{pace_info['oikomi_count']}頭にゃ")
+
+    st.info(f"📊 {pace_info['pace_note']}")
+
+    # ペース別有利脚質にゃ
+    if pace == "ハイペース":
+        st.success("🔥 ハイペース → **差し・追込馬が有利**にゃ！逃げ・先行は注意にゃ🐾")
+    elif pace == "スローペース":
+        st.success("💤 スローペース → **逃げ・先行馬が有利**にゃ！差し・追込には厳しいにゃ🐾")
+    elif pace == "ミドルペース":
+        st.info("⚡ ミドルペース → **先行馬が安定**にゃ。展開の綾が少ないにゃ")
+    else:
+        st.warning("🌀 流動的 → **展開読みが難しいにゃ**。AI確率重視で判断するにゃ")
+
+    # 各馬の展開有利不利テーブルにゃ
+    st.markdown("#### 🏇 馬別展開スコアにゃ")
+    cols_show = ["ml_rank","final_mark","horse_no","horse_name","running_style",
+                 "pace_advantage","pace_adv_detail","pace_dist_adv",
+                 "pace_track_adv","pace_going_adv","pace_pace_adv","pace_frame_adv"]
+    cols_show = [c for c in cols_show if c in race_df.columns]
+    disp = race_df[cols_show].sort_values("ml_rank").copy()
+
+    # カラー付けにゃ
+    def color_pace(row):
+        pa = _safe_float(row.get("展開スコアにゃ", row.get("pace_advantage", 1.0)), 1.0)
+        if pa >= 1.10: return ["background-color:#d4edda"]*len(row)
+        if pa >= 1.03: return ["background-color:#d1ecf1"]*len(row)
+        if pa <= 0.88: return ["background-color:#f8d7da"]*len(row)
+        if pa <= 0.95: return ["background-color:#fff3cd"]*len(row)
+        return [""]*len(row)
+
+    rename_map = {
+        "ml_rank":"AI順位にゃ","final_mark":"最終印にゃ",
+        "horse_no":"馬番にゃ","horse_name":"馬名にゃ",
+        "running_style":"脚質にゃ","pace_advantage":"展開スコアにゃ",
+        "pace_adv_detail":"展開メモにゃ","pace_dist_adv":"距離適性にゃ",
+        "pace_track_adv":"コース適性にゃ","pace_going_adv":"馬場適性にゃ",
+        "pace_pace_adv":"ペース適性にゃ","pace_frame_adv":"枠順適性にゃ",
+    }
+    disp = disp.rename(columns=rename_map)
+    try:
+        st.dataframe(disp.style.apply(color_pace, axis=1),
+                     use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # 展開有利馬ランキングにゃ
+    st.markdown("#### 🎯 展開有利馬 TOP5にゃ")
+    top5 = race_df.sort_values("pace_advantage", ascending=False).head(5)
+    for rank, (_, row) in enumerate(top5.iterrows(), 1):
+        pa   = _safe_float(row.get("pace_advantage", 1.0), 1.0)
+        icon = "🟢" if pa >= 1.05 else ("🟡" if pa >= 1.00 else "🔴")
+        hno  = _safe_int(row.get("horse_no", 0), 0)
+        name = str(row.get("horse_name", ""))
+        st = row.get("running_style", "不明")
+        note = str(row.get("pace_adv_detail", ""))
+        ai_r = _safe_int(row.get("ml_rank", 0), 0)
+        st_obj = __import__('streamlit')
+        st_obj.markdown(
+            f"{icon} **{rank}位** 馬番{hno} {name}（{st}）"
+            f"　展開スコア: **{pa:.3f}**　AI{ai_r}位　{note}"
+        )
+
+
+def show_ev_analysis_v2(race_df: pd.DataFrame):
+    """S級期待値分析タブにゃ"""
+    st.subheader("📈 S級期待値分析にゃ（展開補正済みにゃ）")
+
+    if "ev_score_v2" not in race_df.columns:
+        st.warning("期待値V2が計算されていないにゃ。予想を再実行するにゃ🐾")
+        return
+
+    # EVグレード分布にゃ
+    if "ev_grade" in race_df.columns:
+        grade_cnt = race_df["ev_grade"].value_counts()
+        c1,c2,c3,c4,c5 = st.columns(5)
+        for col, grade, icon in [
+            (c1,"S","🌟"),(c2,"A","⭐"),(c3,"B","✅"),(c4,"C","⚠️"),(c5,"D","❌")
+        ]:
+            cnt = int(grade_cnt.get(grade, 0))
+            col.metric(f"{icon} {grade}評価にゃ", f"{cnt}頭にゃ")
+
+    # 期待値テーブルにゃ
+    cols = ["ml_rank","final_mark","horse_no","horse_name","odds","popularity",
+            "ml_top3_prob","ev_score","ev_score_v2","ev_composite",
+            "ev_grade","pace_advantage","buy_flag_v2","buy_reason_v2","pass_score"]
+    cols = [c for c in cols if c in race_df.columns]
+    disp = race_df[cols].sort_values("ev_score_v2", ascending=False).copy()
+
+    # フォーマットにゃ
+    for c in ["ml_top3_prob"]:
+        if c in disp.columns:
+            disp[c] = (pd.to_numeric(disp[c], errors="coerce")*100).round(1).astype(str)+"%"
+    for c in ["ev_score","ev_score_v2","ev_composite","pace_advantage"]:
+        if c in disp.columns:
+            disp[c] = pd.to_numeric(disp[c], errors="coerce").round(4)
+
+    rename_map = {
+        "ml_rank":"AI順位","final_mark":"最終印",
+        "horse_no":"馬番","horse_name":"馬名",
+        "odds":"オッズ","popularity":"人気",
+        "ml_top3_prob":"AI確率","ev_score":"EV(旧)",
+        "ev_score_v2":"EV(展開補正)","ev_composite":"実質期待値",
+        "ev_grade":"EVグレード","pace_advantage":"展開スコア",
+        "buy_flag_v2":"買い判定","buy_reason_v2":"判定理由","pass_score":"見送りスコア",
+    }
+    disp = disp.rename(columns=rename_map)
+
+    def color_ev(row):
+        ev = _safe_float(row.get("EV(展開補正)", row.get("ev_score_v2", 0)), 0)
+        grade = str(row.get("EVグレード", "C"))
+        if grade == "S":  return ["background-color:#c3e6cb"]*len(row)
+        if grade == "A":  return ["background-color:#d1ecf1"]*len(row)
+        if ev < -0.08:    return ["background-color:#f8d7da"]*len(row)
+        return [""]*len(row)
+
+    try:
+        st.dataframe(disp.style.apply(color_ev, axis=1),
+                     use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # S・A評価馬の解説にゃ
+    if "ev_grade" in race_df.columns:
+        sa_horses = race_df[race_df["ev_grade"].isin(["S","A"])].sort_values(
+            "ev_score_v2", ascending=False)
+        if not sa_horses.empty:
+            st.markdown("#### 🌟 S・A評価馬（買い推奨にゃ）")
+            for _, row in sa_horses.iterrows():
+                hno   = _safe_int(row.get("horse_no",0),0)
+                name  = str(row.get("horse_name",""))
+                ev2   = _safe_float(row.get("ev_score_v2",0),0)
+                evc   = _safe_float(row.get("ev_composite",0),0)
+                grade = str(row.get("ev_grade",""))
+                pace  = _safe_float(row.get("pace_advantage",1.0),1.0)
+                ai_r  = _safe_int(row.get("ml_rank",0),0)
+                icon  = "🌟" if grade=="S" else "⭐"
+                st.success(
+                    f"{icon} **馬番{hno} {name}**（AI{ai_r}位）"
+                    f"　EV(補正)={ev2:.3f}　実質期待値={evc:.3f}　展開スコア={pace:.3f}にゃ"
+                )
+
+
+def show_pass_judgment(race_df: pd.DataFrame,
+                       strategy_mode: str = STRATEGY_MODE_ROI):
+    """S級見送り判定タブにゃ"""
+    st.subheader("🚦 S級買い/見送り判定にゃ（多角的スコアリングにゃ）")
+
+    if "pass_score" not in race_df.columns:
+        st.warning("見送りスコアが計算されていないにゃ。予想を再実行するにゃ🐾")
+        return
+
+    # サマリーにゃ
+    buy_cnt  = int((race_df["buy_flag_v2"].str.contains("買い")).sum()) \
+        if "buy_flag_v2" in race_df.columns else 0
+    pass_cnt = int((race_df["buy_flag_v2"] == "見送り").sum()) \
+        if "buy_flag_v2" in race_df.columns else 0
+    kento    = int((race_df["buy_flag_v2"] == "△検討").sum()) \
+        if "buy_flag_v2" in race_df.columns else 0
+
+    c1,c2,c3 = st.columns(3)
+    c1.metric("◎○▲買い推奨にゃ", f"{buy_cnt}頭にゃ")
+    c2.metric("△検討にゃ",        f"{kento}頭にゃ")
+    c3.metric("見送りにゃ",        f"{pass_cnt}頭にゃ")
+
+    # 判定テーブルにゃ
+    cols = ["ml_rank","final_mark","horse_no","horse_name","odds","popularity",
+            "ml_top3_prob","ev_grade","pace_advantage","pass_score","pass_reason",
+            "buy_flag_v2","buy_reason_v2"]
+    cols = [c for c in cols if c in race_df.columns]
+    disp = race_df[cols].copy()
+
+    # ソート: 買い→検討→見送り、その中でfinal_score降順にゃ
+    order_map = {"◎買い":0,"○買い":1,"▲買い":2,"△検討":3,"見送り":4}
+    if "buy_flag_v2" in disp.columns:
+        disp["_sort"] = disp["buy_flag_v2"].map(order_map).fillna(9)
+        if "final_score" in race_df.columns:
+            disp["_fs"] = race_df["final_score"].values
+            disp = disp.sort_values(["_sort","_fs"], ascending=[True,False])
+        else:
+            disp = disp.sort_values("_sort")
+        disp = disp.drop(columns=["_sort","_fs"] if "_fs" in disp.columns else ["_sort"])
+
+    if "ml_top3_prob" in disp.columns:
+        disp["ml_top3_prob"] = (pd.to_numeric(disp["ml_top3_prob"],errors="coerce")*100).round(1).astype(str)+"%"
+    if "pace_advantage" in disp.columns:
+        disp["pace_advantage"] = pd.to_numeric(disp["pace_advantage"],errors="coerce").round(3)
+
+    rename_map = {
+        "ml_rank":"AI順位","final_mark":"最終印",
+        "horse_no":"馬番","horse_name":"馬名",
+        "odds":"オッズ","popularity":"人気",
+        "ml_top3_prob":"AI確率","ev_grade":"EVグレード",
+        "pace_advantage":"展開スコア","pass_score":"見送りスコア",
+        "pass_reason":"見送り理由","buy_flag_v2":"判定","buy_reason_v2":"判定理由",
+    }
+    disp = disp.rename(columns=rename_map)
+
+    def color_judge(row):
+        judge = str(row.get("判定",""))
+        if "◎" in judge: return ["background-color:#c3e6cb"]*len(row)
+        if "○" in judge: return ["background-color:#d1ecf1"]*len(row)
+        if "▲" in judge: return ["background-color:#fff3cd"]*len(row)
+        if "見送り" in judge: return ["background-color:#f8d7da"]*len(row)
+        return [""]*len(row)
+
+    try:
+        st.dataframe(disp.style.apply(color_judge, axis=1),
+                     use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # 強力推奨馬にゃ
+    strong = race_df[race_df.get("buy_flag_v2","").str.startswith("◎")
+                     if "buy_flag_v2" in race_df.columns
+                     else pd.Series([False]*len(race_df))]
+    if not strong.empty:
+        st.markdown("---")
+        st.markdown("#### 🌟 強力推奨馬にゃ（◎買いにゃ）")
+        for _, row in strong.iterrows():
+            hno  = _safe_int(row.get("horse_no",0),0)
+            name = str(row.get("horse_name",""))
+            r    = str(row.get("buy_reason_v2",""))
+            ps   = _safe_int(row.get("pass_score",0),0)
+            st.success(f"◎ **馬番{hno} {name}**　{r}　見送りスコア={ps}点にゃ")
+
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI v26にゃ")
     st.success(f"起動版にゃ: {VERSION}にゃ")
@@ -5250,6 +6475,30 @@ def app_main():
             st.markdown("---")
             show_ev_ranking(race_df)
 
+            # ── S級分析タブにゃ ──
+            st.markdown("---")
+            st.subheader("🏆 S級分析にゃ（展開・期待値・見送り判定）")
+            s_tab1, s_tab2, s_tab3 = st.tabs([
+                "🌪️ 展開予測にゃ",
+                "📈 S級期待値にゃ",
+                "🚦 S級見送り判定にゃ",
+            ])
+            with s_tab1:
+                try:
+                    show_pace_analysis(race_df)
+                except Exception as e:
+                    st.warning(f"展開予測エラーにゃ: {e}")
+            with s_tab2:
+                try:
+                    show_ev_analysis_v2(race_df)
+                except Exception as e:
+                    st.warning(f"S級期待値エラーにゃ: {e}")
+            with s_tab3:
+                try:
+                    show_pass_judgment(race_df, strategy_mode=strategy_mode)
+                except Exception as e:
+                    st.warning(f"S級見送り判定エラーにゃ: {e}")
+
             # 三連複にゃ
             st.markdown("---")
             show_sanrenpuku_tabs(race_df, strategy_mode=strategy_mode)
@@ -5324,6 +6573,19 @@ def app_main():
             with st.expander("エラー詳細にゃ"):
                 import traceback
                 st.code(traceback.format_exc())
+
+    # ── バックテストセクションにゃ（予想ボタンと独立して動くにゃ）──
+    st.markdown("---")
+    with st.expander("📊 バックテスト（実績検証）にゃ🐾 - クリックして開くにゃ", expanded=False):
+        # バックテスト用に独自でbundleをロードするにゃ
+        try:
+            bundle_bt, bt_status = load_model_safely(uploaded_model)
+            if bundle_bt is not None:
+                show_backtest_tab(bundle_bt, strategy_mode=strategy_mode)
+            else:
+                st.info("PKLをアップロードするとバックテストができるにゃ🐾")
+        except Exception as _bt_load_err:
+            st.info(f"PKLをアップロードするとバックテストができるにゃ🐾")
 
     st.divider()
     with st.expander("簡易CSVテンプレにゃ（v26対応にゃ）"):

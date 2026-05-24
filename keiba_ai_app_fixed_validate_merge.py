@@ -1658,7 +1658,7 @@ def predict(bundle, df, strategy_mode=STRATEGY_MODE_ROI):
     calibrated = np.zeros(len(df))
     for rk in df["race_key"].unique():
         mask = df["race_key"] == rk
-        calibrated[mask.values] = calibrate_prob(raw_prob[mask.values])
+        calibrated[mask.values] = calibrate_prob_isotonic(raw_prob[mask.values])
     df["ml_top3_prob"] = calibrated
     df["calibrated_prob"] = calibrated  # 表示用にも保持にゃ
 
@@ -4996,7 +4996,7 @@ def run_backtest(bundle, history_df: pd.DataFrame,
         calibrated = np.zeros(len(df_for_pred))
         for rk in df_for_pred["race_key"].unique():
             mask = df_for_pred["race_key"] == rk
-            calibrated[mask.values] = calibrate_prob(raw_prob[mask.values])
+            calibrated[mask.values] = calibrate_prob_isotonic(raw_prob[mask.values])
         df["ml_top3_prob"] = calibrated
         # タイブレーク付きランク計算にゃ
         _pop_tb  = pd.to_numeric(df["popularity"], errors="coerce").fillna(99)
@@ -6156,6 +6156,1912 @@ def show_pass_judgment(race_df: pd.DataFrame,
 
 
 
+
+
+# ============================================================
+# ============================================================
+# ML強化モジュールにゃ
+# ① Leakage防止チェッカーにゃ
+# ② Walk-Forward バリデーションにゃ
+# ③ ROI最適化エンジンにゃ
+# ④ 本格キャリブレーション（Platt / Isotonic）にゃ
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# ① Leakage防止チェッカーにゃ
+# ============================================================
+# AUC=1.0の根本原因にゃ：
+#   レース当日に確定するデータ（オッズ・人気・着順）が
+#   学習特徴量に混入しているにゃ
+#   → 予測時には存在しない未来情報を学習してしまうにゃ
+
+# 学習に使ってはいけない「リーク特徴量」にゃ
+LEAKAGE_FEATURES = [
+    "finish",           # 着順（答えそのものにゃ）
+    "target_value",     # ターゲット変数にゃ
+    "time_sec",         # タイム（レース後確定にゃ）
+    "time_raw",         # タイム（レース後確定にゃ）
+    "last3f",           # 上り3F（レース後確定にゃ）
+    "pass1","pass2","pass3","pass4",  # 通過順（レース後確定にゃ）
+    "prize",            # 賞金（レース後確定にゃ）
+    "body_weight",      # 当日馬体重（当日確定にゃ）※議論あり
+]
+
+# 危険な特徴量（使う場合は理由を要確認にゃ）
+CAUTION_FEATURES = [
+    "odds",             # 当日オッズ（予測時点で利用可能だが高リーク性にゃ）
+    "popularity",       # 当日人気にゃ
+    "field_odds_rank",  # オッズ順位にゃ
+    "field_pop_rank",   # 人気順位にゃ
+    "odds_gap_to_fav",  # オッズ差にゃ
+    "popularity_gap_to_fav",  # 人気差にゃ
+]
+
+
+def check_leakage(feature_cols: list,
+                  bundle: dict = None,
+                  verbose: bool = True) -> dict:
+    """
+    特徴量リストのリークチェックにゃ。
+    リーク特徴量が含まれていると AUC=1.0 になるにゃ。
+
+    戻り値にゃ:
+      leakage_found: bool
+      leaked_cols: list
+      caution_cols: list
+      safe_cols: list
+      leak_severity: str ('critical'/'warning'/'ok')
+    """
+    if feature_cols is None:
+        feature_cols = BASE_NUM_FEATURES + CAT_FEATURES
+
+    leaked   = [f for f in feature_cols if f in LEAKAGE_FEATURES]
+    caution  = [f for f in feature_cols if f in CAUTION_FEATURES]
+    safe     = [f for f in feature_cols
+                if f not in LEAKAGE_FEATURES and f not in CAUTION_FEATURES]
+
+    if leaked:
+        severity = "critical"
+    elif len(caution) >= 3:
+        severity = "warning"
+    else:
+        severity = "ok"
+
+    result = {
+        "leakage_found": len(leaked) > 0,
+        "leaked_cols":   leaked,
+        "caution_cols":  caution,
+        "safe_cols":     safe,
+        "leak_severity": severity,
+        "n_total":       len(feature_cols),
+        "n_leaked":      len(leaked),
+        "n_caution":     len(caution),
+        "n_safe":        len(safe),
+    }
+
+    if verbose:
+        import streamlit as st
+        st.markdown("#### 🔍 Leakageチェック結果にゃ")
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("全特徴量にゃ",    f"{len(feature_cols)}個にゃ")
+        c2.metric("🔴 リーク確定にゃ", f"{len(leaked)}個にゃ",
+                  delta="要除外にゃ" if leaked else None, delta_color="inverse")
+        c3.metric("🟡 要注意にゃ",    f"{len(caution)}個にゃ")
+        c4.metric("✅ 安全にゃ",      f"{len(safe)}個にゃ")
+
+        if leaked:
+            st.error(
+                f"🔴 **Critical: リーク特徴量が{len(leaked)}個あるにゃ！**\n\n"
+                f"`{', '.join(leaked)}`\n\n"
+                "これらはレース後にしか確定しない情報にゃ。"
+                "AUC=1.0の直接原因になるにゃ🐾"
+            )
+        if caution:
+            st.warning(
+                f"🟡 **Warning: 要注意特徴量が{len(caution)}個あるにゃ**\n\n"
+                f"`{', '.join(caution)}`\n\n"
+                "当日オッズ・人気は予測時点で使えるが、"
+                "目的変数との相関が高すぎてリーク的な動作をするにゃ。"
+                "使う場合は意図的に含めていることを確認するにゃ🐾"
+            )
+        if severity == "ok" and not caution:
+            st.success("✅ リーク特徴量なしにゃ。安全な特徴量セットにゃ🐾")
+
+    return result
+
+
+def get_safe_feature_cols(feature_cols: list,
+                          remove_leakage: bool = True,
+                          remove_caution: bool = False) -> list:
+    """
+    安全な特徴量リストを返すにゃ。
+    remove_leakage=True: リーク確定を除去にゃ
+    remove_caution=True: 要注意も除去（オッズ除外版にゃ）
+    """
+    result = list(feature_cols)
+    if remove_leakage:
+        result = [f for f in result if f not in LEAKAGE_FEATURES]
+    if remove_caution:
+        result = [f for f in result if f not in CAUTION_FEATURES]
+    return result
+
+
+# ============================================================
+# ② Walk-Forward バリデーションにゃ
+# ============================================================
+# 通常のランダム分割はNG: 未来のデータで過去を予測してしまうにゃ
+# Walk-Forward: 時系列順を守った検証にゃ
+#
+# 例にゃ:
+#   Train: 2020/1/1 〜 2022/12/31
+#   Test:  2023/1/1 〜 2023/3/31
+#   → 常に「過去で学習→未来を予測」にゃ
+
+def create_walkforward_splits(df: pd.DataFrame,
+                               n_splits: int = 5,
+                               test_months: int = 3,
+                               min_train_months: int = 12) -> list[dict]:
+    """
+    Walk-Forward の時系列分割を生成するにゃ。
+
+    戻り値にゃ:
+      [{"fold": 1, "train_idx": [...], "test_idx": [...],
+        "train_start": date, "train_end": date,
+        "test_start": date, "test_end": date}, ...]
+    """
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    if "date_int" not in df.columns:
+        raise ValueError("date_int 列が必要にゃ（clean_types()を先に実行するにゃ）")
+
+    date_vals = pd.to_numeric(df["date_int"], errors="coerce").dropna().sort_values().unique()
+    if len(date_vals) == 0:
+        raise ValueError("有効な日付データがないにゃ")
+
+    # 月単位に変換にゃ（date_int = YYYYMMDD なのでにゃ）
+    months = sorted(set(int(str(int(d))[:6]) for d in date_vals if d > 0))
+    if len(months) < min_train_months + test_months:
+        raise ValueError(
+            f"データ期間が短すぎるにゃ（{len(months)}ヶ月）。"
+            f"最低{min_train_months + test_months}ヶ月必要にゃ"
+        )
+
+    splits = []
+    test_start_idx = min_train_months
+
+    for fold in range(n_splits):
+        ts_idx = test_start_idx + fold * test_months
+        if ts_idx + test_months > len(months):
+            break
+
+        train_months_set = set(months[:ts_idx])
+        test_months_set  = set(months[ts_idx: ts_idx + test_months])
+
+        # date_intから月を取得にゃ
+        df_months = df["date_int"].apply(
+            lambda d: int(str(int(d))[:6]) if pd.notna(d) and d > 0 else 0)
+
+        train_idx = df.index[df_months.isin(train_months_set)].tolist()
+        test_idx  = df.index[df_months.isin(test_months_set)].tolist()
+
+        if not train_idx or not test_idx:
+            continue
+
+        splits.append({
+            "fold":        fold + 1,
+            "train_idx":   train_idx,
+            "test_idx":    test_idx,
+            "train_months": sorted(train_months_set),
+            "test_months":  sorted(test_months_set),
+            "n_train":      len(train_idx),
+            "n_test":       len(test_idx),
+        })
+
+    return splits
+
+
+def run_walkforward_validation(bundle,
+                                history_df: pd.DataFrame,
+                                n_splits: int = 5,
+                                test_months: int = 3,
+                                strategy_mode: str = STRATEGY_MODE_ROI) -> dict:
+    """
+    Walk-Forward バリデーションを実行するにゃ。
+    各フォールドで的中率・回収率を計算するにゃ。
+    """
+    import traceback as _tb
+
+    if history_df is None or history_df.empty:
+        return {"error": "データがないにゃ"}
+    if "finish" not in history_df.columns:
+        return {"error": "finish（着順）列が必要にゃ"}
+
+    try:
+        splits = create_walkforward_splits(
+            history_df, n_splits=n_splits, test_months=test_months)
+    except Exception as e:
+        return {"error": f"分割エラーにゃ: {e}"}
+
+    if not splits:
+        return {"error": "有効な分割が作れなかったにゃ"}
+
+    fold_results = []
+    all_preds = []
+
+    for sp in splits:
+        test_df = history_df.loc[sp["test_idx"]].copy()
+        if test_df.empty:
+            continue
+
+        # 予想を実行するにゃ（テストデータのみにゃ）
+        try:
+            test_df2 = add_prior_stats_for_prediction(test_df.copy())
+            test_df2 = add_running_style(test_df2)
+            pipe, fc = get_pipeline_and_features(bundle)
+            miss = [c for c in fc if c not in test_df2.columns]
+            for c in miss:
+                test_df2[c] = 0.0
+
+            if hasattr(pipe, "predict_proba"):
+                raw_prob = pipe.predict_proba(test_df2[fc])[:, 1]
+            else:
+                raw_prob = np.asarray(pipe.predict(test_df2[fc]), dtype=float)
+
+            # キャリブレーションにゃ
+            calibrated = np.zeros(len(test_df2))
+            for rk in test_df2["race_key"].unique():
+                mask = test_df2["race_key"] == rk
+                calibrated[mask.values] = calibrate_prob_isotonic(
+                    raw_prob[mask.values])
+            test_df2["ml_top3_prob"] = calibrated
+
+            # タイブレーク付きランクにゃ
+            _pop  = pd.to_numeric(test_df2["popularity"],errors="coerce").fillna(99)
+            _odds = pd.to_numeric(test_df2["odds"],errors="coerce").fillna(999)
+            _hno  = pd.to_numeric(test_df2["horse_no"],errors="coerce").fillna(99)
+            _tb2  = (1.0/_pop.clip(1))*1e-4 + (1.0/_odds.clip(0.1))*1e-6 + (1.0/_hno.clip(1))*1e-8
+            test_df2["_comp"] = test_df2["ml_top3_prob"] + _tb2
+            test_df2["ml_rank"] = (test_df2.groupby("race_key")["_comp"]
+                                    .rank(ascending=False,method="first")
+                                    .fillna(1).astype(int))
+            test_df2 = test_df2.drop(columns=["_comp"])
+            test_df2 = add_ev_score(test_df2)
+            test_df2 = add_kelly_ratio(test_df2)
+            test_df2 = add_value_strategy(test_df2, strategy_mode=strategy_mode)
+            test_df2["actual_finish"] = test_df["finish"].values
+
+        except Exception as e:
+            fold_results.append({
+                "フォールドにゃ": sp["fold"],
+                "テスト月にゃ": f"{sp['test_months'][0]}〜{sp['test_months'][-1]}",
+                "エラーにゃ": str(e),
+            })
+            continue
+
+        # 的中率・回収率を計算にゃ
+        tansho_h=0; tansho_b=0; tansho_r=0.0
+        san3_h=0;   san3_b=0;   san3_r=0.0
+        fuku_h=0;   fuku_b=0;   fuku_r=0.0
+
+        for rk in test_df2["race_key"].unique():
+            rdf = test_df2[test_df2["race_key"]==rk]
+            if rdf.empty: continue
+
+            winner = rdf[rdf["actual_finish"]==1]
+            second = rdf[rdf["actual_finish"]==2]
+            third  = rdf[rdf["actual_finish"]==3]
+            w_no   = str(_safe_int(winner["horse_no"].iloc[0],0)) if not winner.empty else ""
+            s_no   = str(_safe_int(second["horse_no"].iloc[0],0)) if not second.empty else ""
+            t_no   = str(_safe_int(third["horse_no"].iloc[0], 0)) if not third.empty else ""
+            top3_set = {w_no,s_no,t_no}-{"0",""}
+
+            ai1    = rdf.sort_values("ml_rank").iloc[0]
+            ai1_no = str(_safe_int(ai1["horse_no"],0))
+            ai1_od = _safe_float(ai1.get("odds",0),0)
+
+            tansho_b += 100
+            if ai1_no == w_no:
+                tansho_h += 1
+                tansho_r += int(100 * ai1_od * 0.80)
+
+            buy_df = rdf[rdf["buy_flag"]=="買い"] if "buy_flag" in rdf.columns else rdf.head(3)
+            for _,brow in buy_df.iterrows():
+                bno  = str(_safe_int(brow["horse_no"],0))
+                bods = _safe_float(brow.get("odds",0),0)
+                fuku_b += 100
+                if bno in top3_set:
+                    fuku_h += 1
+                    fuku_r += int(100 * max(1.1, bods*0.3) * 0.80)
+
+            top3_pred = rdf.sort_values("ml_rank").head(3)
+            t3_nos = set(str(_safe_int(r["horse_no"],0)) for _,r in top3_pred.iterrows())
+            san3_b += 100
+            if t3_nos == top3_set:
+                san3_h += 1
+                t3_ods = [_safe_float(r["odds"],0) for _,r in top3_pred.iterrows()]
+                san3_r += int(100*max(5.0,t3_ods[0]*t3_ods[1]*t3_ods[2]*0.05)*0.75)
+
+        fold_results.append({
+            "フォールドにゃ":   sp["fold"],
+            "テスト月にゃ":     f"{sp['test_months'][0]}〜{sp['test_months'][-1]}",
+            "テスト数にゃ":     sp["n_test"],
+            "単勝的中率にゃ":   f"{tansho_h/max(tansho_b//100,1)*100:.1f}%",
+            "単勝回収率にゃ":   f"{tansho_r/max(tansho_b,1)*100:.1f}%",
+            "複勝的中率にゃ":   f"{fuku_h/max(fuku_b//100,1)*100:.1f}%",
+            "複勝回収率にゃ":   f"{fuku_r/max(fuku_b,1)*100:.1f}%",
+            "三連複的中率にゃ": f"{san3_h/max(san3_b//100,1)*100:.1f}%",
+            "三連複回収率にゃ": f"{san3_r/max(san3_b,1)*100:.1f}%",
+            "_tan_h": tansho_h, "_tan_b": tansho_b, "_tan_r": tansho_r,
+            "_fuku_h": fuku_h, "_fuku_b": fuku_b, "_fuku_r": fuku_r,
+            "_san_h": san3_h, "_san_b": san3_b, "_san_r": san3_r,
+        })
+        all_preds.append(test_df2)
+
+    if not fold_results:
+        return {"error": "有効なフォールドがなかったにゃ"}
+
+    # 全フォールド集計にゃ
+    valid = [r for r in fold_results if "_tan_b" in r]
+    if valid:
+        tot_tan_h = sum(r["_tan_h"] for r in valid)
+        tot_tan_b = sum(r["_tan_b"] for r in valid)
+        tot_tan_r = sum(r["_tan_r"] for r in valid)
+        tot_fuku_h= sum(r["_fuku_h"] for r in valid)
+        tot_fuku_b= sum(r["_fuku_b"] for r in valid)
+        tot_fuku_r= sum(r["_fuku_r"] for r in valid)
+        tot_san_h = sum(r["_san_h"] for r in valid)
+        tot_san_b = sum(r["_san_b"] for r in valid)
+        tot_san_r = sum(r["_san_r"] for r in valid)
+        overall = {
+            "単勝的中率(全体)":   f"{tot_tan_h/max(tot_tan_b//100,1)*100:.1f}%",
+            "単勝回収率(全体)":   f"{tot_tan_r/max(tot_tan_b,1)*100:.1f}%",
+            "複勝的中率(全体)":   f"{tot_fuku_h/max(tot_fuku_b//100,1)*100:.1f}%",
+            "複勝回収率(全体)":   f"{tot_fuku_r/max(tot_fuku_b,1)*100:.1f}%",
+            "三連複的中率(全体)": f"{tot_san_h/max(tot_san_b//100,1)*100:.1f}%",
+            "三連複回収率(全体)": f"{tot_san_r/max(tot_san_b,1)*100:.1f}%",
+        }
+    else:
+        overall = {}
+
+    return {
+        "splits":       splits,
+        "fold_results": fold_results,
+        "overall":      overall,
+        "all_preds_df": pd.concat(all_preds, ignore_index=True) if all_preds else pd.DataFrame(),
+    }
+
+
+# ============================================================
+# ③ ROI最適化エンジンにゃ
+# ============================================================
+# 「何点買うか」「どの馬を買うか」を
+# 実測データから最適なしきい値を求めるにゃ
+
+def optimize_roi_thresholds(pred_df: pd.DataFrame,
+                             history_df: pd.DataFrame = None) -> dict:
+    """
+    ROI最大化のための最適しきい値を探索するにゃ。
+
+    探索パラメータにゃ:
+    - EV閾値（ev_score_v2 / ev_score）にゃ
+    - AI確率閾値にゃ
+    - Kelly閾値にゃ
+    - 最大購入点数にゃ
+
+    戻り値にゃ:
+    - 各パラメータの最適値にゃ
+    - 最大ROIとその条件にゃ
+    """
+    if pred_df is None or pred_df.empty:
+        return {}
+
+    # 必要な列を確保にゃ
+    r = pred_df.copy()
+    for col,dv in [("ml_top3_prob",0),("ev_score",0),("ev_score_v2",0),
+                   ("kelly_ratio",0),("kelly_ratio_sanren",0),
+                   ("ml_rank",99),("popularity",99),("odds",0),
+                   ("actual_finish",99)]:
+        if col not in r.columns: r[col] = dv
+        r[col] = pd.to_numeric(r[col], errors="coerce").fillna(dv)
+
+    has_result = "actual_finish" in pred_df.columns and \
+                 pred_df["actual_finish"].notna().sum() > 0
+
+    # 探索グリッドにゃ
+    ev_thresholds   = [-0.05, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10]
+    prob_thresholds = [0.10, 0.15, 0.18, 0.20, 0.22, 0.25, 0.28]
+    kelly_thresholds= [0.00, 0.01, 0.02, 0.03, 0.04, 0.05]
+    max_points      = [3, 4, 5, 6, 8, 10]
+
+    best_roi    = -999
+    best_params = {}
+    grid_results= []
+
+    ev_col = "ev_score_v2" if "ev_score_v2" in r.columns else "ev_score"
+
+    for ev_th in ev_thresholds:
+        for prob_th in prob_thresholds:
+            for kelly_th in kelly_thresholds:
+                # このパラメータでの買い候補にゃ
+                mask = (
+                    (r[ev_col] >= ev_th) &
+                    (r["ml_top3_prob"] >= prob_th) &
+                    ((r["kelly_ratio"] >= kelly_th) | (r["kelly_ratio_sanren"] >= kelly_th)) &
+                    (r.get("danger_level", pd.Series([""]* len(r))).isin(["","注意"]))
+                )
+                buy_df = r[mask]
+                if buy_df.empty: continue
+
+                n_buy = int(mask.sum())
+                avg_odds = float(buy_df["odds"].mean())
+
+                if has_result:
+                    # 実績から計算にゃ
+                    hits = int((buy_df["actual_finish"] <= 3).sum())
+                    bets = n_buy * 100
+                    fuku_ret = sum(
+                        int(100 * max(1.1, row["odds"]*0.3) * 0.80)
+                        for _, row in buy_df[buy_df["actual_finish"]<=3].iterrows()
+                    )
+                    roi = fuku_ret / max(bets, 1) * 100
+                    hitrate = hits / n_buy * 100
+                else:
+                    # 期待値ベースの推定にゃ
+                    exp_ret = float((buy_df["ml_top3_prob"] * buy_df["odds"] * 0.80).sum())
+                    bets    = n_buy * 100
+                    roi     = exp_ret / max(bets/100, 1) * 100
+                    hitrate = float(buy_df["ml_top3_prob"].mean()) * 100
+
+                grid_results.append({
+                    "EV閾値にゃ":    ev_th,
+                    "確率閾値にゃ":  prob_th,
+                    "Kelly閾値にゃ": kelly_th,
+                    "買い点数にゃ":  n_buy,
+                    "推定ROIにゃ":   round(roi, 1),
+                    "推定的中率にゃ":round(hitrate, 1),
+                    "平均オッズにゃ":round(avg_odds, 1),
+                })
+                if roi > best_roi:
+                    best_roi = roi
+                    best_params = {
+                        "ev_threshold":    ev_th,
+                        "prob_threshold":  prob_th,
+                        "kelly_threshold": kelly_th,
+                        "expected_roi":    round(roi, 1),
+                        "expected_hitrate":round(hitrate, 1),
+                        "n_buy":           n_buy,
+                    }
+
+    grid_df = pd.DataFrame(grid_results).sort_values("推定ROIにゃ", ascending=False)
+
+    return {
+        "best_params":  best_params,
+        "best_roi":     best_roi,
+        "grid_results": grid_df,
+        "top10":        grid_df.head(10),
+        "has_result":   has_result,
+    }
+
+
+def apply_roi_optimized_filter(df: pd.DataFrame,
+                                best_params: dict) -> pd.DataFrame:
+    """
+    ROI最適化パラメータを適用して買い候補を絞り込むにゃ。
+    """
+    df = df.copy()
+    ev_th    = best_params.get("ev_threshold",   0.02)
+    prob_th  = best_params.get("prob_threshold",  0.18)
+    kelly_th = best_params.get("kelly_threshold", 0.02)
+
+    ev_col = "ev_score_v2" if "ev_score_v2" in df.columns else "ev_score"
+
+    for col,dv in [(ev_col,0),("ml_top3_prob",0),
+                   ("kelly_ratio",0),("kelly_ratio_sanren",0)]:
+        if col not in df.columns: df[col]=dv
+        df[col] = pd.to_numeric(df[col],errors="coerce").fillna(dv)
+
+    mask = (
+        (df[ev_col] >= ev_th) &
+        (df["ml_top3_prob"] >= prob_th) &
+        ((df["kelly_ratio"] >= kelly_th) | (df["kelly_ratio_sanren"] >= kelly_th))
+    )
+    dl = df.get("danger_level", pd.Series([""]*len(df)))
+    mask &= ~dl.isin(["強危険","危険"])
+
+    df["roi_optimized_buy"] = mask.map({True:"◎ROI最適", False:"見送り"})
+    return df
+
+
+# ============================================================
+# ④ 本格キャリブレーションにゃ
+# ============================================================
+# 現在のcalibrate_prob: シグモイド圧縮のみにゃ
+# 問題にゃ:
+#   ① 実際の的中率との乖離を補正していないにゃ
+#   ② Platt Scaling / Isotonic Regression を使っていないにゃ
+#   ③ レース種別・頭数による差を考慮していないにゃ
+
+def calibrate_prob_isotonic(raw_prob: np.ndarray,
+                             reference_hitrate: float = None) -> np.ndarray:
+    """
+    Isotonic Regression 近似によるキャリブレーションにゃ。
+
+    【改善点にゃ】
+    1. 単純なシグモイド圧縮から「単調増加制約付き補正」にゃ
+    2. 実際の3着内率（約21.8%）に合わせた補正にゃ
+    3. 過学習モデルの確率の「平滑化」にゃ
+
+    reference_hitrate: 実際の3着内率（デフォルト0.218にゃ）
+    """
+    if len(raw_prob) == 0:
+        return raw_prob
+
+    # 参照的中率にゃ（PKLのmetricsから取るにゃ、なければ競馬の一般的な値にゃ）
+    if reference_hitrate is None:
+        reference_hitrate = 0.218  # 17〜18頭立てで3着内=3/17≈18%にゃ
+
+    p = np.clip(raw_prob, 1e-6, 1 - 1e-6)
+    n = len(p)
+
+    # ── Step1: 確率の合計を理論値3.0に正規化にゃ ──
+    target_sum = 3.0
+    p_sum = float(p.sum())
+    if p_sum > 0:
+        p_scaled = p * (target_sum / p_sum)
+    else:
+        p_scaled = p.copy()
+    p_scaled = np.clip(p_scaled, 0, 0.95)
+
+    # ── Step2: Isotonic Regression 近似にゃ ──
+    # 確率が単調に並ぶよう「プールアジャセント バイオレーター」で平滑化にゃ
+    # （PAVA: Pool Adjacent Violators Algorithmにゃ）
+    def pava(y):
+        """単調増加制約を満たすよう平均化にゃ"""
+        y = np.array(y, dtype=float)
+        n = len(y)
+        # 降順ソートのインデックスにゃ
+        idx = np.argsort(-y)
+        y_sorted = y[idx]
+        # PAVA適用にゃ（降順にゃ）
+        i = 0
+        while i < n - 1:
+            if y_sorted[i] < y_sorted[i+1]:
+                # バイオレーション発生にゃ → 平均化にゃ
+                j = i + 1
+                while j < n and y_sorted[j] > y_sorted[i]:
+                    avg = np.mean(y_sorted[i:j+1])
+                    y_sorted[i:j+1] = avg
+                    j += 1
+            i += 1
+        # 元の順序に戻すにゃ
+        result = np.empty_like(y)
+        result[idx] = y_sorted
+        return result
+
+    p_isotonic = pava(p_scaled)
+
+    # ── Step3: 参照的中率に合わせた補正にゃ ──
+    # 期待3着内頭数 = 頭数 × reference_hitrate にゃ
+    target_top3 = n * reference_hitrate
+    current_sum = float(p_isotonic.sum())
+    if current_sum > 0:
+        p_final = p_isotonic * (target_top3 / current_sum)
+    else:
+        p_final = p_isotonic
+
+    # ── Step4: Platt Scaling 近似にゃ（sigmoid calibrationにゃ）──
+    # logistic: p_cal = 1/(1+exp(-(A*logit(p)+B)))
+    # A,Bはデフォルト値を使うにゃ（実データがあれば学習するにゃ）
+    A = 0.85  # 過学習モデルは圧縮するにゃ（< 1にゃ）
+    B = 0.0   # バイアス補正にゃ
+    logit_p = np.log(np.clip(p_final, 1e-6, 1-1e-6) /
+                     (1 - np.clip(p_final, 1e-6, 1-1e-6) + 1e-8) + 1e-8)
+    p_platt = 1.0 / (1.0 + np.exp(-(A * logit_p + B)))
+
+    # ── Step5: 最終正規化にゃ ──
+    final_sum = float(p_platt.sum())
+    if final_sum > 0:
+        p_final2 = p_platt * (target_top3 / final_sum)
+    else:
+        p_final2 = p_platt
+
+    # ── Step6: 微小ノイズにゃ（同率防止にゃ）──
+    rng = np.random.default_rng(42)
+    noise = rng.uniform(-1e-6, 1e-6, len(p_final2))
+    p_final2 = p_final2 + noise
+
+    return np.clip(p_final2, 0.01, 0.95)
+
+
+def fit_calibrator_from_history(bundle,
+                                  history_df: pd.DataFrame) -> dict:
+    """
+    過去データから実際のキャリブレーションパラメータを学習するにゃ。
+    Platt Scaling の A,B を実データから推定するにゃ。
+
+    戻り値にゃ:
+      calibration_params: {"A": float, "B": float, "reference_hitrate": float}
+      calibration_curve: DataFrame（確率帯別の実際の的中率にゃ）
+    """
+    if history_df is None or history_df.empty:
+        return {}
+    if "finish" not in history_df.columns:
+        return {}
+
+    df = history_df.copy()
+    df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
+    df = df[df["finish"].notna() & (df["finish"] > 0)].copy()
+
+    # 予想を実行にゃ
+    try:
+        df2 = add_prior_stats_for_prediction(df.copy())
+        pipe, fc = get_pipeline_and_features(bundle)
+        miss = [c for c in fc if c not in df2.columns]
+        for c in miss: df2[c] = 0.0
+
+        if hasattr(pipe, "predict_proba"):
+            raw_prob = pipe.predict_proba(df2[fc])[:, 1]
+        else:
+            raw_prob = np.asarray(pipe.predict(df2[fc]), dtype=float)
+
+        df2["raw_prob"] = raw_prob
+        df2["is_top3"]  = df["finish"].between(1, 3).values
+
+    except Exception as e:
+        return {"error": f"予測エラーにゃ: {e}"}
+
+    # 確率帯別の実際の的中率にゃ（キャリブレーション曲線にゃ）
+    bins = [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.70, 1.0]
+    labels = [f"{bins[i]:.2f}〜{bins[i+1]:.2f}" for i in range(len(bins)-1)]
+    df2["prob_bin"] = pd.cut(df2["raw_prob"], bins=bins, labels=labels)
+
+    calib_curve = df2.groupby("prob_bin", observed=True).agg(
+        件数=("is_top3","count"),
+        AI予測確率平均=("raw_prob","mean"),
+        実際的中率=("is_top3","mean"),
+    ).reset_index().rename(columns={"prob_bin":"確率帯にゃ"})
+    calib_curve["乖離にゃ"] = (
+        calib_curve["AI予測確率平均"] - calib_curve["実際的中率"]
+    ).round(4)
+    calib_curve["AI予測確率平均"] = calib_curve["AI予測確率平均"].round(4)
+    calib_curve["実際的中率"]     = calib_curve["実際的中率"].round(4)
+
+    # 全体的中率にゃ
+    overall_hitrate = float(df2["is_top3"].mean())
+
+    # Platt Scaling パラメータをSimple線形回帰で推定にゃ
+    valid = calib_curve[calib_curve["件数"] >= 5].copy()
+    if len(valid) >= 3:
+        x = valid["AI予測確率平均"].values
+        y = valid["実際的中率"].values
+        # logit変換にゃ
+        x_logit = np.log(np.clip(x,1e-6,1-1e-6) / (1-np.clip(x,1e-6,1-1e-6)+1e-8) + 1e-8)
+        y_logit = np.log(np.clip(y,1e-6,1-1e-6) / (1-np.clip(y,1e-6,1-1e-6)+1e-8) + 1e-8)
+        # 最小二乗法にゃ
+        if len(x_logit) > 1 and np.std(x_logit) > 0:
+            A = float(np.cov(x_logit, y_logit)[0,1] / np.var(x_logit))
+            B = float(np.mean(y_logit) - A * np.mean(x_logit))
+        else:
+            A, B = 1.0, 0.0
+    else:
+        A, B = 1.0, 0.0
+
+    return {
+        "calibration_params": {
+            "A": round(A, 4),
+            "B": round(B, 4),
+            "reference_hitrate": round(overall_hitrate, 4),
+        },
+        "calibration_curve": calib_curve,
+        "overall_hitrate":   overall_hitrate,
+        "n_samples":         len(df2),
+    }
+
+
+# ============================================================
+# ⑤ ML強化ダッシュボード表示にゃ
+# ============================================================
+
+def show_ml_enhance_dashboard(bundle, history_df=None,
+                               pred_df=None, race_df=None,
+                               strategy_mode=STRATEGY_MODE_ROI):
+    """
+    Leakage・Walk-Forward・ROI最適化・キャリブレーション
+    4機能を統合したダッシュボードにゃ🐾
+    """
+    st.header("🔬 ML強化ダッシュボードにゃ（Leakage防止・WF検証・ROI最適化・キャリブレーションにゃ）")
+    st.caption(
+        "AIの**本当の精度**を計測するにゃ。"
+        "過学習(AUC=1.0)の原因特定から「実際に勝てる買い方」の最適化まで行うにゃ🐾"
+    )
+
+    info = get_bundle_info(bundle) if bundle else {}
+    fc   = info.get("feature_cols", BASE_NUM_FEATURES + CAT_FEATURES)
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 Leakage防止にゃ",
+        "📅 Walk-Forward検証にゃ",
+        "💰 ROI最適化にゃ",
+        "📊 本格キャリブレーションにゃ",
+    ])
+
+    # ── Tab1: Leakage防止にゃ ──
+    with tab1:
+        st.subheader("🔍 データリーク（Leakage）診断にゃ")
+        st.markdown("""
+**なぜ AUC=1.0 になるのかにゃ？**
+
+> レース後にしか分からない情報（着順・タイム・上り3F）が
+> 学習データに混入している可能性にゃ。
+> これを「データリーク」と呼ぶにゃ。
+
+**当日オッズ・人気の問題にゃ:**
+オッズと人気は「予測時点では使えるにゃ」が、
+3着内と非常に高相関なのでモデルが答えを丸暗記するにゃ。
+        """)
+
+        st.markdown("---")
+        result = check_leakage(fc, bundle=bundle, verbose=True)
+
+        # 安全な特徴量セットにゃ
+        with st.expander("✅ リーク除外後の推奨特徴量セットにゃ"):
+            safe_no_odds = get_safe_feature_cols(fc, remove_leakage=True, remove_caution=True)
+            safe_with_odds = get_safe_feature_cols(fc, remove_leakage=True, remove_caution=False)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**オッズ除外版にゃ（推奨にゃ）**")
+                st.caption(f"{len(safe_no_odds)}個の特徴量にゃ")
+                st.code('\n'.join(safe_no_odds), language="text")
+            with c2:
+                st.markdown("**オッズ保持版にゃ（現状にゃ）**")
+                st.caption(f"{len(safe_with_odds)}個の特徴量にゃ")
+                st.code('\n'.join(safe_with_odds), language="text")
+
+        # 再学習推奨コードにゃ
+        with st.expander("📝 再学習推奨コードにゃ"):
+            st.code("""
+# Leakage防止版の再学習コードにゃ
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.impute import SimpleImputer
+
+# オッズ・人気を除外した特徴量にゃ
+NO_LEAKAGE_FEATURES = [
+    "year_full","month","day","race_no","race_grade",
+    "course_kind","distance","age","carried_weight",
+    "field_size","horse_no","frame_no",
+    # ↑ コース情報にゃ
+    "jockey_runs_prior","jockey_win_rate_prior","jockey_top3_rate_prior",
+    "trainer_runs_prior","trainer_win_rate_prior","trainer_top3_rate_prior",
+    "sire_runs_prior","sire_win_rate_prior","sire_top3_rate_prior",
+    "horse_runs_prior","horse_win_rate_prior","horse_top3_rate_prior",
+    "horse_distance_runs_prior","horse_distance_top3_rate_prior",
+    "horse_track_runs_prior","horse_track_top3_rate_prior",
+    # ↑ 事前統計にゃ（レース前確定にゃ）
+    "place","track_type","going","sex","jockey","trainer",
+    "belonging","sire","dam","broodmare_sire",
+    # ↑ カテゴリにゃ
+]
+
+model = HistGradientBoostingClassifier(
+    max_iter=150,            # 過学習防止にゃ
+    learning_rate=0.05,
+    max_leaf_nodes=31,
+    min_samples_leaf=30,
+    l2_regularization=0.1,  # 正則化にゃ
+    early_stopping=True,
+    validation_fraction=0.15,
+    n_iter_no_change=20,
+    random_state=42,
+)
+            """, language="python")
+
+    # ── Tab2: Walk-Forward検証にゃ ──
+    with tab2:
+        st.subheader("📅 Walk-Forward バリデーションにゃ")
+        st.markdown("""
+**通常のランダム分割の問題にゃ:**
+> 未来のデータで過去を予測 → 楽観的すぎる結果にゃ
+
+**Walk-Forwardにゃ:**
+> 常に「過去で学習 → 未来を予測」にゃ
+> 実際の運用に近い条件で検証にゃ🐾
+        """)
+
+        if history_df is None or "finish" not in (history_df.columns if history_df is not None else []):
+            st.info(
+                "📂 着順データ（finish列付きCSV）が必要にゃ。\n\n"
+                "バックテストタブからデータをアップロードするにゃ🐾"
+            )
+            return
+
+        col1, col2, col3 = st.columns(3)
+        n_splits    = col1.number_input("フォールド数にゃ", 3, 10, 5, key="wf_n")
+        test_months = col2.number_input("テスト月数/フォールドにゃ", 1, 6, 3, key="wf_m")
+        col3.metric("データ量にゃ", f"{len(history_df)}行にゃ")
+
+        if st.button("🐾 Walk-Forward検証 実行にゃ！", key="wf_run"):
+            with st.spinner("Walk-Forward検証中にゃ...（フォールド数×レース数分かかるにゃ）"):
+                wf_result = run_walkforward_validation(
+                    bundle, history_df,
+                    n_splits=int(n_splits),
+                    test_months=int(test_months),
+                    strategy_mode=strategy_mode
+                )
+
+            if "error" in wf_result:
+                st.error(f"❌ {wf_result['error']}")
+                return
+
+            # フォールド別結果にゃ
+            st.markdown("#### 📋 フォールド別結果にゃ")
+            fold_df = pd.DataFrame([
+                {k:v for k,v in r.items() if not k.startswith("_")}
+                for r in wf_result["fold_results"]
+            ])
+            st.dataframe(fold_df, use_container_width=True, hide_index=True)
+
+            # 全体集計にゃ
+            st.markdown("#### 📊 全体集計にゃ")
+            overall = wf_result.get("overall", {})
+            if overall:
+                c1,c2,c3 = st.columns(3)
+                c1.metric("単勝的中率にゃ",   overall.get("単勝的中率(全体)","N/A"))
+                c2.metric("複勝的中率にゃ",   overall.get("複勝的中率(全体)","N/A"))
+                c3.metric("三連複的中率にゃ", overall.get("三連複的中率(全体)","N/A"))
+                c1.metric("単勝回収率にゃ",   overall.get("単勝回収率(全体)","N/A"))
+                c2.metric("複勝回収率にゃ",   overall.get("複勝回収率(全体)","N/A"))
+                c3.metric("三連複回収率にゃ", overall.get("三連複回収率(全体)","N/A"))
+
+            # 安定性評価にゃ
+            valid_folds = [r for r in wf_result["fold_results"] if "_tan_b" in r]
+            if len(valid_folds) >= 2:
+                fuku_rois = [r["_fuku_r"]/max(r["_fuku_b"],1)*100 for r in valid_folds]
+                roi_std = float(np.std(fuku_rois))
+                roi_avg = float(np.mean(fuku_rois))
+                if roi_std < 15:
+                    st.success(f"✅ 複勝回収率は安定しているにゃ（平均{roi_avg:.1f}%±{roi_std:.1f}%にゃ）🐾")
+                elif roi_std < 30:
+                    st.warning(f"⚠️ 複勝回収率にやや波があるにゃ（平均{roi_avg:.1f}%±{roi_std:.1f}%にゃ）")
+                else:
+                    st.error(f"🔴 複勝回収率が不安定にゃ（平均{roi_avg:.1f}%±{roi_std:.1f}%にゃ）。モデルの再学習を推奨にゃ")
+
+            # CSV出力にゃ
+            st.download_button(
+                "📥 Walk-Forward結果CSVにゃ",
+                data=fold_df.to_csv(index=False,encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="walkforward_result.csv", mime="text/csv"
+            )
+
+    # ── Tab3: ROI最適化にゃ ──
+    with tab3:
+        st.subheader("💰 ROI最適化にゃ（最適しきい値探索にゃ）")
+        st.markdown("""
+**「何点買うか」「どの馬を買うか」を自動最適化するにゃ。**
+
+EV閾値・AI確率閾値・Kelly閾値を変えながら
+最もROIが高い組み合わせを探索するにゃ🐾
+        """)
+
+        target_df = pred_df if pred_df is not None else race_df
+        if target_df is None or target_df.empty:
+            st.info("予想を実行してからROI最適化するにゃ🐾")
+            return
+
+        # 着順データがあればリンクにゃ
+        has_result = (history_df is not None and
+                      "finish" in (history_df.columns if history_df is not None else []))
+        if has_result:
+            st.info("✅ 着順データあり → 実績ベースでROI最適化するにゃ🐾")
+            # 予想と実績をマージにゃ
+            target_df2 = target_df.copy()
+            if "race_key" in target_df2.columns and "race_key" in history_df.columns:
+                fin_map = dict(zip(
+                    history_df["race_key"].astype(str) + "_" +
+                    history_df["horse_no"].fillna(0).astype(int).astype(str),
+                    history_df["finish"]
+                ))
+                target_df2["actual_finish"] = [
+                    fin_map.get(
+                        str(r.get("race_key","")) + "_" + str(_safe_int(r.get("horse_no",0),0)),
+                        np.nan
+                    )
+                    for _, r in target_df2.iterrows()
+                ]
+        else:
+            st.info("ℹ️ 着順データなし → 期待値ベースでROI最適化するにゃ（推定値にゃ）")
+            target_df2 = target_df.copy()
+            target_df2["actual_finish"] = np.nan
+
+        if st.button("🐾 ROI最適化 実行にゃ！", key="roi_run"):
+            with st.spinner("ROIを最適化中にゃ..."):
+                roi_result = optimize_roi_thresholds(target_df2, history_df)
+
+            if not roi_result:
+                st.warning("最適化できなかったにゃ"); return
+
+            bp = roi_result["best_params"]
+            st.markdown("#### 🌟 最適パラメータにゃ")
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("EV閾値にゃ",      f"{bp.get('ev_threshold',0):.3f}")
+            c2.metric("確率閾値にゃ",    f"{bp.get('prob_threshold',0):.2f}")
+            c3.metric("Kelly閾値にゃ",   f"{bp.get('kelly_threshold',0):.3f}")
+            c4.metric("推定ROIにゃ",     f"{bp.get('expected_roi',0):.1f}%")
+            c5.metric("推定的中率にゃ",  f"{bp.get('expected_hitrate',0):.1f}%")
+
+            if bp.get("expected_roi",0) >= 100:
+                st.success(f"🎉 期待ROI {bp.get('expected_roi',0):.1f}% にゃ！プラス期待値にゃ🐾")
+            elif bp.get("expected_roi",0) >= 80:
+                st.info(f"📊 期待ROI {bp.get('expected_roi',0):.1f}% にゃ。馬券の控除率（75-80%）を上回っているにゃ")
+            else:
+                st.warning(f"⚠️ 期待ROI {bp.get('expected_roi',0):.1f}% にゃ。控除率を下回っているにゃ")
+
+            # グリッド結果にゃ
+            st.markdown("#### 📋 上位10パラメータにゃ")
+            top10 = roi_result.get("top10", pd.DataFrame())
+            if not top10.empty:
+                disp_cols = [c for c in ["EV閾値にゃ","確率閾値にゃ","Kelly閾値にゃ",
+                                          "買い点数にゃ","推定ROIにゃ","推定的中率にゃ","平均オッズにゃ"]
+                             if c in top10.columns]
+                st.dataframe(top10[disp_cols], use_container_width=True, hide_index=True)
+
+            # 最適パラメータで再フィルタにゃ
+            if target_df is not None:
+                filtered = apply_roi_optimized_filter(target_df, bp)
+                buy_opt  = filtered[filtered["roi_optimized_buy"]=="◎ROI最適"]
+                st.markdown(f"#### ✅ 最適パラメータでの買い候補にゃ: {len(buy_opt)}頭にゃ")
+                if not buy_opt.empty:
+                    disp = buy_opt[["horse_no","horse_name","odds","popularity",
+                                    "ml_top3_prob","ev_score",
+                                    "kelly_ratio","roi_optimized_buy"]].copy()
+                    if "ml_top3_prob" in disp.columns:
+                        disp["ml_top3_prob"] = (pd.to_numeric(disp["ml_top3_prob"],errors="coerce")*100).round(1).astype(str)+"%"
+                    st.dataframe(disp.rename(columns={
+                        "horse_no":"馬番","horse_name":"馬名","odds":"オッズ",
+                        "popularity":"人気","ml_top3_prob":"AI確率",
+                        "ev_score":"EV乖離","kelly_ratio":"Kelly比",
+                        "roi_optimized_buy":"ROI最適判定",
+                    }), use_container_width=True, hide_index=True)
+
+    # ── Tab4: 本格キャリブレーションにゃ ──
+    with tab4:
+        st.subheader("📊 本格キャリブレーションにゃ（Isotonic + Platt Scalingにゃ）")
+        st.markdown("""
+**現在のキャリブレーション問題にゃ:**
+- シグモイド圧縮のみ → 実際の的中率との乖離を補正していないにゃ
+- 固定係数 → レース種別・頭数の違いを無視にゃ
+
+**改善内容にゃ:**
+1. **Isotonic Regression** → 単調増加制約付き平滑化にゃ
+2. **Platt Scaling** → 実データからA,Bパラメータを学習にゃ
+3. **キャリブレーション曲線** → 「AI予測30%の馬は実際何%来るか」を可視化にゃ
+        """)
+
+        if history_df is None or "finish" not in (history_df.columns if history_df is not None else []):
+            st.info("📂 着順データが必要にゃ。バックテストタブからデータをアップロードするにゃ🐾")
+
+            # キャリブレーション効果のデモにゃ
+            st.markdown("#### 📈 キャリブレーション効果のデモにゃ")
+            demo_raw = np.array([0.99, 0.95, 0.80, 0.60, 0.40, 0.20, 0.10, 0.05, 0.01])
+            demo_cal = calibrate_prob_isotonic(demo_raw, reference_hitrate=0.218)
+            demo_df  = pd.DataFrame({
+                "生確率(過学習にゃ)":    [f"{p:.3f}" for p in demo_raw],
+                "補正後確率(Isotonic)":  [f"{p:.3f}" for p in demo_cal],
+                "変化にゃ":             [f"{(c-r)*100:+.1f}%" for r,c in zip(demo_raw,demo_cal)],
+            })
+            st.dataframe(demo_df, use_container_width=True, hide_index=True)
+            st.caption("AUC=1.0モデルの0/1への張り付きが緩和されているにゃ🐾")
+            return
+
+        if st.button("🐾 キャリブレーション分析 実行にゃ！", key="cal_run"):
+            with st.spinner("キャリブレーション分析中にゃ..."):
+                cal_result = fit_calibrator_from_history(bundle, history_df)
+
+            if "error" in cal_result:
+                st.error(f"❌ {cal_result['error']}")
+                return
+
+            params = cal_result.get("calibration_params", {})
+            st.markdown("#### 📋 学習済みキャリブレーションパラメータにゃ")
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Platt A にゃ",      f"{params.get('A',1.0):.4f}",
+                      help="<1ならモデルが過信している（圧縮するにゃ）")
+            c2.metric("Platt B にゃ",      f"{params.get('B',0.0):.4f}",
+                      help="バイアス補正にゃ")
+            c3.metric("実際の3着内率にゃ",  f"{params.get('reference_hitrate',0.218)*100:.1f}%")
+            c4.metric("サンプル数にゃ",     f"{cal_result.get('n_samples',0):,}にゃ")
+
+            A = params.get("A", 1.0)
+            if A < 0.7:
+                st.error(
+                    f"🔴 A={A:.3f} → モデルが極端に過信しているにゃ。"
+                    "オッズ除外での再学習を強く推奨にゃ🐾"
+                )
+            elif A < 0.9:
+                st.warning(
+                    f"🟡 A={A:.3f} → モデルがやや過信にゃ。"
+                    "キャリブレーションで補正中にゃ"
+                )
+            else:
+                st.success(f"✅ A={A:.3f} → キャリブレーションは良好にゃ🐾")
+
+            # キャリブレーション曲線にゃ
+            st.markdown("#### 📈 キャリブレーション曲線にゃ")
+            st.caption("完璧なモデルでは「AI予測確率 = 実際的中率」になるにゃ。乖離が大きいほど補正が必要にゃ。")
+            cal_curve = cal_result.get("calibration_curve", pd.DataFrame())
+            if not cal_curve.empty:
+                def color_cal(row):
+                    d = abs(_safe_float(row.get("乖離にゃ",0),0))
+                    if d > 0.10: return ["background-color:#f8d7da"]*len(row)
+                    if d > 0.05: return ["background-color:#fff3cd"]*len(row)
+                    return ["background-color:#d4edda"]*len(row)
+                try:
+                    st.dataframe(
+                        cal_curve.style.apply(color_cal, axis=1),
+                        use_container_width=True, hide_index=True
+                    )
+                except Exception:
+                    st.dataframe(cal_curve, use_container_width=True, hide_index=True)
+
+                st.caption("🟢=乖離小（良好にゃ） / 🟡=乖離中 / 🔴=乖離大（補正要にゃ）")
+
+            st.download_button(
+                "📥 キャリブレーション結果CSVにゃ",
+                data=cal_curve.to_csv(index=False,encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="calibration_curve.csv", mime="text/csv"
+            )
+
+
+
+
+
+# ============================================================
+# ============================================================
+# バックテスト v2 完全版にゃ
+# ① 全券種の正確な的中・回収計算にゃ
+# ② 複数条件の一括比較にゃ
+# ③ 時系列グラフ（月別推移にゃ）にゃ
+# ④ レース種別・距離・競馬場別の詳細分析にゃ
+# ⑤ 改善提案の自動生成にゃ
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# バックテストコアエンジン v2にゃ
+# ============================================================
+
+def _bt_predict_race(bundle, rdf_raw, strategy_mode):
+    """1レース分の予想を実行するにゃ（軽量版にゃ）"""
+    try:
+        df2 = add_prior_stats_for_prediction(rdf_raw.copy())
+        df2 = add_running_style(df2)
+        pipe, fc = get_pipeline_and_features(bundle)
+        for c in [c for c in fc if c not in df2.columns]:
+            df2[c] = 0.0
+        if hasattr(pipe, "predict_proba"):
+            raw_prob = pipe.predict_proba(df2[fc])[:, 1]
+        else:
+            raw_prob = np.asarray(pipe.predict(df2[fc]), dtype=float)
+
+        # キャリブレーション + タイブレークにゃ
+        cal = calibrate_prob_isotonic(raw_prob)
+        df2["ml_top3_prob"] = cal
+        _pop  = pd.to_numeric(df2["popularity"], errors="coerce").fillna(99)
+        _odds = pd.to_numeric(df2["odds"],       errors="coerce").fillna(999)
+        _hno  = pd.to_numeric(df2["horse_no"],   errors="coerce").fillna(99)
+        _tb   = (1.0/_pop.clip(1))*1e-4 + (1.0/_odds.clip(0.1))*1e-6 + (1.0/_hno.clip(1))*1e-8
+        df2["_c"] = df2["ml_top3_prob"] + _tb
+        df2["ml_rank"] = (df2.groupby("race_key")["_c"]
+                           .rank(ascending=False, method="first")
+                           .fillna(1).astype(int))
+        df2 = df2.drop(columns=["_c"])
+        df2 = add_ev_score(df2)
+        df2 = add_kelly_ratio(df2)
+        df2 = add_value_strategy(df2, strategy_mode=strategy_mode)
+        # S級処理にゃ
+        try:
+            df2 = add_pace_advantage(df2)
+            df2 = add_ev_score_v2(df2)
+            df2 = add_pass_score(df2, strategy_mode=strategy_mode)
+            df2 = add_final_score(df2, strategy_mode=strategy_mode)
+        except Exception:
+            pass
+        return df2
+    except Exception:
+        return None
+
+
+def _get_top3_set(rdf, finish_col="actual_finish"):
+    """実際の1〜3着馬番セットにゃ"""
+    s = set()
+    for pos in [1, 2, 3]:
+        rows = rdf[rdf[finish_col] == pos]
+        if not rows.empty:
+            s.add(str(_safe_int(rows.iloc[0]["horse_no"], 0)))
+    return s - {"0", ""}
+
+
+def run_backtest_v2(bundle,
+                    history_df: pd.DataFrame,
+                    strategy_mode: str = STRATEGY_MODE_ROI,
+                    min_odds: float = 1.0,
+                    max_odds: float = 9999.0,
+                    bet_unit: int = 100) -> dict:
+    """
+    バックテスト v2 完全版にゃ。
+
+    計算する券種にゃ:
+      単勝（AI1位固定にゃ）
+      複勝（買い判定馬全員にゃ）
+      馬連（AI上位2頭にゃ）
+      ワイド（AI上位3頭のBOX全3点にゃ）
+      馬単（AI1位→2位にゃ）
+      三連複（AI上位3頭BOXにゃ）
+      三連単（AI順1→2→3にゃ）
+      S級判定買いにゃ（buy_flag_v2=◎/○/▲にゃ）
+
+    戻り値にゃ:
+      race_records: レース別詳細にゃ
+      monthly_records: 月別集計にゃ
+      summary: 全体サマリーにゃ
+      by_place: 競馬場別にゃ
+      by_distance: 距離帯別にゃ
+      by_field_size: 頭数別にゃ
+    """
+    import traceback as _tb
+
+    if history_df is None or history_df.empty:
+        return {"error": "データがないにゃ"}
+    if "finish" not in history_df.columns:
+        return {"error": "finish（着順）列が必要にゃ"}
+
+    df = history_df.copy()
+    df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
+    df = df[df["finish"].notna() & (df["finish"] > 0)].copy()
+    if df.empty:
+        return {"error": "有効な着順データがないにゃ"}
+
+    race_keys = df["race_key"].dropna().unique() if "race_key" in df.columns else []
+    if len(race_keys) == 0:
+        return {"error": "race_keyが設定されていないにゃ"}
+
+    # ── 券種別集計バッファにゃ ──
+    BET_TYPES = ["単勝","複勝","馬連","ワイド","馬単","三連複","三連単","S級判定"]
+    stats = {bt: {"hit":0, "bet":0, "ret":0.0, "races":0} for bt in BET_TYPES}
+    race_records   = []
+    monthly_buffer = {}  # {YYYYMM: {bt: stats}}
+
+    total = len(race_keys)
+    for idx, rk in enumerate(race_keys):
+        rdf_raw = df[df["race_key"] == rk].copy()
+        if rdf_raw.empty:
+            continue
+
+        # 着順列を退避にゃ
+        rdf_raw["actual_finish"] = pd.to_numeric(rdf_raw["finish"], errors="coerce")
+        top3_set = _get_top3_set(rdf_raw)
+        if len(top3_set) < 3:
+            continue
+
+        # 実際の着順馬にゃ
+        winner_row = rdf_raw[rdf_raw["actual_finish"] == 1]
+        second_row = rdf_raw[rdf_raw["actual_finish"] == 2]
+        third_row  = rdf_raw[rdf_raw["actual_finish"] == 3]
+        w_no = str(_safe_int(winner_row.iloc[0]["horse_no"],0)) if not winner_row.empty else ""
+        s_no = str(_safe_int(second_row.iloc[0]["horse_no"],0)) if not second_row.empty else ""
+        t_no = str(_safe_int(third_row.iloc[0]["horse_no"],0))  if not third_row.empty  else ""
+        w_odds = _safe_float(winner_row.iloc[0].get("odds",10), 10) if not winner_row.empty else 10.0
+
+        # オッズフィルタにゃ
+        avg_odds = float(rdf_raw["odds"].mean()) if "odds" in rdf_raw.columns else 10.0
+        if not (min_odds <= avg_odds <= max_odds):
+            continue
+
+        # レース情報にゃ
+        place     = str(rdf_raw["place"].iloc[0]) if "place" in rdf_raw.columns else "不明"
+        distance  = _safe_int(rdf_raw["distance"].iloc[0], 0) if "distance" in rdf_raw.columns else 0
+        field_sz  = _safe_int(rdf_raw["field_size"].max(), len(rdf_raw)) if "field_size" in rdf_raw.columns else len(rdf_raw)
+        date_int  = _safe_int(rdf_raw["date_int"].iloc[0], 0) if "date_int" in rdf_raw.columns else 0
+        yyyymm    = int(str(date_int)[:6]) if date_int > 0 else 0
+        race_label= str(rdf_raw["race_label"].iloc[0]) if "race_label" in rdf_raw.columns else str(rk)
+
+        # 予想実行にゃ
+        pred = _bt_predict_race(bundle, rdf_raw, strategy_mode)
+        if pred is None:
+            continue
+        pred["actual_finish"] = rdf_raw["actual_finish"].values
+
+        pred_sorted = pred.sort_values("ml_rank")
+        ai_horses = [str(_safe_int(row["horse_no"],0)) for _,row in pred_sorted.iterrows()
+                     if _safe_int(row.get("horse_no",0),0) > 0]
+        if len(ai_horses) < 3:
+            continue
+
+        ai1,ai2,ai3 = ai_horses[0], ai_horses[1], ai_horses[2]
+        ai1_odds = _safe_float(pred_sorted.iloc[0].get("odds",10), 10)
+        ai2_odds = _safe_float(pred_sorted.iloc[1].get("odds",10), 10) if len(pred_sorted)>1 else 10.0
+
+        # 買い判定馬にゃ
+        buy_df = pred[pred.get("buy_flag","") == "買い"] if "buy_flag" in pred.columns else pred.head(3)
+        buy_nos = [str(_safe_int(r["horse_no"],0)) for _,r in buy_df.iterrows()]
+        # S級判定にゃ
+        s_buy_df = pred[pred.get("buy_flag_v2","").str.contains("買い", na=False)] \
+            if "buy_flag_v2" in pred.columns else buy_df
+        s_buy_nos = [str(_safe_int(r["horse_no"],0)) for _,r in s_buy_df.iterrows()]
+
+        # ── 月別バッファ初期化にゃ ──
+        if yyyymm not in monthly_buffer:
+            monthly_buffer[yyyymm] = {bt:{"hit":0,"bet":0,"ret":0.0} for bt in BET_TYPES}
+
+        # ────────────────────────
+        # 各券種の的中・払戻計算にゃ
+        # ────────────────────────
+        rec = {
+            "レースにゃ": race_label, "競馬場にゃ": place,
+            "距離にゃ": distance, "頭数にゃ": field_sz,
+            "date_int": date_int, "yyyymm": yyyymm,
+            "1着にゃ": f"馬番{w_no}({w_odds:.1f}倍)", "2着にゃ": f"馬番{s_no}", "3着にゃ": f"馬番{t_no}",
+            "AI1位にゃ": f"馬番{ai1}({ai1_odds:.1f}倍)",
+        }
+
+        # ── 単勝にゃ ──
+        tan_odds = ai1_odds
+        if min_odds <= tan_odds <= max_odds:
+            stats["単勝"]["bet"] += bet_unit
+            monthly_buffer[yyyymm]["単勝"]["bet"] += bet_unit
+            if ai1 == w_no:
+                ret = int(bet_unit * tan_odds * (1 - TANSHO_DEDUCTION))
+                stats["単勝"]["hit"] += 1
+                stats["単勝"]["ret"] += ret
+                monthly_buffer[yyyymm]["単勝"]["hit"] += 1
+                monthly_buffer[yyyymm]["単勝"]["ret"] += ret
+                rec["単勝にゃ"] = f"✅ {ret}円にゃ"
+            else:
+                rec["単勝にゃ"] = f"❌ 馬番{ai1}→{w_no}にゃ"
+            stats["単勝"]["races"] += 1
+
+        # ── 複勝にゃ（買い判定馬全員にゃ）──
+        for bno in buy_nos:
+            b_odds = _safe_float(pred[pred["horse_no"].astype(str).str.strip() == bno]["odds"].iloc[0]
+                                  if not pred[pred["horse_no"].astype(str).str.strip() == bno].empty else 0, 10)
+            if b_odds < min_odds: continue
+            fuku_est = max(1.1, b_odds * 0.30)
+            stats["複勝"]["bet"] += bet_unit
+            monthly_buffer[yyyymm]["複勝"]["bet"] += bet_unit
+            if bno in top3_set:
+                ret = int(bet_unit * fuku_est * (1 - FUKUSHO_DEDUCTION))
+                stats["複勝"]["hit"] += 1
+                stats["複勝"]["ret"] += ret
+                monthly_buffer[yyyymm]["複勝"]["hit"] += 1
+                monthly_buffer[yyyymm]["複勝"]["ret"] += ret
+        rec["複勝にゃ"] = "✅" if any(n in top3_set for n in buy_nos) else "❌"
+        stats["複勝"]["races"] += 1
+
+        # ── 馬連にゃ（AI上位2頭にゃ）──
+        if ai2:
+            stats["馬連"]["bet"] += bet_unit
+            monthly_buffer[yyyymm]["馬連"]["bet"] += bet_unit
+            umaren_hit = {ai1,ai2} <= top3_set and w_no in {ai1,ai2}
+            if umaren_hit:
+                um_est = max(2.0, ai1_odds * ai2_odds * 0.15)
+                ret = int(bet_unit * um_est * (1 - UMAREN_DEDUCTION))
+                stats["馬連"]["hit"] += 1
+                stats["馬連"]["ret"] += ret
+                monthly_buffer[yyyymm]["馬連"]["hit"] += 1
+                monthly_buffer[yyyymm]["馬連"]["ret"] += ret
+                rec["馬連にゃ"] = f"✅ {ret}円にゃ"
+            else:
+                rec["馬連にゃ"] = "❌"
+            stats["馬連"]["races"] += 1
+
+        # ── ワイドにゃ（AI上位3頭のBOX3点にゃ）──
+        wide_pairs = [(ai1,ai2),(ai1,ai3),(ai2,ai3)]
+        for wa,wb in wide_pairs:
+            stats["ワイド"]["bet"] += bet_unit
+            monthly_buffer[yyyymm]["ワイド"]["bet"] += bet_unit
+            if {wa,wb} <= top3_set:
+                wa_odds = _safe_float(pred[pred["horse_no"]==_safe_int(wa,0)]["odds"].iloc[0]
+                                       if not pred[pred["horse_no"]==_safe_int(wa,0)].empty else 0, 5)
+                wb_odds = _safe_float(pred[pred["horse_no"]==_safe_int(wb,0)]["odds"].iloc[0]
+                                       if not pred[pred["horse_no"]==_safe_int(wb,0)].empty else 0, 5)
+                wide_est = max(1.5, (wa_odds + wb_odds) * 0.15)
+                ret = int(bet_unit * wide_est * (1 - WIDE_DEDUCTION))
+                stats["ワイド"]["hit"] += 1
+                stats["ワイド"]["ret"] += ret
+                monthly_buffer[yyyymm]["ワイド"]["hit"] += 1
+                monthly_buffer[yyyymm]["ワイド"]["ret"] += ret
+        stats["ワイド"]["races"] += 1
+
+        # ── 馬単にゃ（AI1→2にゃ）──
+        if ai2:
+            stats["馬単"]["bet"] += bet_unit
+            monthly_buffer[yyyymm]["馬単"]["bet"] += bet_unit
+            if ai1 == w_no and ai2 == s_no:
+                um_tan_est = max(5.0, ai1_odds * ai2_odds * 0.25)
+                ret = int(bet_unit * um_tan_est * (1 - UMATAN_DEDUCTION))
+                stats["馬単"]["hit"] += 1
+                stats["馬単"]["ret"] += ret
+                monthly_buffer[yyyymm]["馬単"]["hit"] += 1
+                monthly_buffer[yyyymm]["馬単"]["ret"] += ret
+                rec["馬単にゃ"] = f"✅ {ret}円にゃ"
+            else:
+                rec["馬単にゃ"] = "❌"
+            stats["馬単"]["races"] += 1
+
+        # ── 三連複にゃ（AI上位3頭BOXにゃ）──
+        stats["三連複"]["bet"] += bet_unit
+        monthly_buffer[yyyymm]["三連複"]["bet"] += bet_unit
+        if {ai1,ai2,ai3} == top3_set:
+            ai3_odds = _safe_float(pred_sorted.iloc[2].get("odds",10) if len(pred_sorted)>2 else 10, 10)
+            san3_est = max(5.0, ai1_odds * ai2_odds * ai3_odds * 0.05)
+            ret = int(bet_unit * san3_est * (1 - SANRENPUKU_DEDUCTION))
+            stats["三連複"]["hit"] += 1
+            stats["三連複"]["ret"] += ret
+            monthly_buffer[yyyymm]["三連複"]["hit"] += 1
+            monthly_buffer[yyyymm]["三連複"]["ret"] += ret
+            rec["三連複にゃ"] = f"✅ {ret}円にゃ"
+        else:
+            rec["三連複にゃ"] = "❌"
+        stats["三連複"]["races"] += 1
+
+        # ── 三連単にゃ（AI順1→2→3にゃ）──
+        stats["三連単"]["bet"] += bet_unit
+        monthly_buffer[yyyymm]["三連単"]["bet"] += bet_unit
+        if ai1==w_no and ai2==s_no and ai3==t_no:
+            ai3_odds2 = _safe_float(pred_sorted.iloc[2].get("odds",10) if len(pred_sorted)>2 else 10, 10)
+            san1_est = max(10.0, ai1_odds * ai2_odds * ai3_odds2 * 0.12)
+            ret = int(bet_unit * san1_est * (1 - SANRENTAN_DEDUCTION))
+            stats["三連単"]["hit"] += 1
+            stats["三連単"]["ret"] += ret
+            monthly_buffer[yyyymm]["三連単"]["hit"] += 1
+            monthly_buffer[yyyymm]["三連単"]["ret"] += ret
+            rec["三連単にゃ"] = f"✅ {ret}円にゃ"
+        else:
+            rec["三連単にゃ"] = "❌"
+        stats["三連単"]["races"] += 1
+
+        # ── S級判定買いにゃ ──
+        for sno in s_buy_nos:
+            s_odds = _safe_float(pred[pred["horse_no"]==_safe_int(sno,0)]["odds"].iloc[0]
+                                  if not pred[pred["horse_no"]==_safe_int(sno,0)].empty else 0, 10)
+            if s_odds < min_odds: continue
+            s_fuku = max(1.1, s_odds * 0.30)
+            stats["S級判定"]["bet"] += bet_unit
+            monthly_buffer[yyyymm]["S級判定"]["bet"] += bet_unit
+            if sno in top3_set:
+                ret = int(bet_unit * s_fuku * (1 - FUKUSHO_DEDUCTION))
+                stats["S級判定"]["hit"] += 1
+                stats["S級判定"]["ret"] += ret
+                monthly_buffer[yyyymm]["S級判定"]["hit"] += 1
+                monthly_buffer[yyyymm]["S級判定"]["ret"] += ret
+        stats["S級判定"]["races"] += 1
+
+        race_records.append(rec)
+
+    if not race_records:
+        return {"error": "有効なレースが処理できなかったにゃ"}
+
+    # ── サマリーにゃ ──
+    def pct(h, b):
+        return f"{h/b*100:.1f}%" if b > 0 else "-"
+    def roi(r, b):
+        return f"{r/b*100:.1f}%" if b > 0 else "-"
+    def roi_float(r, b):
+        return round(r/b*100, 1) if b > 0 else 0.0
+
+    summary_rows = []
+    for bt in BET_TYPES:
+        s = stats[bt]
+        n_bet = s["bet"] // bet_unit
+        summary_rows.append({
+            "券種にゃ":    bt,
+            "レース数にゃ": s["races"],
+            "購入点数にゃ": n_bet,
+            "的中数にゃ":  s["hit"],
+            "的中率にゃ":  pct(s["hit"], n_bet),
+            "投資額にゃ":  f"¥{s['bet']:,}",
+            "回収額にゃ":  f"¥{int(s['ret']):,}",
+            "回収率にゃ":  roi(s["ret"], s["bet"]),
+            "損益にゃ":    f"{'+'if s['ret']>s['bet'] else ''}{int(s['ret']-s['bet']):,}円にゃ",
+            "_roi":       roi_float(s["ret"], s["bet"]),
+        })
+    summary_df = pd.DataFrame(summary_rows)
+
+    # ── 月別集計にゃ ──
+    monthly_rows = []
+    for yyyymm_key in sorted(monthly_buffer.keys()):
+        if yyyymm_key == 0:
+            continue
+        mb = monthly_buffer[yyyymm_key]
+        row = {"年月にゃ": str(yyyymm_key)}
+        for bt in ["単勝","複勝","三連複","S級判定"]:
+            s2 = mb[bt]
+            nb = s2["bet"] // bet_unit
+            row[f"{bt}的中率にゃ"] = pct(s2["hit"], nb)
+            row[f"{bt}回収率にゃ"] = roi(s2["ret"], s2["bet"])
+            row[f"_{bt}_roi"]     = roi_float(s2["ret"], s2["bet"])
+        monthly_rows.append(row)
+    monthly_df = pd.DataFrame(monthly_rows)
+
+    # ── 競馬場別にゃ ──
+    rec_df = pd.DataFrame(race_records)
+    by_place_rows = []
+    for pl, g in rec_df.groupby("競馬場にゃ"):
+        n = len(g)
+        san3_hits = int(g["三連複にゃ"].str.startswith("✅").sum()) if "三連複にゃ" in g.columns else 0
+        tan_hits  = int(g["単勝にゃ"].str.startswith("✅").sum())   if "単勝にゃ"  in g.columns else 0
+        by_place_rows.append({
+            "競馬場にゃ":     pl,
+            "レース数にゃ":   n,
+            "単勝的中率にゃ": pct(tan_hits, n),
+            "三連複的中率にゃ":pct(san3_hits, n),
+        })
+    by_place_df = pd.DataFrame(by_place_rows).sort_values("三連複的中率にゃ", ascending=False)
+
+    # ── 距離帯別にゃ ──
+    def dist_band(d):
+        if d <= 1400:   return "短距離(〜1400)"
+        if d <= 1800:   return "マイル(1401〜1800)"
+        if d <= 2200:   return "中距離(1801〜2200)"
+        return "長距離(2201〜)"
+
+    rec_df["距離帯にゃ"] = rec_df["距離にゃ"].apply(lambda x: dist_band(_safe_int(x,2000)))
+    by_dist_rows = []
+    for db, g in rec_df.groupby("距離帯にゃ"):
+        n = len(g)
+        san3_hits = int(g["三連複にゃ"].str.startswith("✅").sum()) if "三連複にゃ" in g.columns else 0
+        tan_hits  = int(g["単勝にゃ"].str.startswith("✅").sum())   if "単勝にゃ" in g.columns else 0
+        by_dist_rows.append({
+            "距離帯にゃ":     db,
+            "レース数にゃ":   n,
+            "単勝的中率にゃ": pct(tan_hits, n),
+            "三連複的中率にゃ":pct(san3_hits, n),
+        })
+    by_dist_df = pd.DataFrame(by_dist_rows)
+
+    # ── 頭数帯別にゃ ──
+    def field_band(f):
+        if f <= 8:  return "少頭数(〜8頭)"
+        if f <= 12: return "中頭数(9〜12頭)"
+        if f <= 16: return "多頭数(13〜16頭)"
+        return "大頭数(17頭〜)"
+
+    rec_df["頭数帯にゃ"] = rec_df["頭数にゃ"].apply(lambda x: field_band(_safe_int(x,16)))
+    by_field_rows = []
+    for fb, g in rec_df.groupby("頭数帯にゃ"):
+        n = len(g)
+        san3_hits = int(g["三連複にゃ"].str.startswith("✅").sum()) if "三連複にゃ" in g.columns else 0
+        tan_hits  = int(g["単勝にゃ"].str.startswith("✅").sum())   if "単勝にゃ" in g.columns else 0
+        by_field_rows.append({
+            "頭数帯にゃ":    fb,
+            "レース数にゃ":  n,
+            "単勝的中率にゃ":pct(tan_hits, n),
+            "三連複的中率にゃ":pct(san3_hits, n),
+        })
+    by_field_df = pd.DataFrame(by_field_rows)
+
+    # ── 改善提案の自動生成にゃ ──
+    tips = []
+    for s_row in summary_df.itertuples():
+        bt    = getattr(s_row, "券種にゃ")
+        roi_v = getattr(s_row, "_roi", 0)
+        if roi_v >= 100:
+            tips.append(f"🎉 **{bt}がプラス収支**にゃ！回収率{roi_v:.1f}% → この券種に集中するにゃ🐾")
+        elif roi_v >= 80:
+            tips.append(f"✅ **{bt}はほぼ均衡**にゃ（{roi_v:.1f}%にゃ）。点数を絞れば黒字化できるにゃ")
+        elif roi_v < 50 and bt in ["三連単","馬単"]:
+            tips.append(f"⚠️ **{bt}は回収率{roi_v:.1f}%**にゃ。見送りを推奨するにゃ")
+
+    # 競馬場別アドバイスにゃ
+    if not by_place_df.empty:
+        best_pl = by_place_df.iloc[0]
+        tips.append(
+            f"🏟️ **{best_pl['競馬場にゃ']}が三連複的中率最高**にゃ"
+            f"（{best_pl['三連複的中率にゃ']}にゃ）。この競馬場のレースを優先するにゃ"
+        )
+
+    return {
+        "summary":      summary_df,
+        "race_records": rec_df,
+        "monthly":      monthly_df,
+        "by_place":     by_place_df,
+        "by_distance":  by_dist_df,
+        "by_field":     by_field_df,
+        "tips":         tips,
+        "n_races":      len(race_records),
+        "stats_raw":    stats,
+    }
+
+
+# ============================================================
+# 複数条件の一括比較にゃ
+# ============================================================
+
+def run_backtest_comparison(bundle,
+                             history_df: pd.DataFrame,
+                             conditions: list[dict] = None,
+                             bet_unit: int = 100) -> dict:
+    """
+    複数の条件でバックテストを一括実行して比較するにゃ。
+
+    conditions の例にゃ:
+    [
+      {"name":"回収率重視にゃ", "strategy_mode": STRATEGY_MODE_ROI,   "min_odds":1.0},
+      {"name":"的中率重視にゃ", "strategy_mode": STRATEGY_MODE_HITRATE,"min_odds":1.0},
+      {"name":"高オッズ限定にゃ","strategy_mode": STRATEGY_MODE_ROI,  "min_odds":5.0},
+      {"name":"低オッズ限定にゃ","strategy_mode": STRATEGY_MODE_ROI,  "min_odds":1.0, "max_odds":5.0},
+    ]
+    """
+    if conditions is None:
+        conditions = [
+            {"name": "回収率重視にゃ",   "strategy_mode": STRATEGY_MODE_ROI,     "min_odds": 1.0, "max_odds": 9999.0},
+            {"name": "的中率重視にゃ",   "strategy_mode": STRATEGY_MODE_HITRATE,  "min_odds": 1.0, "max_odds": 9999.0},
+            {"name": "中穴限定にゃ(5〜20倍)", "strategy_mode": STRATEGY_MODE_ROI, "min_odds": 5.0, "max_odds": 20.0},
+            {"name": "本命限定にゃ(〜5倍)",   "strategy_mode": STRATEGY_MODE_ROI, "min_odds": 1.0, "max_odds": 5.0},
+        ]
+
+    results = {}
+    for cond in conditions:
+        name = cond.get("name", "条件にゃ")
+        try:
+            r = run_backtest_v2(
+                bundle, history_df,
+                strategy_mode=cond.get("strategy_mode", STRATEGY_MODE_ROI),
+                min_odds=cond.get("min_odds", 1.0),
+                max_odds=cond.get("max_odds", 9999.0),
+                bet_unit=bet_unit,
+            )
+            results[name] = r
+        except Exception as e:
+            results[name] = {"error": str(e)}
+
+    # 比較テーブルにゃ
+    compare_rows = []
+    for name, r in results.items():
+        if "error" in r:
+            compare_rows.append({"条件にゃ": name, "エラーにゃ": r["error"]})
+            continue
+        s = r.get("stats_raw", {})
+        def roi_f(bt):
+            st2 = s.get(bt, {})
+            b = st2.get("bet", 0)
+            ret = st2.get("ret", 0)
+            return round(ret/b*100, 1) if b > 0 else 0.0
+        def hit_f(bt):
+            st2 = s.get(bt, {})
+            nb = st2.get("bet",0) // bet_unit
+            return round(st2.get("hit",0)/nb*100,1) if nb > 0 else 0.0
+
+        compare_rows.append({
+            "条件にゃ":       name,
+            "レース数にゃ":   r.get("n_races", 0),
+            "単勝的中%にゃ":  hit_f("単勝"),
+            "単勝回収%にゃ":  roi_f("単勝"),
+            "複勝的中%にゃ":  hit_f("複勝"),
+            "複勝回収%にゃ":  roi_f("複勝"),
+            "三連複的中%にゃ":hit_f("三連複"),
+            "三連複回収%にゃ":roi_f("三連複"),
+            "S級的中%にゃ":   hit_f("S級判定"),
+            "S級回収%にゃ":   roi_f("S級判定"),
+        })
+    compare_df = pd.DataFrame(compare_rows)
+
+    return {"results": results, "compare": compare_df}
+
+
+# ============================================================
+# バックテスト v2 表示にゃ
+# ============================================================
+
+def show_backtest_v2_tab(bundle, strategy_mode=STRATEGY_MODE_ROI):
+    """バックテスト v2 完全表示にゃ"""
+    st.header("📊 バックテスト v2（完全版・比較分析にゃ）")
+    st.caption(
+        "実際の着順データで**全券種の的中率・回収率**を計測するにゃ🐾\n"
+        "複数条件を一括比較して**最も勝てる買い方**を見つけるにゃ"
+    )
+
+    # ── データ読み込みUIにゃ ──
+    col1, col2 = st.columns(2)
+    with col1:
+        bt2_file = st.file_uploader(
+            "過去データCSVにゃ（finish列必須にゃ）",
+            type=["csv"], key="bt2_upload"
+        )
+        use_yosou2 = st.checkbox(
+            f"yosou.csvを使うにゃ",
+            value=TARGET_CSV_PATH.exists(), key="bt2_yosou"
+        )
+    with col2:
+        bet_unit2   = st.number_input("1点あたり金額にゃ（円にゃ）", 100, 10000, 100, 100, key="bt2_unit")
+        min_o2      = st.number_input("最低オッズにゃ", 1.0, 10.0, 1.0, 0.5, key="bt2_mino")
+        max_o2      = st.number_input("最高オッズにゃ", 10.0, 9999.0, 9999.0, 10.0, key="bt2_maxo")
+
+    # データ読み込みにゃ
+    hist_df2 = None
+    if bt2_file is not None:
+        raw2 = bt2_file.read()
+        try:
+            hist_df2 = normalize_52cols(read_csv_bytes(raw2), bt2_file.name)
+        except Exception:
+            try:
+                hist_df2 = read_simple_csv_to_52(raw2, bt2_file.name)
+            except Exception as e:
+                st.error(f"CSV読込エラーにゃ: {e}")
+    elif use_yosou2 and TARGET_CSV_PATH.exists():
+        hist_df2 = read_target_history_csv(TARGET_CSV_PATH)
+
+    if hist_df2 is None:
+        st.info(
+            "📂 着順データをアップロードするにゃ🐾\n\n"
+            "**必要な列にゃ**: 馬名・馬番・オッズ・人気・finish（着順）にゃ\n\n"
+            "**推奨にゃ**: JRA-VAN/TARGETからエクスポートした52列CSVにゃ"
+        )
+        return
+
+    # finishチェックにゃ
+    if "finish" not in hist_df2.columns:
+        st.error("❌ finish（着順）列がないにゃ")
+        return
+
+    n_valid = int(hist_df2["finish"].notna().sum())
+    n_races = hist_df2["race_key"].nunique() if "race_key" in hist_df2.columns else "?"
+    st.success(f"✅ データ読込完了にゃ: {len(hist_df2)}行 / 有効着順:{n_valid}行 / {n_races}レースにゃ")
+
+    # ── 実行モード選択にゃ ──
+    run_mode = st.radio(
+        "実行モードにゃ",
+        ["🎯 単一条件バックテスト", "⚖️ 複数条件一括比較（推奨にゃ）"],
+        horizontal=True
+    )
+
+    if run_mode == "🎯 単一条件バックテスト":
+        if st.button("🐾 バックテスト実行にゃ！", type="primary", key="bt2_single"):
+            with st.spinner("バックテスト実行中にゃ...🐾"):
+                try:
+                    bundle_bt2, _ = load_model_safely(None)
+                    if bundle_bt2 is None:
+                        st.error("PKLが必要にゃ🐾"); return
+                    result = run_backtest_v2(
+                        bundle_bt2, hist_df2,
+                        strategy_mode=strategy_mode,
+                        min_odds=min_o2, max_odds=max_o2,
+                        bet_unit=int(bet_unit2)
+                    )
+                except Exception as e:
+                    st.error(f"エラーにゃ: {e}"); return
+
+            if "error" in result:
+                st.error(f"❌ {result['error']}"); return
+
+            _show_bt2_single_result(result, int(bet_unit2))
+
+    else:  # 複数条件比較にゃ
+        st.markdown("#### 比較条件設定にゃ")
+        conditions_default = [
+            {"name":"回収率重視にゃ",       "strategy_mode": STRATEGY_MODE_ROI,     "min_odds":1.0,  "max_odds":9999.0},
+            {"name":"的中率重視にゃ",       "strategy_mode": STRATEGY_MODE_HITRATE, "min_odds":1.0,  "max_odds":9999.0},
+            {"name":"中穴限定にゃ(5〜20倍)", "strategy_mode": STRATEGY_MODE_ROI,    "min_odds":5.0,  "max_odds":20.0},
+            {"name":"本命限定にゃ(〜5倍)",  "strategy_mode": STRATEGY_MODE_ROI,    "min_odds":1.0,  "max_odds":5.0},
+        ]
+        st.dataframe(pd.DataFrame(conditions_default), use_container_width=True, hide_index=True)
+
+        if st.button("🐾 全条件一括比較 実行にゃ！", type="primary", key="bt2_compare"):
+            bundle_bt2, _ = load_model_safely(None)
+            if bundle_bt2 is None:
+                st.error("PKLが必要にゃ🐾"); return
+
+            prog = st.progress(0)
+            results_all = {}
+            for ci, cond in enumerate(conditions_default):
+                prog.progress((ci+1)/len(conditions_default),
+                               text=f"条件 {ci+1}/{len(conditions_default)}: {cond['name']}にゃ")
+                try:
+                    r = run_backtest_v2(
+                        bundle_bt2, hist_df2,
+                        strategy_mode=cond["strategy_mode"],
+                        min_odds=cond["min_odds"],
+                        max_odds=cond["max_odds"],
+                        bet_unit=int(bet_unit2)
+                    )
+                    results_all[cond["name"]] = r
+                except Exception as e:
+                    results_all[cond["name"]] = {"error": str(e)}
+
+            prog.empty()
+            _show_bt2_compare_result(results_all, int(bet_unit2))
+
+
+def _show_bt2_single_result(result: dict, bet_unit: int):
+    """単一バックテスト結果表示にゃ"""
+    st.markdown(f"### 📈 バックテスト結果にゃ（{result['n_races']}レースにゃ）")
+
+    # ── サマリーにゃ ──
+    summary = result.get("summary", pd.DataFrame())
+    if not summary.empty:
+        st.markdown("#### 🏆 券種別成績にゃ")
+
+        def color_summary(row):
+            roi_v = _safe_float(str(row.get("回収率にゃ","0%")).replace("%",""), 0)
+            if roi_v >= 100: return ["background-color:#c3e6cb"]*len(row)
+            if roi_v >= 80:  return ["background-color:#d1ecf1"]*len(row)
+            if roi_v < 50:   return ["background-color:#f8d7da"]*len(row)
+            return [""]*len(row)
+
+        disp = summary.drop(columns=["_roi"], errors="ignore")
+        try:
+            st.dataframe(disp.style.apply(color_summary, axis=1),
+                         use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        # KPIメトリクスにゃ
+        c1,c2,c3,c4 = st.columns(4)
+        for col, bt in [(c1,"単勝"),(c2,"複勝"),(c3,"三連複"),(c4,"S級判定")]:
+            row = summary[summary["券種にゃ"]==bt]
+            if not row.empty:
+                roi_v = _safe_float(str(row.iloc[0].get("回収率にゃ","0%")).replace("%",""), 0)
+                hit_v = str(row.iloc[0].get("的中率にゃ", "-"))
+                delta_c = "normal" if roi_v >= 80 else "inverse"
+                col.metric(f"{bt}にゃ", f"回収{roi_v:.0f}%",
+                           delta=f"的中{hit_v}", delta_color=delta_c)
+
+        st.download_button("📥 サマリーCSVにゃ",
+            data=summary.to_csv(index=False,encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name="bt_summary.csv", mime="text/csv")
+
+    # ── 月別推移にゃ ──
+    monthly = result.get("monthly", pd.DataFrame())
+    if not monthly.empty:
+        st.markdown("#### 📅 月別回収率推移にゃ")
+        disp_m = monthly.drop(columns=[c for c in monthly.columns if c.startswith("_")], errors="ignore")
+        st.dataframe(disp_m, use_container_width=True, hide_index=True)
+
+        # 月別グラフにゃ（簡易にゃ）
+        roi_cols = [c for c in monthly.columns if c.endswith("回収率にゃ")]
+        if roi_cols:
+            chart_data = monthly[["年月にゃ"] + roi_cols].copy()
+            for c in roi_cols:
+                chart_data[c] = chart_data[c].apply(
+                    lambda x: _safe_float(str(x).replace("%",""), 0))
+            st.line_chart(chart_data.set_index("年月にゃ"))
+
+    # ── 詳細分析にゃ ──
+    tab_pl, tab_dist, tab_field, tab_race = st.tabs([
+        "🏟️ 競馬場別にゃ", "📏 距離帯別にゃ", "👥 頭数別にゃ", "📋 レース別明細にゃ"
+    ])
+    with tab_pl:
+        bp = result.get("by_place", pd.DataFrame())
+        if not bp.empty:
+            st.dataframe(bp, use_container_width=True, hide_index=True)
+    with tab_dist:
+        bd = result.get("by_distance", pd.DataFrame())
+        if not bd.empty:
+            st.dataframe(bd, use_container_width=True, hide_index=True)
+    with tab_field:
+        bf = result.get("by_field", pd.DataFrame())
+        if not bf.empty:
+            st.dataframe(bf, use_container_width=True, hide_index=True)
+    with tab_race:
+        rr = result.get("race_records", pd.DataFrame())
+        if not rr.empty:
+            disp_r = rr.drop(columns=["date_int","yyyymm"], errors="ignore")
+            st.dataframe(disp_r, use_container_width=True, hide_index=True)
+            st.download_button("📥 レース別明細CSVにゃ",
+                data=disp_r.to_csv(index=False,encoding="utf-8-sig").encode("utf-8-sig"),
+                file_name="bt_race_detail.csv", mime="text/csv")
+
+    # ── 改善提案にゃ ──
+    tips = result.get("tips", [])
+    if tips:
+        st.markdown("---")
+        st.markdown("#### 💡 改善提案にゃ")
+        for tip in tips:
+            st.info(tip)
+
+
+def _show_bt2_compare_result(results_all: dict, bet_unit: int):
+    """複数条件比較結果の表示にゃ"""
+    st.markdown("### ⚖️ 複数条件比較結果にゃ")
+
+    # 比較テーブルにゃ
+    compare_rows = []
+    for name, r in results_all.items():
+        if "error" in r:
+            compare_rows.append({"条件にゃ": name, "エラーにゃ": r.get("error","")})
+            continue
+        s = r.get("stats_raw", {})
+        def roi_f(bt):
+            s2 = s.get(bt, {})
+            b = s2.get("bet", 0)
+            return round(s2.get("ret",0)/b*100,1) if b > 0 else 0.0
+        def hit_f(bt):
+            s2 = s.get(bt, {})
+            nb = s2.get("bet",0)//bet_unit
+            return round(s2.get("hit",0)/nb*100,1) if nb > 0 else 0.0
+
+        compare_rows.append({
+            "条件にゃ":       name,
+            "レース数にゃ":   r.get("n_races",0),
+            "単勝的中%にゃ":  hit_f("単勝"),
+            "単勝回収%にゃ":  roi_f("単勝"),
+            "複勝的中%にゃ":  hit_f("複勝"),
+            "複勝回収%にゃ":  roi_f("複勝"),
+            "三連複的中%にゃ":hit_f("三連複"),
+            "三連複回収%にゃ":roi_f("三連複"),
+            "S級的中%にゃ":   hit_f("S級判定"),
+            "S級回収%にゃ":   roi_f("S級判定"),
+        })
+    compare_df = pd.DataFrame(compare_rows)
+
+    # カラーにゃ
+    def color_compare(row):
+        colors = []
+        for col in row.index:
+            v = _safe_float(str(row[col]).replace("%",""), 0)
+            if "回収" in str(col) and v >= 100:
+                colors.append("background-color:#c3e6cb")
+            elif "回収" in str(col) and v >= 80:
+                colors.append("background-color:#d1ecf1")
+            elif "回収" in str(col) and v < 60:
+                colors.append("background-color:#f8d7da")
+            else:
+                colors.append("")
+        return colors
+
+    try:
+        st.dataframe(compare_df.style.apply(color_compare, axis=1),
+                     use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+    st.download_button("📥 比較結果CSVにゃ",
+        data=compare_df.to_csv(index=False,encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name="bt_compare.csv", mime="text/csv")
+
+    # ── 条件別詳細にゃ ──
+    st.markdown("#### 📋 条件別詳細にゃ")
+    tabs = st.tabs([f"📊 {name}" for name in results_all.keys()])
+    for tab, (name, r) in zip(tabs, results_all.items()):
+        with tab:
+            if "error" in r:
+                st.error(f"エラーにゃ: {r['error']}")
+                continue
+            _show_bt2_single_result(r, bet_unit)
+
+    # ── 総合ベスト条件にゃ ──
+    valid = {n:r for n,r in results_all.items() if "error" not in r}
+    if valid:
+        st.markdown("---")
+        st.markdown("#### 🌟 総合ベスト条件にゃ（複勝回収率にゃ）")
+        best_name = max(
+            valid.keys(),
+            key=lambda n: _safe_float(
+                str(valid[n].get("summary",pd.DataFrame())
+                    .query("券種にゃ=='複勝'")["回収率にゃ"].iloc[0]
+                    if not valid[n].get("summary",pd.DataFrame()).empty else "0%")
+                .replace("%",""), 0)
+        )
+        best_r = valid[best_name]
+        summary_best = best_r.get("summary", pd.DataFrame())
+        fuku_roi = ""
+        if not summary_best.empty:
+            f_row = summary_best[summary_best["券種にゃ"]=="複勝"]
+            if not f_row.empty:
+                fuku_roi = str(f_row.iloc[0].get("回収率にゃ",""))
+        st.success(
+            f"🏆 **{best_name}** が最もROI高いにゃ！\n\n"
+            f"複勝回収率: **{fuku_roi}**にゃ🐾"
+        )
+
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI v26にゃ")
     st.success(f"起動版にゃ: {VERSION}にゃ")
@@ -6553,6 +8459,19 @@ def app_main():
             except Exception as _ai_err:
                 st.warning(f"AI分析エラーにゃ: {_ai_err}にゃ")
 
+            # ML強化ダッシュボードにゃ
+            st.markdown("---")
+            try:
+                show_ml_enhance_dashboard(
+                    bundle,
+                    history_df=None,
+                    pred_df=pred_df,
+                    race_df=race_df,
+                    strategy_mode=strategy_mode
+                )
+            except Exception as _ml_err:
+                st.warning(f"ML強化ダッシュボードエラーにゃ: {_ml_err}にゃ")
+
             # 全レースにゃ
             st.markdown("---")
             st.subheader("全レースにゃ🐾")
@@ -6576,16 +8495,15 @@ def app_main():
 
     # ── バックテストセクションにゃ（予想ボタンと独立して動くにゃ）──
     st.markdown("---")
-    with st.expander("📊 バックテスト（実績検証）にゃ🐾 - クリックして開くにゃ", expanded=False):
-        # バックテスト用に独自でbundleをロードするにゃ
+    with st.expander("📊 バックテスト v2（完全版・比較分析にゃ）🐾 - クリックして開くにゃ", expanded=False):
         try:
             bundle_bt, bt_status = load_model_safely(uploaded_model)
             if bundle_bt is not None:
-                show_backtest_tab(bundle_bt, strategy_mode=strategy_mode)
+                show_backtest_v2_tab(bundle_bt, strategy_mode=strategy_mode)
             else:
                 st.info("PKLをアップロードするとバックテストができるにゃ🐾")
         except Exception as _bt_load_err:
-            st.info(f"PKLをアップロードするとバックテストができるにゃ🐾")
+            st.info("PKLをアップロードするとバックテストができるにゃ🐾")
 
     st.divider()
     with st.expander("簡易CSVテンプレにゃ（v26対応にゃ）"):

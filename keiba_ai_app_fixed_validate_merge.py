@@ -8062,6 +8062,666 @@ def _show_bt2_compare_result(results_all: dict, bet_unit: int):
 
 
 
+
+
+# ============================================================
+# ============================================================
+# 着順データ一括取得モジュールにゃ🐾
+# netkeibaから過去レース結果を自動取得するにゃ
+# ============================================================
+# ============================================================
+
+import time as _time
+
+# ── 結果ページのURL生成にゃ ──
+def _result_url(race_id: str) -> str:
+    return f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
+
+def _shutuba_past_url(race_id: str) -> str:
+    """出馬表+結果の旧式URL（より安定にゃ）"""
+    return f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
+
+def _db_url(race_id: str) -> str:
+    """db.netkeibaのURL（着順データが豊富にゃ）"""
+    return f"https://db.netkeiba.com/race/{race_id}/"
+
+
+def fetch_result_html(race_id: str, session=None) -> tuple[str, str]:
+    """
+    レース結果HTMLを取得するにゃ。
+    複数URLを試してどれか取得できたものを返すにゃ。
+    戻り値: (html, 使用したURLにゃ)
+    """
+    if session is None:
+        session = _make_session()
+
+    urls = [
+        (_result_url(race_id),       "result"),
+        (_shutuba_past_url(race_id), "shutuba_past"),
+        (_db_url(race_id),           "db"),
+    ]
+
+    for url, url_type in urls:
+        try:
+            r = session.get(url, timeout=20)
+            if r.status_code == 200 and len(r.text) > 1000:
+                return r.text, url_type
+        except Exception:
+            continue
+    raise ValueError(f"レース結果の取得に失敗したにゃ: race_id={race_id}")
+
+
+def parse_result_html(html: str, race_id: str,
+                       url_type: str = "result") -> pd.DataFrame:
+    """
+    結果HTMLをパースして着順付きDataFrameを返すにゃ。
+    finish列（着順）が必ず含まれるにゃ。
+    """
+    info = race_id_to_info(race_id)
+
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception as e:
+        raise ValueError(f"HTML解析失敗にゃ: {e}")
+
+    def flatten_cols(df):
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                "_".join([str(x) for x in c if str(x) != "nan"]).strip("_")
+                for c in df.columns
+            ]
+        else:
+            df.columns = [str(c) for c in df.columns]
+        return df
+
+    # 結果テーブルを探すにゃ
+    target = None
+    for t in tables:
+        t = flatten_cols(t)
+        j = " ".join(str(c) for c in t.columns)
+        # 着順・馬名・騎手が揃っているテーブルにゃ
+        if (("着順" in j or "着" in j or "finish" in j.lower()) and
+                ("馬名" in j or "馬番" in j)):
+            target = t
+            break
+        # 出走馬リストにゃ（shutuba_past形式にゃ）
+        if "馬名" in j and "騎手" in j and len(t) >= 5:
+            target = t
+            break
+
+    if target is None:
+        raise ValueError("結果テーブルが見つからなかったにゃ")
+
+    # 列名を正規化にゃ
+    rename = {}
+    for c in target.columns:
+        s = str(c).lower()
+        if "着順" in str(c) or s in ["着","finish","確定着順","入線"]:
+            rename[c] = "finish"
+        elif "馬番" in str(c):
+            rename[c] = "horse_no"
+        elif "馬名" in str(c):
+            rename[c] = "horse_name"
+        elif "騎手" in str(c):
+            rename[c] = "jockey"
+        elif "斤量" in str(c):
+            rename[c] = "carried_weight"
+        elif "単勝" in str(c) or ("オッズ" in str(c) and "複" not in str(c)):
+            rename[c] = "odds"
+        elif "人気" in str(c):
+            rename[c] = "popularity"
+        elif "枠番" in str(c) or str(c) == "枠":
+            rename[c] = "frame_no"
+        elif "タイム" in str(c) or "time" in s:
+            rename[c] = "time_raw"
+        elif "上り" in str(c) or "上がり" in str(c) or "3f" in s:
+            rename[c] = "last3f"
+        elif "通過" in str(c) or "pass" in s:
+            if "1" in str(c):
+                rename[c] = "pass1"
+            elif "2" in str(c):
+                rename[c] = "pass2"
+            elif "3" in str(c):
+                rename[c] = "pass3"
+            elif "4" in str(c):
+                rename[c] = "pass4"
+        elif "馬体重" in str(c) or "体重" in str(c):
+            rename[c] = "body_weight"
+        elif "調教師" in str(c) or "厩舎" in str(c):
+            rename[c] = "trainer"
+        elif "賞金" in str(c):
+            rename[c] = "prize"
+    target = target.rename(columns=rename)
+
+    # finishがなければ行番号を着順として使うにゃ
+    if "finish" not in target.columns:
+        # 1列目が着順の場合にゃ
+        first_col = target.columns[0]
+        first_vals = pd.to_numeric(target[first_col], errors="coerce")
+        if first_vals.notna().sum() > len(target) * 0.5:
+            target = target.rename(columns={first_col: "finish"})
+        else:
+            target["finish"] = range(1, len(target) + 1)
+
+    # 馬名がなければ失敗にゃ
+    if "horse_name" not in target.columns:
+        # horse_noで代替にゃ
+        if "horse_no" not in target.columns:
+            raise ValueError("馬名・馬番が見つからないにゃ")
+
+    # クリーニングにゃ
+    target = target.dropna(subset=["horse_name"] if "horse_name" in target.columns
+                            else ["horse_no"]).copy()
+    if "horse_name" in target.columns:
+        target["horse_name"] = (target["horse_name"].astype(str)
+                                 .str.replace("\n", " ").str.strip())
+        target = target[~target["horse_name"].str.contains("馬名|除外|取消", na=False)]
+        target = target[target["horse_name"].ne("")]
+
+    # HTMLからレース情報を追加取得にゃ
+    distance_m   = re.search(r"(\d{4})m",           html, re.IGNORECASE)
+    track_type_m = re.search(r"(芝|ダート|障害)",   html)
+    going_m      = re.search(r"馬場[:：\s]*([良稍重不良]+)", html)
+    race_name_m  = re.search(r'class="RaceTitle[^"]*"[^>]*>([^<]+)<', html)
+
+    # 52列DataFrameを構築にゃ
+    rows = []
+    for i, r in target.iterrows():
+        row = {c: "" for c in COLS_52}
+        row.update({
+            "year":       info["year"] - 2000,
+            "month":      1,
+            "day":        1,
+            "kai":        info["kai"],
+            "place":      info["place"],
+            "nichiji":    info["nichiji"],
+            "race_no":    info["race_no"],
+            "race_name":  race_name_m.group(1).strip() if race_name_m else f"R{info['race_no']}",
+            "race_grade": "3",
+            "track_type": track_type_m.group(1) if track_type_m else "芝",
+            "course_kind":"0",
+            "distance":   distance_m.group(1) if distance_m else "2000",
+            "going":      going_m.group(1) if going_m else "良",
+            "finish":     r.get("finish", ""),
+            "horse_name": r.get("horse_name", ""),
+            "horse_no":   r.get("horse_no",   ""),
+            "frame_no":   r.get("frame_no",   ""),
+            "jockey":     r.get("jockey",     ""),
+            "carried_weight": r.get("carried_weight", ""),
+            "odds":       r.get("odds",       ""),
+            "popularity": r.get("popularity", ""),
+            "time_raw":   r.get("time_raw",   ""),
+            "last3f":     r.get("last3f",     ""),
+            "pass1":      r.get("pass1",      ""),
+            "pass2":      r.get("pass2",      ""),
+            "pass3":      r.get("pass3",      ""),
+            "pass4":      r.get("pass4",      ""),
+            "body_weight":r.get("body_weight",""),
+            "trainer":    r.get("trainer",    ""),
+            "prize":      r.get("prize",      ""),
+            "field_size": len(target),
+        })
+        # 性齢分解にゃ
+        for sex_col in ["sex_age","性齢","性令"]:
+            sa = str(r.get(sex_col, "")).strip()
+            if sa and sa not in ["nan","None",""]:
+                row["sex"] = sa[0]
+                m2 = re.search(r"(\d+)", sa[1:])
+                row["age"] = m2.group(1) if m2 else ""
+                break
+        rows.append([row[c] for c in COLS_52])
+
+    df = pd.DataFrame(rows, columns=COLS_52)
+    df["source_file"] = f"netkeiba_result_{race_id}"
+    return clean_types(df)
+
+
+def fetch_race_result(race_id: str,
+                       session=None) -> pd.DataFrame:
+    """
+    1レースの結果（着順付き）を取得するにゃ。
+    """
+    if session is None:
+        session = _make_session()
+    html, url_type = fetch_result_html(race_id, session)
+    return parse_result_html(html, race_id, url_type)
+
+
+def fetch_results_by_date(target_date: str,
+                           session=None,
+                           sleep_sec: float = 1.5) -> tuple[pd.DataFrame, list]:
+    """
+    指定日の全レース結果を一括取得するにゃ。
+    target_date: "YYYYMMDD"にゃ
+    戻り値: (全レース着順DataFrame, エラーリストにゃ)
+    """
+    if session is None:
+        session = _make_session()
+
+    # まず当日のrace_idを取得にゃ
+    race_ids = fetch_today_race_ids(target_date)
+    if not race_ids:
+        return pd.DataFrame(), [{"date": target_date, "error": "レースIDが取得できなかったにゃ"}]
+
+    frames, errors = [], []
+    for rid in race_ids:
+        try:
+            df = fetch_race_result(rid, session)
+            frames.append(df)
+        except Exception as e:
+            errors.append({"race_id": rid, "error": str(e)})
+        _time.sleep(sleep_sec)
+
+    all_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return all_df, errors
+
+
+def fetch_results_by_date_range(start_date: str,
+                                  end_date: str,
+                                  sleep_sec: float = 1.5,
+                                  max_days: int = 90) -> tuple[pd.DataFrame, dict]:
+    """
+    日付範囲の全レース結果を一括取得するにゃ🐾
+    start_date, end_date: "YYYYMMDD"にゃ
+    max_days: 最大取得日数にゃ（デフォルト90日にゃ）
+
+    戻り値: (全着順DataFrame, 進捗サマリーにゃ)
+    """
+    from datetime import datetime, timedelta
+
+    start_dt = datetime.strptime(start_date, "%Y%m%d")
+    end_dt   = datetime.strptime(end_date,   "%Y%m%d")
+
+    # 日数制限にゃ
+    delta = (end_dt - start_dt).days + 1
+    if delta > max_days:
+        end_dt  = start_dt + timedelta(days=max_days - 1)
+        delta   = max_days
+
+    session = _make_session()
+    all_frames  = []
+    all_errors  = []
+    progress    = {"total_days": delta, "done_days": 0,
+                   "total_races": 0, "error_races": 0,
+                   "dates_processed": []}
+
+    current = start_dt
+    while current <= end_dt:
+        date_str = current.strftime("%Y%m%d")
+        try:
+            df, errors = fetch_results_by_date(
+                date_str, session=session, sleep_sec=sleep_sec)
+            if not df.empty:
+                all_frames.append(df)
+                progress["total_races"]  += df["race_key"].nunique() \
+                    if "race_key" in df.columns else len(df) // 10
+            progress["error_races"]     += len(errors)
+            all_errors.extend(errors)
+            progress["dates_processed"].append(date_str)
+        except Exception as e:
+            all_errors.append({"date": date_str, "error": str(e)})
+
+        progress["done_days"] += 1
+        current += timedelta(days=1)
+        _time.sleep(sleep_sec * 0.5)  # 日切り替え時の待機にゃ
+
+    all_df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+    progress["final_rows"]  = len(all_df)
+    progress["error_count"] = len(all_errors)
+    progress["errors"]      = all_errors[:20]  # 先頭20件のみにゃ
+
+    return all_df, progress
+
+
+def fetch_results_by_race_ids(race_ids: list[str],
+                               sleep_sec: float = 1.5) -> tuple[pd.DataFrame, list]:
+    """
+    race_idリストから結果を一括取得するにゃ。
+    """
+    session = _make_session()
+    frames, errors = [], []
+    for rid in race_ids:
+        try:
+            df = fetch_race_result(rid, session)
+            frames.append(df)
+        except Exception as e:
+            errors.append({"race_id": rid, "error": str(e)})
+        _time.sleep(sleep_sec)
+    all_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return all_df, errors
+
+
+# ============================================================
+# 着順データ一括取得タブにゃ
+# ============================================================
+
+def show_result_fetch_tab():
+    """
+    着順データ一括取得の画面にゃ🐾
+    3つの取得方法にゃ:
+      ① 日付指定にゃ（1日分にゃ）
+      ② 日付範囲指定にゃ（最大90日にゃ）
+      ③ race_id直接指定にゃ
+    """
+    st.header("📥 着順データ一括取得にゃ🐾")
+    st.caption(
+        "netkeibaから過去レースの着順データを自動取得するにゃ。\n"
+        "取得したCSVはバックテストに直接使えるにゃ🐾"
+    )
+
+    st.info(
+        "💡 **推奨フローにゃ**\n\n"
+        "① ここで着順データを取得 → CSVダウンロードにゃ\n"
+        "② バックテストタブでそのCSVをアップロードにゃ\n"
+        "③ 複数条件で一括比較 → 最強の買い方を発見するにゃ🐾"
+    )
+
+    # 取得方法の選択にゃ
+    METHOD_DATE    = "📅 日付指定にゃ（1日分にゃ）"
+    METHOD_RANGE   = "📆 日付範囲指定にゃ（最大90日にゃ）"
+    METHOD_RACE_ID = "🔑 race_id直接指定にゃ"
+
+    method = st.radio(
+        "取得方法にゃ",
+        [METHOD_DATE, METHOD_RANGE, METHOD_RACE_ID],
+        horizontal=True
+    )
+
+    sleep_sec = st.slider(
+        "アクセス間隔（秒）にゃ",
+        min_value=1.0, max_value=5.0, value=2.0, step=0.5,
+        help="短すぎるとBANされるにゃ。2秒以上推奨にゃ🐾"
+    )
+
+    # ── 各取得方法のUIにゃ ──
+    target_ids   = []
+    target_date  = None
+    start_date   = None
+    end_date     = None
+    max_days_v   = 30
+
+    if method == METHOD_DATE:
+        st.markdown("#### 📅 日付指定にゃ")
+        col1, col2 = st.columns(2)
+        with col1:
+            sel_date = st.date_input(
+                "取得日にゃ",
+                value=date.today() - __import__('datetime').timedelta(days=1),
+                key="rf_date"
+            )
+            target_date = sel_date.strftime("%Y%m%d")
+        with col2:
+            st.metric("取得対象日にゃ", target_date)
+            st.caption("その日の全レース（通常8〜12Rにゃ）を取得にゃ")
+
+    elif method == METHOD_RANGE:
+        st.markdown("#### 📆 日付範囲指定にゃ")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            import datetime as _dt
+            start_d = st.date_input(
+                "開始日にゃ",
+                value=_dt.date.today() - _dt.timedelta(days=30),
+                key="rf_start"
+            )
+            start_date = start_d.strftime("%Y%m%d")
+        with col2:
+            end_d = st.date_input(
+                "終了日にゃ",
+                value=_dt.date.today() - _dt.timedelta(days=1),
+                key="rf_end"
+            )
+            end_date = end_d.strftime("%Y%m%d")
+        with col3:
+            max_days_v = st.number_input(
+                "最大取得日数にゃ", 1, 90, 30, key="rf_maxdays")
+
+        days = (_dt.datetime.strptime(end_date, "%Y%m%d") -
+                _dt.datetime.strptime(start_date, "%Y%m%d")).days + 1
+        est_races = days * 9  # 1日平均9レースにゃ
+        est_time  = int(days * 9 * sleep_sec / 60)
+
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("対象日数にゃ",   f"{days}日にゃ")
+        col_b.metric("推定レース数にゃ", f"約{est_races}レースにゃ")
+        col_c.metric("推定時間にゃ",   f"約{est_time}分にゃ")
+
+        if days > 30:
+            st.warning(
+                f"⚠️ {days}日分は時間がかかるにゃ（推定{est_time}分にゃ）。\n"
+                "まず30日以内で試すことを推奨するにゃ🐾"
+            )
+
+    else:  # METHOD_RACE_ID
+        st.markdown("#### 🔑 race_id直接指定にゃ")
+        ids_text = st.text_area(
+            "race_idを1行ずつ入力にゃ（またはURLも可にゃ）",
+            placeholder="202505040811\n202505040812\nhttps://race.netkeiba.com/race/result.html?race_id=202505040813",
+            height=150, key="rf_rids"
+        )
+        target_ids = [
+            extract_race_id(line.strip())
+            for line in ids_text.splitlines()
+            if line.strip()
+        ]
+        target_ids = [r for r in target_ids if r]
+        if target_ids:
+            st.metric("取得予定レース数にゃ", f"{len(target_ids)}レースにゃ")
+            est_t = int(len(target_ids) * sleep_sec / 60)
+            if est_t > 0:
+                st.caption(f"推定所要時間にゃ: 約{est_t}分にゃ")
+
+    # 入力チェックにゃ
+    can_run = (
+        (method == METHOD_DATE   and target_date)  or
+        (method == METHOD_RANGE  and start_date and end_date) or
+        (method == METHOD_RACE_ID and len(target_ids) > 0)
+    )
+    if not can_run:
+        st.info("取得条件を入力するにゃ🐾")
+        return
+
+    # ── 実行ボタンにゃ ──
+    if st.button("🐾 着順データ取得 開始にゃ！", type="primary", key="rf_run"):
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        result_df    = pd.DataFrame()
+        errors_list  = []
+
+        try:
+            if method == METHOD_DATE:
+                status_text.info(f"📡 {target_date} のレースデータを取得中にゃ...")
+                result_df, errors_list = fetch_results_by_date(
+                    target_date, sleep_sec=sleep_sec)
+                progress_bar.progress(1.0)
+
+            elif method == METHOD_RANGE:
+                status_text.info(f"📡 {start_date}〜{end_date} のデータを取得中にゃ...")
+
+                # プログレス付き取得にゃ
+                from datetime import datetime as _dtt, timedelta as _td
+                start_dt = _dtt.strptime(start_date, "%Y%m%d")
+                end_dt   = _dtt.strptime(end_date,   "%Y%m%d")
+                days_total = min((end_dt - start_dt).days + 1, int(max_days_v))
+                session  = _make_session()
+                frames   = []
+
+                for di in range(days_total):
+                    current_d  = start_dt + _td(days=di)
+                    date_str   = current_d.strftime("%Y%m%d")
+                    status_text.info(
+                        f"📡 {date_str} を取得中にゃ..."
+                        f"（{di+1}/{days_total}日目にゃ）"
+                    )
+                    try:
+                        df_day, errs = fetch_results_by_date(
+                            date_str, session=session, sleep_sec=sleep_sec)
+                        if not df_day.empty:
+                            frames.append(df_day)
+                        errors_list.extend(errs)
+                    except Exception as e:
+                        errors_list.append({"date": date_str, "error": str(e)})
+
+                    progress_bar.progress((di + 1) / days_total)
+                    _time.sleep(0.3)
+
+                result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+            else:  # race_id指定にゃ
+                status_text.info(f"📡 {len(target_ids)}レースを取得中にゃ...")
+                frames = []
+                session = _make_session()
+                for ri, rid in enumerate(target_ids):
+                    status_text.info(
+                        f"📡 {rid} を取得中にゃ..."
+                        f"（{ri+1}/{len(target_ids)}にゃ）"
+                    )
+                    try:
+                        df_r = fetch_race_result(rid, session)
+                        frames.append(df_r)
+                    except Exception as e:
+                        errors_list.append({"race_id": rid, "error": str(e)})
+                    progress_bar.progress((ri + 1) / len(target_ids))
+                    _time.sleep(sleep_sec)
+                result_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+        except Exception as e:
+            st.error(f"❌ 取得エラーにゃ: {e}にゃ")
+            with st.expander("エラー詳細にゃ"):
+                import traceback
+                st.code(traceback.format_exc())
+            return
+
+        progress_bar.empty()
+        status_text.empty()
+
+        # ── 結果表示にゃ ──
+        if result_df.empty:
+            st.error(
+                "❌ データが取得できなかったにゃ🐾\n\n"
+                "**考えられる原因にゃ:**\n"
+                "- 指定日にレースが開催されていないにゃ\n"
+                "- netkeibaのIP制限にゃ（少し時間を置くにゃ）\n"
+                "- インターネット接続の問題にゃ"
+            )
+            if errors_list:
+                st.dataframe(pd.DataFrame(errors_list[:10]),
+                             use_container_width=True, hide_index=True)
+            return
+
+        n_rows  = len(result_df)
+        n_races = result_df["race_key"].nunique() if "race_key" in result_df.columns else "?"
+        n_valid_finish = int(
+            pd.to_numeric(result_df.get("finish", pd.Series()), errors="coerce").notna().sum()
+        )
+
+        st.success(
+            f"✅ 取得完了にゃ🐾\n\n"
+            f"**{n_races}レース / {n_rows}頭 / 着順あり:{n_valid_finish}行**にゃ"
+        )
+
+        # エラー報告にゃ
+        if errors_list:
+            st.warning(f"⚠️ 取得失敗にゃ: {len(errors_list)}件にゃ")
+            with st.expander("失敗詳細にゃ"):
+                st.dataframe(pd.DataFrame(errors_list[:20]),
+                             use_container_width=True, hide_index=True)
+
+        # プレビューにゃ
+        st.markdown("#### 📋 プレビューにゃ（先頭20行にゃ）")
+        preview_cols = [c for c in
+                        ["race_label","horse_no","horse_name","finish",
+                         "odds","popularity","jockey","time_raw","last3f"]
+                        if c in result_df.columns]
+        st.dataframe(
+            result_df[preview_cols].head(20).rename(columns={
+                "race_label":"レースにゃ","horse_no":"馬番にゃ","horse_name":"馬名にゃ",
+                "finish":"着順にゃ","odds":"オッズにゃ","popularity":"人気にゃ",
+                "jockey":"騎手にゃ","time_raw":"タイムにゃ","last3f":"上り3Fにゃ",
+            }),
+            use_container_width=True, hide_index=True
+        )
+
+        # 統計にゃ
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("取得レース数にゃ", f"{n_races}にゃ")
+        col2.metric("取得頭数にゃ",     f"{n_rows}頭にゃ")
+        col3.metric("着順データにゃ",   f"{n_valid_finish}行にゃ")
+        col4.metric("エラーにゃ",       f"{len(errors_list)}件にゃ")
+
+        # ── ダウンロードにゃ ──
+        st.markdown("---")
+        st.markdown("#### 💾 CSVダウンロードにゃ")
+
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
+
+        # 52列フルCSVにゃ（バックテスト用にゃ）
+        with col_dl1:
+            csv_full = result_df.to_csv(
+                index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "📥 52列フルCSVにゃ\n（バックテスト用にゃ）",
+                data=csv_full,
+                file_name=f"results_full_{target_date or start_date or 'batch'}.csv",
+                mime="text/csv",
+                help="バックテストタブに直接使えるにゃ🐾"
+            )
+
+        # 簡易CSVにゃ（着順・馬名・オッズのみにゃ）
+        with col_dl2:
+            simple_cols = [c for c in
+                           ["race_label","place","race_no","horse_no","horse_name",
+                            "finish","odds","popularity","jockey","last3f","time_raw"]
+                           if c in result_df.columns]
+            csv_simple = result_df[simple_cols].rename(columns={
+                "race_label":"レースにゃ","place":"競馬場にゃ","race_no":"R番号にゃ",
+                "horse_no":"馬番にゃ","horse_name":"馬名にゃ","finish":"着順にゃ",
+                "odds":"オッズにゃ","popularity":"人気にゃ","jockey":"騎手にゃ",
+                "last3f":"上り3Fにゃ","time_raw":"タイムにゃ",
+            }).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "📥 簡易CSVにゃ\n（確認用にゃ）",
+                data=csv_simple,
+                file_name=f"results_simple_{target_date or start_date or 'batch'}.csv",
+                mime="text/csv"
+            )
+
+        # race_idリストにゃ（再取得用にゃ）
+        with col_dl3:
+            if "race_key" in result_df.columns:
+                race_ids_list = result_df["source_file"].str.replace(
+                    "netkeiba_result_","").unique().tolist()
+                ids_text_out = "\n".join(str(r) for r in race_ids_list if r)
+                st.download_button(
+                    "📥 race_idリストにゃ\n（再取得用にゃ）",
+                    data=ids_text_out.encode("utf-8"),
+                    file_name=f"race_ids_{target_date or start_date or 'batch'}.txt",
+                    mime="text/plain"
+                )
+
+        # バックテスト即時実行にゃ
+        st.markdown("---")
+        st.markdown("#### ⚡ 取得データで即バックテストにゃ")
+        if st.button("🐾 このデータでバックテスト実行にゃ！", key="rf_bt_run"):
+            bundle_rf, status_rf = load_model_safely(None)
+            if bundle_rf is None:
+                st.error("PKLが必要にゃ🐾（サイドバーからアップロードするにゃ）")
+            else:
+                with st.spinner("バックテスト実行中にゃ...🐾"):
+                    try:
+                        bt_result = run_backtest_v2(
+                            bundle_rf, result_df,
+                            strategy_mode=STRATEGY_MODE_ROI,
+                        )
+                        if "error" in bt_result:
+                            st.error(f"❌ {bt_result['error']}")
+                        else:
+                            _show_bt2_single_result(bt_result, 100)
+                    except Exception as e:
+                        st.error(f"バックテストエラーにゃ: {e}にゃ")
+
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI v26にゃ")
     st.success(f"起動版にゃ: {VERSION}にゃ")
@@ -8504,6 +9164,17 @@ def app_main():
                 st.info("PKLをアップロードするとバックテストができるにゃ🐾")
         except Exception as _bt_load_err:
             st.info("PKLをアップロードするとバックテストができるにゃ🐾")
+
+    # ── 着順データ一括取得セクションにゃ ──
+    st.markdown("---")
+    with st.expander("📥 着順データ一括取得にゃ🐾 - クリックして開くにゃ", expanded=False):
+        try:
+            show_result_fetch_tab()
+        except Exception as _rf_err:
+            st.error(f"着順取得エラーにゃ: {_rf_err}にゃ")
+            with st.expander("エラー詳細にゃ"):
+                import traceback
+                st.code(traceback.format_exc())
 
     st.divider()
     with st.expander("簡易CSVテンプレにゃ（v26対応にゃ）"):

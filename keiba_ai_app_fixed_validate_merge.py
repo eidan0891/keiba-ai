@@ -422,7 +422,7 @@ def repair_simple_imputer(obj, _seen=None, _depth=0, _max_depth=20):
 # netkeiba スクレイピング完全実装にゃ（v26新機能にゃ）
 # ============================================================
 def _make_session():
-    """netkeibaアクセス用セッションにゃ"""
+    """netkeibaアクセス用セッションにゃ（CP932/Shift-JIS対応にゃ）"""
     s = requests.Session()
     s.headers.update({
         "User-Agent": (
@@ -439,6 +439,21 @@ def _make_session():
     return s
 
 
+def _fetch_with_encoding(url: str, session=None,
+                           timeout: int = 20) -> str:
+    """
+    netkeibaはShift-JIS(CP932)にゃ。
+    自動検出ではなく明示的にCP932でデコードするにゃ。
+    """
+    if session is None:
+        session = _make_session()
+    r = session.get(url, timeout=timeout)
+    r.raise_for_status()
+    # netkeibaは常にCP932(Shift-JIS)にゃ → 強制指定にゃ
+    r.encoding = 'cp932'
+    return r.text
+
+
 def fetch_today_race_ids(target_date: str = None, sleep_sec: float = 1.0) -> list[str]:
     """
     指定日（YYYYMMDD）の全race_idを取得するにゃ。
@@ -450,9 +465,7 @@ def fetch_today_race_ids(target_date: str = None, sleep_sec: float = 1.0) -> lis
     session = _make_session()
     url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date}"
     try:
-        r = session.get(url, timeout=20)
-        r.raise_for_status()
-        html = r.text
+        html = _fetch_with_encoding(url, session)
     except Exception as e:
         raise ValueError(f"レース一覧の取得に失敗したにゃ: {e}")
 
@@ -461,12 +474,10 @@ def fetch_today_race_ids(target_date: str = None, sleep_sec: float = 1.0) -> lis
 
 
 def fetch_shutuba_html(race_id: str, session=None) -> str:
-    """出馬表HTMLを取得するにゃ"""
+    """出馬表HTMLをCP932で取得するにゃ"""
     if session is None: session = _make_session()
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    r = session.get(url, timeout=20)
-    r.raise_for_status()
-    return r.text
+    return _fetch_with_encoding(url, session)
 
 
 def fetch_odds_tansho(race_id: str, session=None) -> dict[str, float]:
@@ -8088,7 +8099,7 @@ def _db_url(race_id: str) -> str:
 
 def fetch_result_html(race_id: str, session=None) -> tuple[str, str]:
     """
-    レース結果HTMLを取得するにゃ。
+    レース結果HTMLをCP932(Shift-JIS)で取得するにゃ。
     複数URLを試してどれか取得できたものを返すにゃ。
     戻り値: (html, 使用したURLにゃ)
     """
@@ -8103,9 +8114,9 @@ def fetch_result_html(race_id: str, session=None) -> tuple[str, str]:
 
     for url, url_type in urls:
         try:
-            r = session.get(url, timeout=20)
-            if r.status_code == 200 and len(r.text) > 1000:
-                return r.text, url_type
+            html = _fetch_with_encoding(url, session)
+            if len(html) > 1000:
+                return html, url_type
         except Exception:
             continue
     raise ValueError(f"レース結果の取得に失敗したにゃ: race_id={race_id}")
@@ -8156,7 +8167,7 @@ def parse_result_html(html: str, race_id: str,
     rename = {}
     for c in target.columns:
         s = str(c).lower()
-        if "着順" in str(c) or s in ["着","finish","確定着順","入線"]:
+        if any(x in str(c) for x in ["着順","着 順","確定着順"]) or s in ["着","finish","入線"]:
             rename[c] = "finish"
         elif "馬番" in str(c):
             rename[c] = "horse_no"

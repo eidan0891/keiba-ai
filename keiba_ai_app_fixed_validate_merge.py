@@ -7338,7 +7338,13 @@ def run_backtest_v2(bundle,
     if df.empty:
         return {"error": "有効な着順データがないにゃ"}
 
-    race_keys = df["race_key"].dropna().unique() if "race_key" in df.columns else []
+    # race_key がなければ race_id から生成するにゃ
+    if "race_key" not in df.columns:
+        if "race_id" in df.columns:
+            df["race_key"] = df["race_id"].astype(str)
+        else:
+            return {"error": "race_key または race_id 列が必要にゃ"}
+    race_keys = df["race_key"].dropna().unique()
     if len(race_keys) == 0:
         return {"error": "race_keyが設定されていないにゃ"}
 
@@ -7811,7 +7817,7 @@ def show_backtest_v2_tab(bundle, strategy_mode=STRATEGY_MODE_ROI):
     if hist_df2 is None:
         st.info(
             "📂 着順データをアップロードするにゃ🐾\n\n"
-            "**必要な列にゃ**: 馬名・馬番・オッズ・人気・finish（着順）にゃ\n\n"
+            "**必要な列にゃ**: 馬名・馬番・finish（着順）にゃ\n\n"
             "**推奨にゃ**: JRA-VAN/TARGETからエクスポートした52列CSVにゃ"
         )
         return
@@ -7821,8 +7827,65 @@ def show_backtest_v2_tab(bundle, strategy_mode=STRATEGY_MODE_ROI):
         st.error("❌ finish（着順）列がないにゃ")
         return
 
-    n_valid = int(hist_df2["finish"].notna().sum())
-    n_races = hist_df2["race_key"].nunique() if "race_key" in hist_df2.columns else "?"
+    # ── race_key 自動生成にゃ ──
+    if "race_key" not in hist_df2.columns:
+        if "race_id" in hist_df2.columns:
+            hist_df2["race_key"] = hist_df2["race_id"].astype(str)
+        else:
+            hist_df2["race_key"] = (
+                hist_df2.get("place", pd.Series(["X"]*len(hist_df2))).astype(str) + "_" +
+                hist_df2.get("race_no", pd.Series(range(len(hist_df2)))).astype(str)
+            )
+
+    # ── date_int 自動生成にゃ ──
+    if "date_int" not in hist_df2.columns:
+        if "race_id" in hist_df2.columns:
+            def _race_id_to_date(rid):
+                rid = str(rid)
+                if len(rid) >= 8:
+                    return int(rid[:8]) if rid[:8].isdigit() else 20260101
+                return 20260101
+            hist_df2["date_int"] = hist_df2["race_id"].apply(_race_id_to_date)
+        else:
+            hist_df2["date_int"] = 20260101
+
+    # ── odds補完にゃ（コーナー通過順が入っている場合にゃ）──
+    # odds列が "2-2" のような形式 → コーナー通過順にゃ → 人気から推定にゃ
+    if "odds" in hist_df2.columns:
+        odds_check = hist_df2["odds"].astype(str).str.contains("-", na=False)
+        if odds_check.mean() > 0.5:
+            st.warning(
+                "⚠️ odds列にコーナー通過順が混入しているにゃ。"
+                "人気からオッズを推定して処理するにゃ🐾"
+            )
+            # 人気列が調教師名になっている場合にゃ
+            if "popularity" in hist_df2.columns:
+                pop_num = pd.to_numeric(hist_df2["popularity"], errors="coerce")
+                if pop_num.notna().mean() < 0.3:
+                    # popularity列も誤っているにゃ → finishベースで人気を推定にゃ
+                    hist_df2["popularity"] = pd.to_numeric(
+                        hist_df2["finish"], errors="coerce").fillna(99).astype(int)
+            # 人気からオッズを推定にゃ（近似式にゃ）
+            pop = pd.to_numeric(hist_df2.get("popularity", pd.Series([99]*len(hist_df2))),
+                                 errors="coerce").fillna(99)
+            hist_df2["odds"] = (pop * 1.5 + 1.0).round(1)
+        else:
+            hist_df2["odds"] = pd.to_numeric(hist_df2["odds"], errors="coerce").fillna(10.0)
+
+    # ── popularityの補完にゃ ──
+    if "popularity" in hist_df2.columns:
+        pop_num = pd.to_numeric(hist_df2["popularity"], errors="coerce")
+        if pop_num.notna().mean() < 0.3:
+            # 人気列が壊れているにゃ → finishベースで近似にゃ
+            hist_df2["popularity"] = pd.to_numeric(
+                hist_df2["finish"], errors="coerce").fillna(99).astype(int)
+
+    # ── field_size 補完にゃ ──
+    if "field_size" not in hist_df2.columns or        pd.to_numeric(hist_df2.get("field_size",""), errors="coerce").notna().mean() < 0.3:
+        hist_df2["field_size"] = hist_df2.groupby("race_key")["horse_no"].transform("count")
+
+    n_valid = int(pd.to_numeric(hist_df2["finish"], errors="coerce").notna().sum())
+    n_races = hist_df2["race_key"].nunique()
     st.success(f"✅ データ読込完了にゃ: {len(hist_df2)}行 / 有効着順:{n_valid}行 / {n_races}レースにゃ")
 
     # ── 実行モード選択にゃ ──

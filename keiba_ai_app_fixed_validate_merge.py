@@ -1123,10 +1123,20 @@ def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.Dat
 
     df = pd.DataFrame(rows, columns=COLS_52)
     df["source_file"] = source_name
-    if "running_style" in src.columns:
-        df["running_style"] = src["running_style"].astype(str).values
-    if "style_note" in src.columns:
-        df["style_note"] = src["style_note"].astype(str).values
+
+    # ── 元CSVにある列をそのまま引き継ぐにゃ ──
+    for carry_col in ["running_style","style_note",
+                       "finish","race_id","race_key","date_int",
+                       "time_raw","last3f","pass1","pass2","pass3","pass4",
+                       "body_weight","trainer","prize"]:
+        if carry_col in src.columns:
+            df[carry_col] = src[carry_col].reset_index(drop=True).values[:len(df)]
+
+    # race_id → race_key を自動生成するにゃ
+    if "race_key" not in df.columns or df["race_key"].isna().all():
+        if "race_id" in df.columns:
+            df["race_key"] = df["race_id"].astype(str)
+
     return clean_types(df)
 
 
@@ -7871,14 +7881,62 @@ def _read_backtest_csv(raw: bytes, fname: str) -> pd.DataFrame | None:
         df["_is_nyanko_csv"] = True  # にゃんこ予想CSVフラグにゃ
         return df
 
-    # ① 52列TARGET形式にゃ
+    # ① result_fetcher.py 出力CSV判定にゃ
+    # 列: race_id, finish, horse_no, horse_name, odds, popularity ...
+    result_markers = {"race_id","finish","horse_no","horse_name"}
+    if len(cols & result_markers) >= 3:
+        for enc in ["utf-8-sig","utf-8","cp932","shift_jis"]:
+            try:
+                df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str)
+                break
+            except Exception:
+                continue
+        # race_key自動生成にゃ
+        if "race_key" not in df.columns:
+            if "race_id" in df.columns:
+                df["race_key"] = df["race_id"].astype(str)
+        # date_int自動生成にゃ
+        if "date_int" not in df.columns:
+            if "race_id" in df.columns:
+                df["date_int"] = df["race_id"].astype(str).str[:8].apply(
+                    lambda x: int(x) if x.isdigit() else 20260101)
+            else:
+                df["date_int"] = 20260101
+        # odds補完にゃ（コーナー通過順が混入している場合にゃ）
+        if "odds" in df.columns:
+            odds_bad = df["odds"].astype(str).str.contains("-", na=False).mean() > 0.5
+            if odds_bad:
+                pop = pd.to_numeric(df.get("popularity",""), errors="coerce").fillna(99)
+                pop_is_bad = pop.notna().mean() < 0.3
+                if pop_is_bad:
+                    fin = pd.to_numeric(df.get("finish",""), errors="coerce").fillna(99)
+                    df["popularity"] = fin.astype(int)
+                pop = pd.to_numeric(df["popularity"], errors="coerce").fillna(99)
+                df["odds"] = (pop * 1.5 + 1.0).round(1)
+        # field_sizeにゃ
+        if "field_size" not in df.columns:
+            df["field_size"] = df.groupby("race_key")["horse_no"].transform("count")
+        # placeにゃ
+        if "place" not in df.columns:
+            place_map = {"01":"札幌","02":"函館","03":"福島","04":"新潟","05":"東京",
+                         "06":"中山","07":"中京","08":"京都","09":"阪神","10":"小倉"}
+            df["place"] = df["race_id"].astype(str).str[4:6].map(place_map).fillna("不明")
+        # race_noにゃ
+        if "race_no" not in df.columns:
+            df["race_no"] = df["race_id"].astype(str).str[10:12].apply(
+                lambda x: int(x) if x.isdigit() else 1)
+        # source_fileにゃ
+        df["source_file"] = fname
+        return clean_types(df) if "clean_types" in dir() else df
+
+    # ② 52列TARGET形式にゃ
     try:
         raw_df = read_csv_bytes(raw)
         return normalize_52cols(raw_df, fname)
     except Exception:
         pass
 
-    # ② 簡易CSVにゃ
+    # ③ 簡易CSVにゃ
     try:
         return read_simple_csv_to_52(raw, fname)
     except Exception:

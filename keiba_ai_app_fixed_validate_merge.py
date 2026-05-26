@@ -7776,6 +7776,117 @@ def run_backtest_comparison(bundle,
 # バックテスト v2 表示にゃ
 # ============================================================
 
+def _read_backtest_csv(raw: bytes, fname: str) -> pd.DataFrame | None:
+    """
+    バックテスト用CSVを柔軟に読み込むにゃ。
+    以下の形式に対応にゃ:
+      ① 52列TARGET形式にゃ
+      ② 簡易CSV（horse_name/finish列ありにゃ）
+      ③ にゃんこ予想結果CSV（nyanko_v26_all.csv形式にゃ）
+         → 着順列がないのでfinish入力UIを出すにゃ
+    """
+    # まずヘッダーを読んで形式を判断にゃ
+    for enc in ["utf-8-sig","utf-8","cp932","shift_jis"]:
+        try:
+            header_df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str, nrows=1)
+            break
+        except Exception:
+            header_df = None
+
+    if header_df is None:
+        return None
+
+    cols = set(str(c).strip() for c in header_df.columns)
+
+    # ③ にゃんこ予想結果CSV判定にゃ（日本語列にゃ）
+    nyanko_markers = {"AI順位","馬番","馬名","オッズ","人気","レース","レースID"}
+    if len(cols & nyanko_markers) >= 4:
+        for enc in ["utf-8-sig","utf-8","cp932","shift_jis"]:
+            try:
+                df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str)
+                break
+            except Exception:
+                continue
+        # 列名を内部形式にマッピングにゃ
+        rename = {
+            "レース": "race_label", "レースID": "race_key",
+            "AI順位": "ml_rank", "印": "mark",
+            "馬番": "horse_no", "馬名": "horse_name",
+            "性別": "sex", "年齢": "age", "騎手": "jockey", "斤量": "carried_weight",
+            "オッズ": "odds", "人気": "popularity",
+            "3着内確率": "ml_top3_prob", "期待値": "expected_value",
+            "EV乖離スコア": "ev_score", "市場暗示3着内確率": "implied_top3",
+            "危険人気馬": "danger_popular", "危険度": "danger_level",
+            "穴候補": "value_horse", "脚質": "running_style", "脚質メモ": "style_note",
+            "騎手実績": "jockey_top3_rate_prior",
+            "調教師実績": "trainer_top3_rate_prior",
+            "血統実績": "sire_top3_rate_prior",
+            "距離適性": "horse_distance_top3_rate_prior",
+            "Kelly比(複勝)": "kelly_ratio",
+            "Kelly比(三連複)": "kelly_ratio_sanren",
+            "軸信頼度": "pivot_confidence",
+        }
+        df = df.rename(columns=rename)
+
+        # odds/popularityを数値化にゃ
+        for c in ["odds","popularity","ml_rank","horse_no","ml_top3_prob",
+                  "ev_score","kelly_ratio","kelly_ratio_sanren"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(
+                    df[c].astype(str).str.replace("%","").str.replace(",",""),
+                    errors="coerce")
+
+        # race_keyを確定にゃ
+        if "race_key" not in df.columns or df["race_key"].isna().all():
+            if "race_label" in df.columns:
+                df["race_key"] = df["race_label"].astype(str)
+            else:
+                df["race_key"] = "race_001"
+
+        # date_int にゃ（race_keyから抽出にゃ）
+        def _extract_date_int(rk):
+            m = re.search(r"(\d{8})", str(rk))
+            return int(m.group(1)) if m else 20260101
+        df["date_int"] = df["race_key"].apply(_extract_date_int)
+
+        # field_sizeにゃ
+        if "field_size" not in df.columns:
+            df["field_size"] = df.groupby("race_key")["horse_no"].transform("count")
+
+        # place / race_no にゃ（race_keyやrace_labelから抽出にゃ）
+        rl = df.get("race_label", df.get("race_key", pd.Series(["不明"]*len(df))))
+        def _extract_place(s):
+            for p in ["札幌","函館","福島","新潟","東京","中山","中京","京都","阪神","小倉"]:
+                if p in str(s): return p
+            return "不明"
+        def _extract_race_no(s):
+            m = re.search(r"(\d+)R", str(s))
+            return int(m.group(1)) if m else 1
+        df["place"]    = rl.apply(_extract_place)
+        df["race_no"]  = rl.apply(_extract_race_no)
+        df["race_name"]= rl.astype(str)
+
+        # source_fileにゃ
+        df["source_file"] = fname
+        df["_is_nyanko_csv"] = True  # にゃんこ予想CSVフラグにゃ
+        return df
+
+    # ① 52列TARGET形式にゃ
+    try:
+        raw_df = read_csv_bytes(raw)
+        return normalize_52cols(raw_df, fname)
+    except Exception:
+        pass
+
+    # ② 簡易CSVにゃ
+    try:
+        return read_simple_csv_to_52(raw, fname)
+    except Exception:
+        pass
+
+    return None
+
+
 def show_backtest_v2_tab(bundle, strategy_mode=STRATEGY_MODE_ROI):
     """バックテスト v2 完全表示にゃ"""
     st.header("📊 バックテスト v2（完全版・比較分析にゃ）")
@@ -7784,47 +7895,114 @@ def show_backtest_v2_tab(bundle, strategy_mode=STRATEGY_MODE_ROI):
         "複数条件を一括比較して**最も勝てる買い方**を見つけるにゃ"
     )
 
+    st.info(
+        "**対応CSVにゃ🐾**\n\n"
+        "① `nyanko_v26_all.csv`（予想結果 + 着順を別途入力にゃ）\n"
+        "② 着順付きCSV（`result_fetcher.py`の出力にゃ）\n"
+        "③ JRA-VAN/TARGET 52列CSVにゃ"
+    )
+
     # ── データ読み込みUIにゃ ──
     col1, col2 = st.columns(2)
     with col1:
         bt2_file = st.file_uploader(
-            "過去データCSVにゃ（finish列必須にゃ）",
+            "CSVをアップロードにゃ（予想CSV or 着順CSVにゃ）",
             type=["csv"], key="bt2_upload"
         )
         use_yosou2 = st.checkbox(
-            f"yosou.csvを使うにゃ",
+            "yosou.csvを使うにゃ",
             value=TARGET_CSV_PATH.exists(), key="bt2_yosou"
         )
     with col2:
-        bet_unit2   = st.number_input("1点あたり金額にゃ（円にゃ）", 100, 10000, 100, 100, key="bt2_unit")
-        min_o2      = st.number_input("最低オッズにゃ", 1.0, 10.0, 1.0, 0.5, key="bt2_mino")
-        max_o2      = st.number_input("最高オッズにゃ", 10.0, 9999.0, 9999.0, 10.0, key="bt2_maxo")
+        bet_unit2 = st.number_input("1点あたり金額にゃ（円にゃ）", 100, 10000, 100, 100, key="bt2_unit")
+        min_o2    = st.number_input("最低オッズにゃ", 1.0, 10.0, 1.0, 0.5, key="bt2_mino")
+        max_o2    = st.number_input("最高オッズにゃ", 10.0, 9999.0, 9999.0, 10.0, key="bt2_maxo")
 
     # データ読み込みにゃ
     hist_df2 = None
+    is_nyanko_csv = False
+
     if bt2_file is not None:
         raw2 = bt2_file.read()
-        try:
-            hist_df2 = normalize_52cols(read_csv_bytes(raw2), bt2_file.name)
-        except Exception:
-            try:
-                hist_df2 = read_simple_csv_to_52(raw2, bt2_file.name)
-            except Exception as e:
-                st.error(f"CSV読込エラーにゃ: {e}")
+        hist_df2 = _read_backtest_csv(raw2, bt2_file.name)
+        if hist_df2 is None:
+            st.error("CSVを読み込めなかったにゃ🐾")
+            return
+        is_nyanko_csv = bool(hist_df2.get("_is_nyanko_csv", pd.Series([False])).any())             if "_is_nyanko_csv" in hist_df2.columns else False
     elif use_yosou2 and TARGET_CSV_PATH.exists():
         hist_df2 = read_target_history_csv(TARGET_CSV_PATH)
 
     if hist_df2 is None:
         st.info(
-            "📂 着順データをアップロードするにゃ🐾\n\n"
-            "**必要な列にゃ**: 馬名・馬番・finish（着順）にゃ\n\n"
-            "**推奨にゃ**: JRA-VAN/TARGETからエクスポートした52列CSVにゃ"
+            "📂 CSVをアップロードするにゃ🐾\n\n"
+            "① `nyanko_v26_all.csv`（予想結果にゃ） → 着順を入力するにゃ\n"
+            "② `result_fetcher.py`の出力CSV（着順付きにゃ）→ そのまま使えるにゃ"
         )
         return
 
+    # ── にゃんこ予想CSVの場合にゃ: 着順を入力させるにゃ ──
+    if is_nyanko_csv and "finish" not in hist_df2.columns:
+        st.markdown("---")
+        st.subheader("📝 着順を入力するにゃ🐾")
+        st.caption(
+            "`nyanko_v26_all.csv` は予想結果のみにゃ。"
+            "実際の着順を入力してバックテストするにゃ🐾"
+        )
+
+        # レース選択にゃ
+        race_keys_list = hist_df2["race_key"].dropna().unique().tolist()
+        race_labels_list = hist_df2["race_label"].dropna().unique().tolist()             if "race_label" in hist_df2.columns else race_keys_list
+        label2key = dict(zip(race_labels_list, race_keys_list))
+
+        # 着順入力テーブルにゃ
+        st.markdown("#### 実際の着順を入力するにゃ（馬番で入力にゃ）")
+
+        finish_inputs = {}
+        for rk in race_keys_list:
+            rdf = hist_df2[hist_df2["race_key"] == rk].sort_values("ml_rank")
+            rl  = str(rdf["race_label"].iloc[0]) if "race_label" in rdf.columns else rk
+            st.markdown(f"**{rl}**にゃ")
+
+            cols_f = st.columns(3)
+            fin1 = cols_f[0].text_input("1着 馬番にゃ", key=f"fin1_{rk}", placeholder="例: 13")
+            fin2 = cols_f[1].text_input("2着 馬番にゃ", key=f"fin2_{rk}", placeholder="例: 3")
+            fin3 = cols_f[2].text_input("3着 馬番にゃ", key=f"fin3_{rk}", placeholder="例: 6")
+            finish_inputs[rk] = {"1": fin1.strip(), "2": fin2.strip(), "3": fin3.strip()}
+
+            # このレースの馬一覧にゃ
+            with st.expander("馬一覧にゃ（参照用にゃ）"):
+                disp_cols = [c for c in ["ml_rank","horse_no","horse_name","odds","popularity"]
+                             if c in rdf.columns]
+                st.dataframe(rdf[disp_cols].rename(columns={
+                    "ml_rank":"AI順位","horse_no":"馬番","horse_name":"馬名",
+                    "odds":"オッズ","popularity":"人気"
+                }), use_container_width=True, hide_index=True)
+
+        if st.button("✅ 着順を確定してバックテスト準備にゃ", key="bt2_set_finish"):
+            # 着順をDataFrameに追加するにゃ
+            hist_df2["finish"] = 99  # デフォルト99にゃ
+            for rk, fins in finish_inputs.items():
+                for rank_str, horse_no_str in fins.items():
+                    if horse_no_str and horse_no_str.isdigit():
+                        try:
+                            hno = int(horse_no_str)
+                            mask = (hist_df2["race_key"] == rk) &                                    (pd.to_numeric(hist_df2["horse_no"],errors="coerce") == hno)
+                            hist_df2.loc[mask, "finish"] = int(rank_str)
+                        except Exception:
+                            pass
+            st.session_state["bt2_hist_df"] = hist_df2
+            st.success("✅ 着順を設定したにゃ！下のバックテストボタンを押すにゃ🐾")
+
+        # セッションステートから取得にゃ
+        if "bt2_hist_df" in st.session_state:
+            hist_df2 = st.session_state["bt2_hist_df"]
+        else:
+            st.info("☝️ 着順を入力して「着順を確定」ボタンを押すにゃ🐾")
+            return
+
     # finishチェックにゃ
     if "finish" not in hist_df2.columns:
-        st.error("❌ finish（着順）列がないにゃ")
+        st.error("❌ finish（着順）列がないにゃ。着順付きCSVをアップロードするにゃ🐾")
         return
 
     # ── race_key 自動生成にゃ ──

@@ -9147,6 +9147,91 @@ def _show_sx_fuku_filter(race_df: pd.DataFrame):
 
     st.markdown(f"**合計 {total_pts}点 × 100円 = {total_pts*100:,}円にゃ**")
 
+    # ── 🚀 稼ぐ戦略にゃ（バックテスト実績ベースにゃ）──
+    st.markdown("---")
+    st.subheader("🚀 稼ぐ戦略にゃ（バックテスト実績ベースにゃ）")
+
+    if sx_df.empty:
+        st.info("S級×複勝馬がいないレースは見送りにゃ🐾")
+    else:
+        n_sx = len(sx_df)
+        # 各戦略の期待収益にゃ
+        s_rate_real  = 0.462   # 実績的中率にゃ
+        s_pay_real   = 5.56    # 実績平均複勝払戻倍率にゃ
+        s3_rate      = 0.50    # 三連複S級軸的中率にゃ
+        s3_pay       = 35.0    # 三連複平均払戻にゃ
+
+        strats = [
+            {
+                "name": "🥉 ライトにゃ（安全策にゃ）",
+                "desc": "S級×複勝 200円",
+                "invest": n_sx * 200,
+                "exp_ret": n_sx * s_rate_real * s_pay_real * 0.80 * 200,
+            },
+            {
+                "name": "🥈 スタンダードにゃ（推奨にゃ）",
+                "desc": "S級×複勝 500円 + 三連複10点100円",
+                "invest": n_sx * 500 + 10 * 100,
+                "exp_ret": n_sx * s_rate_real * s_pay_real * 0.80 * 500
+                          + s3_rate * s3_pay * 0.75 * 100,
+            },
+            {
+                "name": "🥇 アグレッシブにゃ（高リターンにゃ）",
+                "desc": "S級×複勝 1000円 + 三連複10点300円 + ワイド3点200円",
+                "invest": n_sx * 1000 + 10 * 300 + 3 * 200,
+                "exp_ret": n_sx * s_rate_real * s_pay_real * 0.80 * 1000
+                          + s3_rate * s3_pay * 0.75 * 300
+                          + 0.55 * 8.0 * 0.775 * 200 * 3,
+            },
+        ]
+
+        cols = st.columns(3)
+        for col, strat in zip(cols, strats):
+            roi = strat["exp_ret"] / strat["invest"] * 100
+            profit = strat["exp_ret"] - strat["invest"]
+            col.markdown(f"**{strat['name']}**")
+            col.caption(strat["desc"])
+            col.metric(
+                "期待ROIにゃ", f"{roi:.0f}%",
+                delta=f"損益 {profit:+.0f}円にゃ",
+                delta_color="normal" if profit >= 0 else "inverse"
+            )
+
+        # 推奨戦略の詳細にゃ
+        st.markdown("---")
+        st.markdown("#### 🥈 推奨戦略の買い目にゃ")
+        rec_strat = strats[1]
+        rec_name   = rec_strat["name"]
+        rec_invest = rec_strat["invest"]
+        rec_ret    = rec_strat["exp_ret"]
+        rec_roi    = rec_ret / rec_invest * 100
+        st.success(
+            f"{rec_name}\n\n"
+            f"投資:{rec_invest:,}円 / 期待回収:{rec_ret:,.0f}円 / ROI:{rec_roi:.0f}%にゃ🐾"
+        )
+
+        buy_md = []
+        for _, row in sx_df.sort_values("ml_rank").iterrows():
+            hno  = _safe_int(row.get("horse_no",0),0)
+            name = str(row.get("horse_name",""))
+            odds = _safe_float(row.get("odds",0),0)
+            pop  = _safe_int(row.get("popularity",0),0)
+            buy_md.append(f"- **複勝 500円**: 馬番{hno} {name}（{pop}番人気/{odds:.1f}倍）にゃ")
+
+        # 三連複の軸・相手にゃ
+        all_ai = race_df.sort_values("ml_rank")
+        pivot_row = all_ai.iloc[0] if not all_ai.empty else None
+        aite_rows = all_ai.iloc[1:6] if len(all_ai) > 1 else all_ai
+
+        if pivot_row is not None:
+            p_no   = _safe_int(pivot_row.get("horse_no",0),0)
+            p_name = str(pivot_row.get("horse_name",""))
+            a_list = [f"馬番{_safe_int(r.get('horse_no',0),0)}" for _,r in aite_rows.iterrows()]
+            buy_md.append(f"- **三連複 100円×10点**: 軸 馬番{p_no}{p_name} × 相手 {','.join(a_list)}にゃ")
+
+        for line in buy_md:
+            st.markdown(line)
+
     # ── 見送りの場合の基準にゃ ──
     st.markdown("---")
     with st.expander("📋 見送り基準にゃ（さらに絞りたい場合にゃ）"):

@@ -1133,6 +1133,17 @@ def read_simple_csv_to_52(raw: bytes, source_name: str = "simple_csv") -> pd.Dat
         if "race_id" in df.columns:
             df["race_key"] = df["race_id"].astype(str)
 
+    # race_name が長いタイトルの場合は短縮するにゃ（G1判定のためにゃ）
+    # 例: "日本ダービー(G1) 出馬表 | ..." → "日本ダービー(G1)"
+    if "race_name" in src.columns:
+        def _shorten_race_name(s):
+            s = str(s)
+            for sep in ["|", "｜", " 出馬表", " - ", "　"]:
+                if sep in s:
+                    s = s.split(sep)[0].strip()
+            return s[:40]
+        df["race_name"] = src["race_name"].apply(_shorten_race_name).reset_index(drop=True).values[:len(df)]
+
     return clean_types(df)
 
 
@@ -9310,6 +9321,790 @@ def _disp_sx(df: pd.DataFrame):
 
 
 
+
+
+# ============================================================
+# G1レース専用分析モジュールにゃ🏆
+# 日本ダービー・有馬記念・天皇賞など大レース向けにゃ
+# ============================================================
+
+# ── G1固有データにゃ ──
+
+# 日本ダービー過去10年枠順別成績にゃ
+DERBY_FRAME_DATA = {
+    1: {"複勝率": 0.25, "勝利数": 1, "note": "1枠1番は【1.1.1.7】複勝率38%にゃ"},
+    2: {"複勝率": 0.10, "勝利数": 0, "note": "1枠2番は不振にゃ"},
+    3: {"複勝率": 0.15, "勝利数": 0, "note": "標準的にゃ"},
+    4: {"複勝率": 0.15, "勝利数": 0, "note": "4枠最後の勝利は1984年にゃ"},
+    5: {"複勝率": 0.05, "勝利数": 0, "note": "5枠は馬券内率5%の不振枠にゃ"},
+    6: {"複勝率": 0.30, "勝利数": 2, "note": "6枠は最高枠！複勝率30%・勝ち馬2頭にゃ"},
+    7: {"複勝率": 0.20, "勝利数": 1, "note": "外目だが好走例あるにゃ"},
+    8: {"複勝率": 0.15, "勝利数": 1, "note": "大外は位置取りが課題にゃ"},
+}
+
+# 騎手別東京芝2400m成績（重要にゃ）
+JOCKEY_TOKYO_2400 = {
+    "岩田康誠":  {"rate": 0.00, "record": "0-0-0-20", "note": "東京2400m全滅にゃ→切りにゃ"},
+    "松山弘平":  {"rate": 0.35, "record": "G1実績あり", "note": "皐月賞制覇・信頼できるにゃ"},
+    "津村明秀":  {"rate": 0.28, "record": "G1初制覇狙い", "note": "6枠の利を活かすにゃ"},
+    "武豊":     {"rate": 0.32, "record": "ダービー多数V", "note": "青葉賞→ダービー実績にゃ"},
+    "佐々木大輔": {"rate": 0.25, "record": "1枠内有利", "note": "内でため逃げ切り狙いにゃ"},
+    "Ｄ．レーン":  {"rate": 0.30, "record": "外国人強力", "note": "ただし5枠不振が気になるにゃ"},
+    "Ｃ．ルメール": {"rate": 0.38, "record": "リーディング常連", "note": "穴でも怖いにゃ"},
+    "川田将雅":  {"rate": 0.33, "record": "東京得意", "note": "3枠から前目の競馬にゃ"},
+    "西村淳也":  {"rate": 0.28, "record": "関西リーダー", "note": "京都新聞杯からの乗り替わりなしにゃ"},
+    "横山和生":  {"rate": 0.22, "record": "標準的", "note": "1枠2番は過去不振にゃ"},
+}
+
+# 前走ローテ別成績にゃ
+ROTO_DATA = {
+    "皐月賞": {"複勝率": 0.60, "勝利数": 8, "note": "過去10年8勝・2着10回にゃ"},
+    "京都新聞杯": {"複勝率": 0.35, "note": "別路線の刺客にゃ"},
+    "青葉賞": {"複勝率": 0.25, "note": "ダービー直行組にゃ"},
+    "プリンシパルS": {"複勝率": 0.10, "note": "過去苦戦傾向にゃ"},
+}
+
+# 馬別G1分析データにゃ（手動設定にゃ）
+DERBY_2026_HORSE_DATA = {
+    "ロブチェン":      {"前走": "皐月賞", "前走着順": 1, "脚質": "逃げ",  "血統": "ワールドプレミア", "距離適性": 0.85, "note": "皐月賞レコード勝ち。8枠外枠が唯一の懸念にゃ"},
+    "リアライズシリウス": {"前走": "皐月賞", "前走着順": 2, "脚質": "先行", "血統": "不明",           "距離適性": 0.90, "note": "6枠2番人気。距離延長プラスにゃ"},
+    "ゴーイントゥスカイ": {"前走": "青葉賞", "前走着順": 1, "脚質": "先行", "血統": "不明",           "距離適性": 0.92, "note": "青葉賞→ダービーで武豊騎乗にゃ"},
+    "ライヒスアドラー":  {"前走": "皐月賞", "前走着順": 3, "脚質": "差し",  "血統": "不明",           "距離適性": 0.88, "note": "1枠1番で内ため有利にゃ"},
+    "アウダーシア":    {"前走": "スプリングS","前走着順": 1, "脚質": "先行", "血統": "不明",           "距離適性": 0.75, "note": "5枠不振枠・GI未勝利にゃ"},
+    "コンジェスタス":   {"前走": "京都新聞杯","前走着順": 1, "脚質": "差し",  "血統": "不明",           "距離適性": 0.90, "note": "別路線から参戦・3枠良いにゃ"},
+    "バステール":     {"前走": "不明",     "前走着順": 0, "脚質": "先行", "血統": "不明",           "距離適性": 0.82, "note": "川田騎乗・3枠・穴候補にゃ"},
+    "パントルナイーフ":  {"前走": "不明",     "前走着順": 0, "脚質": "差し",  "血統": "不明",           "距離適性": 0.80, "note": "ルメール騎乗10人気・穴にゃ"},
+    "アスクエジンバラ":  {"前走": "皐月賞", "前走着順": 4, "脚質": "差し",  "血統": "不明",           "距離適性": 0.80, "note": "岩田康→東京2400m全滅・切りにゃ"},
+    "グリーンエナジー":  {"前走": "皐月賞", "前走着順": 7, "脚質": "不明",  "血統": "不明",           "距離適性": 0.78, "note": "戸崎騎乗8人気にゃ"},
+}
+
+
+def analyze_derby_horse(row: pd.Series,
+                         all_df: pd.DataFrame) -> dict:
+    """
+    1頭のダービー適性を多角的に評価するにゃ。
+    スコア0〜100で返すにゃ。
+    """
+    name  = str(row.get("horse_name", ""))
+    hno   = _safe_int(row.get("horse_no", 0), 0)
+    frame = _safe_int(row.get("frame_no", 0), 0)
+    odds  = _safe_float(row.get("odds", 99), 99)
+    pop   = _safe_int(row.get("popularity", 99), 99)
+    jockey = str(row.get("jockey", "")).strip()
+
+    score = 50.0  # 基本スコアにゃ
+    reasons = []
+    warnings = []
+
+    # ① 枠順スコアにゃ
+    frame_info = DERBY_FRAME_DATA.get(frame, {"複勝率": 0.15, "note": "標準にゃ"})
+    frame_rate = frame_info["複勝率"]
+    frame_score = (frame_rate - 0.15) * 100  # 平均15%基準にゃ
+    score += frame_score * 0.3
+    if frame_rate >= 0.25:
+        reasons.append(f"✅ {frame}枠有利（複勝率{frame_rate*100:.0f}%にゃ）")
+    elif frame_rate <= 0.08:
+        warnings.append(f"⚠️ {frame}枠不振（複勝率{frame_rate*100:.0f}%にゃ）")
+
+    # ② 騎手スコアにゃ
+    jockey_short = jockey[:4]
+    jockey_info = None
+    for k, v in JOCKEY_TOKYO_2400.items():
+        if k in jockey or jockey in k:
+            jockey_info = v
+            break
+    if jockey_info:
+        j_rate = jockey_info["rate"]
+        jockey_score = (j_rate - 0.25) * 100
+        score += jockey_score * 0.25
+        if j_rate >= 0.30:
+            reasons.append(f"✅ {jockey[:6]}騎手強力（{jockey_info['note']}）にゃ")
+        elif j_rate == 0.00:
+            warnings.append(f"❌ {jockey[:6]}騎手 {jockey_info['record']} にゃ")
+            score -= 20
+
+    # ③ 馬別データスコアにゃ
+    horse_info = DERBY_2026_HORSE_DATA.get(name)
+    if horse_info:
+        dist_score = (horse_info["距離適性"] - 0.82) * 100
+        score += dist_score * 0.2
+
+        roto = horse_info["前走"]
+        roto_info = ROTO_DATA.get(roto, {"複勝率": 0.15})
+        roto_score = (roto_info["複勝率"] - 0.25) * 50
+        score += roto_score * 0.15
+
+        prev_rank = horse_info["前走着順"]
+        if prev_rank == 1: score += 10; reasons.append(f"✅ 前走1着（{roto}にゃ）")
+        elif prev_rank == 2: score += 6; reasons.append(f"✅ 前走2着（{roto}にゃ）")
+        elif prev_rank == 3: score += 3; reasons.append(f"✅ 前走3着（{roto}にゃ）")
+
+        style = horse_info.get("脚質", "不明")
+        # 東京2400は差し有利だが先行も可にゃ
+        if style in ["先行", "差し"]: score += 3
+        elif style == "逃げ": score -= 3  # 外枠逃げは距離ロスにゃ
+
+    # ④ 人気オッズ補正にゃ（1番人気は少し下げるにゃ→過剰人気対策にゃ）
+    if pop == 1:
+        score += 5  # 能力評価にゃ
+    elif pop <= 3:
+        score += 3
+    elif pop >= 10:
+        score -= 5
+
+    # スコアをクリップにゃ
+    score = float(np.clip(score, 5, 98))
+
+    return {
+        "score":    round(score, 1),
+        "reasons":  reasons,
+        "warnings": warnings,
+        "frame_info": frame_info,
+        "horse_info": horse_info or {},
+    }
+
+
+def show_g1_derby_analysis(race_df: pd.DataFrame):
+    """
+    日本ダービー専用分析ダッシュボードにゃ🏆
+    通常の予想に加えてG1固有のデータ分析を表示するにゃ
+    """
+    st.markdown("---")
+    st.subheader("🏆 日本ダービー専用分析にゃ（枠順・騎手・ローテ・展開にゃ）")
+    st.caption("東京芝2400m G1特有のデータで三連複を絞るにゃ🐾")
+
+    if race_df is None or race_df.empty:
+        st.info("出走表CSVを読み込んでから分析するにゃ🐾")
+        return
+
+    # ── 全馬スコアリングにゃ ──
+    results = []
+    for _, row in race_df.iterrows():
+        analysis = analyze_derby_horse(row, race_df)
+        results.append({
+            "馬番": _safe_int(row.get("horse_no", 0), 0),
+            "枠番": _safe_int(row.get("frame_no", 0), 0),
+            "馬名": str(row.get("horse_name", "")),
+            "騎手": str(row.get("jockey", ""))[:8],
+            "人気": _safe_int(row.get("popularity", 99), 99),
+            "オッズ": _safe_float(row.get("odds", 99), 99),
+            "G1スコア": analysis["score"],
+            "プラス要因": " / ".join(analysis["reasons"][:2]) if analysis["reasons"] else "—",
+            "マイナス要因": " / ".join(analysis["warnings"][:1]) if analysis["warnings"] else "—",
+            "_reasons": analysis["reasons"],
+            "_warnings": analysis["warnings"],
+            "_horse_info": analysis["horse_info"],
+        })
+
+    result_df = pd.DataFrame(results).sort_values("G1スコア", ascending=False)
+
+    # ── タブ表示にゃ ──
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 G1スコアランキングにゃ",
+        "🌪️ 展開予測にゃ",
+        "🏇 騎手データにゃ",
+        "🏆 三連複最終買い目にゃ",
+    ])
+
+    with tab1:
+        st.markdown("#### 📊 日本ダービー適性スコアにゃ（高いほど有利にゃ）")
+        st.caption("枠順・騎手実績・前走ローテ・距離適性を総合評価にゃ")
+
+        def color_g1(row):
+            s = float(row.get("G1スコア", 0))
+            if s >= 65: return ["background-color:#c3e6cb"] * len(row)
+            if s >= 55: return ["background-color:#d1ecf1"] * len(row)
+            if s <= 35: return ["background-color:#f8d7da"] * len(row)
+            return [""] * len(row)
+
+        disp = result_df.drop(columns=["_reasons","_warnings","_horse_info"]).copy()
+        try:
+            st.dataframe(
+                disp.style.apply(color_g1, axis=1),
+                use_container_width=True, hide_index=True
+            )
+        except Exception:
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        # 上位3頭の詳細にゃ
+        st.markdown("#### 🏆 上位3頭の評価にゃ")
+        for _, row in result_df.head(3).iterrows():
+            hno = row["馬番"]
+            with st.expander(f"馬番{hno} {row['馬名']} — G1スコア{row['G1スコア']}にゃ"):
+                hi = row["_horse_info"]
+                r2 = row["_reasons"]
+                w2 = row["_warnings"]
+                if hi:
+                    st.write(f"**前走にゃ**: {hi.get('前走','-')} {hi.get('前走着順','-')}着")
+                    st.write(f"**脚質にゃ**: {hi.get('脚質','-')}")
+                    st.write(f"**距離適性にゃ**: {hi.get('距離適性',0)*100:.0f}%")
+                    st.write(f"**評価にゃ**: {hi.get('note','-')}")
+                for r3 in r2: st.success(r3)
+                for w3 in w2: st.warning(w3)
+
+    with tab2:
+        st.markdown("#### 🌪️ ペース展開予測にゃ")
+        # 脚質分布にゃ
+        styles = {
+            "逃げ": ["ロブチェン（馬17）"],
+            "先行": ["リアライズシリウス（馬11）","ゴーイントゥスカイ（馬14）",
+                    "バステール（馬5）","アウダーシア（馬9）"],
+            "差し": ["ライヒスアドラー（馬1）","コンジェスタス（馬6）",
+                    "パントルナイーフ（馬13）"],
+            "追込": ["その他"],
+        }
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("逃げ馬にゃ", "1頭")
+        c2.metric("先行馬にゃ", "4頭")
+        c3.metric("差し馬にゃ", "3頭+")
+        c4.metric("予想ペースにゃ", "ミドル〜スロー")
+
+        st.info(
+            "💡 **展開予測にゃ**\n\n"
+            "逃げはロブチェン1頭。先行馬が複数いるが潰し合いにはならないにゃ。\n"
+            "**ミドルペース想定** → 先行有利・外枠ロブチェンはポジション争いがカギにゃ。\n"
+            "6枠リアライズシリウスは3〜4番手から絶好の展開が見込めるにゃ🐾"
+        )
+
+        frame_rows = []
+        for frame, info in DERBY_FRAME_DATA.items():
+            frame_rows.append({
+                "枠番にゃ": f"{frame}枠",
+                "複勝率にゃ": f"{info['複勝率']*100:.0f}%",
+                "勝利数にゃ": info.get("勝利数",0),
+                "コメントにゃ": info["note"],
+            })
+        st.markdown("#### 東京芝2400m 枠番別成績（過去10年にゃ）")
+        fdf = pd.DataFrame(frame_rows)
+        def color_frame(row):
+            r = float(row["複勝率にゃ"].replace("%","")) / 100
+            if r >= 0.28: return ["background-color:#c3e6cb"]*len(row)
+            if r <= 0.06: return ["background-color:#f8d7da"]*len(row)
+            return [""]*len(row)
+        try:
+            st.dataframe(fdf.style.apply(color_frame, axis=1),
+                         use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(fdf, use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.markdown("#### 🏇 騎手別 東京芝2400m適性にゃ")
+        jockey_rows = []
+        for _, row in race_df.iterrows():
+            jockey = str(row.get("jockey","")).strip()
+            hno = _safe_int(row.get("horse_no",0),0)
+            name = str(row.get("horse_name",""))
+            for k, v in JOCKEY_TOKYO_2400.items():
+                if k in jockey or jockey in k:
+                    jockey_rows.append({
+                        "馬番にゃ": hno,
+                        "馬名にゃ": name,
+                        "騎手にゃ": k,
+                        "東京2400適性にゃ": f"{v['rate']*100:.0f}%",
+                        "評価にゃ": v["note"],
+                    })
+                    break
+        if jockey_rows:
+            jdf = pd.DataFrame(jockey_rows).sort_values("東京2400適性にゃ", ascending=False)
+            def color_jockey(row):
+                r = float(row["東京2400適性にゃ"].replace("%","")) / 100
+                if r >= 0.33: return ["background-color:#c3e6cb"]*len(row)
+                if r == 0.00: return ["background-color:#f8d7da"]*len(row)
+                return [""]*len(row)
+            try:
+                st.dataframe(jdf.style.apply(color_jockey, axis=1),
+                             use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(jdf, use_container_width=True, hide_index=True)
+
+        st.warning("❌ 岩田康誠（12番アスクエジンバラ）→ 東京芝2400m【0-0-0-20】で切りにゃ！")
+        st.success("✅ ルメール（13番パントルナイーフ）→ 10人気でも穴で怖いにゃ！")
+
+    with tab4:
+        st.markdown("#### 🏆 三連複 最終買い目にゃ（G1スコア×AI予想にゃ）")
+
+        # G1スコア上位6頭を相手候補にゃ
+        top6 = result_df.head(6)
+        top6_nos = [int(r["馬番"]) for _, r in top6.iterrows()]
+
+        # 軸馬にゃ（G1スコア1位かつ6枠にゃ）
+        pivot_candidates = result_df[result_df["枠番"] == 6]
+        if not pivot_candidates.empty:
+            pivot = int(pivot_candidates.iloc[0]["馬番"])
+            pivot_name = str(pivot_candidates.iloc[0]["馬名"])
+        else:
+            pivot = int(result_df.iloc[0]["馬番"])
+            pivot_name = str(result_df.iloc[0]["馬名"])
+
+        # 相手馬（軸を除く上位5頭にゃ）
+        aite = [n for n in top6_nos if n != pivot][:5]
+
+        st.success(f"🎯 軸馬にゃ: 馬番{pivot} {pivot_name}（6枠G1スコア最高にゃ）")
+
+        # 10点の買い目にゃ
+        import itertools
+        combos_10 = list(itertools.combinations(aite, 2))
+        combos_display = [f"{pivot}-{min(a,b)}-{max(a,b)}" for a,b in combos_10]
+
+        st.markdown(f"**軸 馬番{pivot} × 相手 {aite} → {len(combos_display)}点にゃ**")
+        cols = st.columns(5)
+        for i, combo in enumerate(combos_display[:10]):
+            cols[i%5].markdown(f"`{combo}`")
+
+        # ルメール・川田の穴にゃ
+        st.markdown("---")
+        st.markdown("**プラス穴 2点にゃ（ルメール・川田にゃ）**")
+        st.markdown("`11-13-17` / `5-13-17`")
+
+        # 投資プランにゃ
+        st.markdown("---")
+        st.markdown("#### 💰 投資プランにゃ")
+        plan_df = pd.DataFrame([
+            {"内容にゃ": f"軸{pivot}×相手5頭 {len(combos_display)}点",
+             "単価にゃ": "300円", "合計にゃ": f"{len(combos_display)*300:,}円"},
+            {"内容にゃ": "穴2点（ルメール川田）",
+             "単価にゃ": "500円", "合計にゃ": "1,000円"},
+        ])
+        plan_df.loc[len(plan_df)] = {
+            "内容にゃ": "合計",
+            "単価にゃ": "—",
+            "合計にゃ": f"{len(combos_display)*300 + 1000:,}円"
+        }
+        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "的中時期待払戻にゃ: 2人気×1人気×3人気 → 約30倍前後にゃ。"
+            "穴が絡むと100倍超もあるにゃ🏆"
+        )
+
+
+
+
+
+# ============================================================
+# 全レース対応 統合分析ダッシュボードにゃ🐾
+# どのレースでも「枠・騎手・展開・EV・三連複買い目」を一発表示にゃ
+# ============================================================
+
+# ── 汎用枠番有利テーブルにゃ（距離・コース種別別にゃ）──
+# (コース種別, 距離帯) → {枠番: 有利度スコアにゃ}
+# 0.0=普通 +0.1=有利 -0.1=不利にゃ
+
+FRAME_ADVANTAGE_TABLE = {
+    # 芝 短距離（〜1400mにゃ）→ 内枠有利にゃ
+    ("芝", "短距離"):  {1:+0.12, 2:+0.08, 3:+0.05, 4:+0.02, 5:-0.02, 6:-0.04, 7:-0.06, 8:-0.08},
+    # 芝 マイル（1401〜1800mにゃ）→ 内〜中枠にゃ
+    ("芝", "マイル"):  {1:+0.08, 2:+0.06, 3:+0.04, 4:+0.02, 5:+0.00, 6:-0.02, 7:-0.04, 8:-0.06},
+    # 芝 中距離（1801〜2200mにゃ）→ 中枠有利にゃ
+    ("芝", "中距離"):  {1:+0.06, 2:+0.08, 3:+0.06, 4:+0.04, 5:+0.02, 6:+0.02, 7:-0.02, 8:-0.04},
+    # 芝 長距離（2200m〜にゃ）→ 内枠有利・外枠不利にゃ
+    ("芝", "長距離"):  {1:+0.10, 2:+0.08, 3:+0.06, 4:+0.04, 5:+0.00, 6:-0.02, 7:-0.04, 8:-0.08},
+    # ダート 短距離（〜1400mにゃ）→ 外枠有利（砂被り回避にゃ）
+    ("ダ", "短距離"):  {1:-0.08, 2:-0.04, 3:+0.00, 4:+0.04, 5:+0.06, 6:+0.08, 7:+0.08, 8:+0.06},
+    # ダート マイルにゃ
+    ("ダ", "マイル"):  {1:-0.04, 2:-0.02, 3:+0.02, 4:+0.04, 5:+0.04, 6:+0.06, 7:+0.04, 8:+0.02},
+    # ダート 中距離にゃ
+    ("ダ", "中距離"):  {1:-0.02, 2:+0.00, 3:+0.02, 4:+0.04, 5:+0.04, 6:+0.04, 7:+0.02, 8:+0.00},
+}
+
+def _get_dist_band(distance: int) -> str:
+    if distance <= 1400: return "短距離"
+    if distance <= 1800: return "マイル"
+    if distance <= 2200: return "中距離"
+    return "長距離"
+
+def _get_frame_advantage(frame_no: int, track_type: str, distance: int) -> float:
+    """枠番の有利不利スコアを返すにゃ（-0.15〜+0.15）"""
+    dist_band = _get_dist_band(distance)
+    # ダート判定にゃ
+    tt = "ダ" if "ダ" in str(track_type) else "芝"
+    table = FRAME_ADVANTAGE_TABLE.get((tt, dist_band),
+            FRAME_ADVANTAGE_TABLE.get(("芝", "中距離"), {}))
+    return table.get(int(frame_no), 0.0)
+
+
+def _calc_all_race_score(row: pd.Series,
+                          all_df: pd.DataFrame,
+                          track_type: str,
+                          distance: int) -> dict:
+    """
+    全レース汎用スコアリングにゃ。
+    AI確率・EV・枠番・展開・騎手実績を総合するにゃ。
+    """
+    # 基本スコアにゃ（AI確率ベースにゃ）
+    ml_prob = _safe_float(row.get("ml_top3_prob", 0), 0)
+    ev2     = _safe_float(row.get("ev_score_v2",  row.get("ev_score", 0)), 0)
+    ev_comp = _safe_float(row.get("ev_composite", 0), 0)
+    pace    = _safe_float(row.get("pace_advantage", 1.0), 1.0)
+    kelly   = _safe_float(row.get("kelly_ratio", 0), 0)
+    kelly_s = _safe_float(row.get("kelly_ratio_sanren", 0), 0)
+    final   = _safe_float(row.get("final_score", ml_prob), ml_prob)
+    pass_sc = _safe_float(row.get("pass_score", 0), 0)
+    buy_v2  = str(row.get("buy_flag_v2", ""))
+    buy_v1  = str(row.get("buy_flag", ""))
+    dl      = str(row.get("danger_level", ""))
+
+    frame_no   = _safe_int(row.get("frame_no", 4), 4)
+    frame_adv  = _get_frame_advantage(frame_no, track_type, distance)
+
+    # 総合スコア計算にゃ（0〜100にゃ）
+    score = (
+        final   * 40          # AI最終スコアにゃ（最重要にゃ）
+        + ml_prob * 20         # AI確率にゃ
+        + ev2  * 15            # EV乖離にゃ
+        + frame_adv * 10       # 枠番有利不利にゃ
+        + pace * 5             # 展開適性にゃ
+        + (kelly + kelly_s) * 5  # Kelly比にゃ
+        - (pass_sc / 200) * 15   # 見送りペナルティにゃ
+    )
+
+    # 危険馬ペナルティにゃ
+    if dl in ["強危険", "危険"]:
+        score -= 20
+    if "見送り" in buy_v2:
+        score -= 10
+
+    # ボーナスにゃ
+    if "◎" in buy_v2: score += 15
+    if "○" in buy_v2: score += 8
+    if buy_v1 == "買い": score += 5
+
+    score = float(np.clip(score * 100, 1, 99))
+
+    # 評価コメントにゃ
+    reasons, warnings = [], []
+    if frame_adv >= 0.06:  reasons.append(f"✅ {frame_no}枠有利（{frame_adv:+.2f}にゃ）")
+    elif frame_adv <= -0.06: warnings.append(f"⚠️ {frame_no}枠不利（{frame_adv:+.2f}にゃ）")
+    if ev2 >= 0.06:  reasons.append(f"✅ EV高め（{ev2:+.3f}にゃ）")
+    elif ev2 <= -0.08: warnings.append(f"⚠️ EV低め（{ev2:+.3f}にゃ）")
+    if pace >= 1.08: reasons.append(f"✅ 展開有利（{pace:.2f}にゃ）")
+    elif pace <= 0.90: warnings.append(f"⚠️ 展開不利（{pace:.2f}にゃ）")
+    if "◎" in buy_v2: reasons.append(f"✅ S級◎判定にゃ")
+    if dl in ["強危険","危険"]: warnings.append(f"❌ {dl}にゃ")
+
+    return {
+        "score":      round(score, 1),
+        "frame_adv":  frame_adv,
+        "reasons":    reasons,
+        "warnings":   warnings,
+    }
+
+
+def show_race_analysis_full(race_df: pd.DataFrame,
+                             strategy_mode: str = STRATEGY_MODE_ROI):
+    """
+    全レース対応の統合分析ダッシュボードにゃ🐾
+    どんなレースでも以下を自動分析するにゃ:
+      ① 総合スコアランキングにゃ
+      ② 展開×脚質マッチにゃ
+      ③ 枠番有利不利にゃ
+      ④ 騎手・EV・Kelly総合にゃ
+      ⑤ 三連複・ワイド・複勝 買い目一発にゃ
+    """
+    if race_df is None or race_df.empty:
+        return
+
+    # レース情報にゃ
+    track_type = str(race_df.get("track_type", pd.Series(["芝"])).iloc[0])
+    distance   = _safe_int(race_df.get("distance", pd.Series([2000])).iloc[0], 2000)
+    race_name  = str(race_df.get("race_name", pd.Series(["レース"])).iloc[0])[:30]
+    field_size = len(race_df)
+    going      = str(race_df.get("going", pd.Series(["良"])).iloc[0])
+    place      = str(race_df.get("place", pd.Series([""])).iloc[0])
+
+    dist_band  = _get_dist_band(distance)
+    tt_label   = "ダート" if "ダ" in track_type else "芝"
+
+    st.markdown("---")
+    st.subheader(f"🔬 全力分析にゃ — {race_name}")
+    st.caption(
+        f"{place} {tt_label}{distance}m {dist_band} {going} "
+        f"{field_size}頭にゃ🐾"
+    )
+
+    # ── 全馬スコアリングにゃ ──
+    score_rows = []
+    for _, row in race_df.iterrows():
+        analysis = _calc_all_race_score(row, race_df, track_type, distance)
+        score_rows.append({
+            "馬番":      _safe_int(row.get("horse_no",0),0),
+            "枠番":      _safe_int(row.get("frame_no",0),0),
+            "馬名":      str(row.get("horse_name","")),
+            "騎手":      str(row.get("jockey",""))[:8],
+            "人気":      _safe_int(row.get("popularity",99),99),
+            "オッズ":    _safe_float(row.get("odds",0),0),
+            "AI確率":    f"{_safe_float(row.get('ml_top3_prob',0),0)*100:.1f}%",
+            "EV":        round(_safe_float(row.get("ev_score_v2",row.get("ev_score",0)),0),3),
+            "展開":      round(_safe_float(row.get("pace_advantage",1.0),1.0),3),
+            "S級判定":   str(row.get("buy_flag_v2",""))[:6],
+            "複勝判定":  str(row.get("buy_flag","")),
+            "総合スコア": analysis["score"],
+            "枠有利":    f"{analysis['frame_adv']:+.2f}",
+            "評価":      " ".join(analysis["reasons"][:1] + analysis["warnings"][:1]),
+            "_r":        analysis["reasons"],
+            "_w":        analysis["warnings"],
+        })
+
+    sdf = pd.DataFrame(score_rows).sort_values("総合スコア", ascending=False).reset_index(drop=True)
+
+    # ── 5タブにゃ ──
+    t1, t2, t3, t4, t5 = st.tabs([
+        "🏆 総合スコアにゃ",
+        "🌪️ 展開×脚質にゃ",
+        "🔲 枠番分析にゃ",
+        "💰 EV・Kellyにゃ",
+        "🎯 買い目一発にゃ",
+    ])
+
+    # ── Tab1: 総合スコアにゃ ──
+    with t1:
+        st.markdown("#### 総合スコアランキングにゃ（AI確率+EV+枠+展開の総合評価にゃ）")
+
+        def color_score(row):
+            s = float(row.get("総合スコア", 0))
+            if s >= 65: return ["background-color:#c3e6cb"] * len(row)
+            if s >= 50: return ["background-color:#d1ecf1"] * len(row)
+            if s <= 25: return ["background-color:#f8d7da"] * len(row)
+            return [""] * len(row)
+
+        disp_cols = ["総合スコア","馬番","枠番","馬名","騎手","人気","オッズ",
+                     "AI確率","EV","展開","枠有利","S級判定","評価"]
+        try:
+            st.dataframe(
+                sdf[disp_cols].style.apply(color_score, axis=1),
+                use_container_width=True, hide_index=True
+            )
+        except Exception:
+            st.dataframe(sdf[disp_cols], use_container_width=True, hide_index=True)
+
+        # 上位3頭の詳細にゃ
+        st.markdown("#### 🥇 上位3頭 評価詳細にゃ")
+        c1, c2, c3 = st.columns(3)
+        for col, (_, row) in zip([c1,c2,c3], sdf.head(3).iterrows()):
+            with col:
+                col.markdown(f"**馬番{row['馬番']} {row['馬名']}**")
+                col.metric("総合スコアにゃ", f"{row['総合スコア']:.0f}点")
+                col.caption(f"{row['人気']}人気 / {row['オッズ']}倍")
+                for r3 in row["_r"][:2]:
+                    col.success(r3.replace("✅ ",""))
+                for w3 in row["_w"][:1]:
+                    col.warning(w3.replace("⚠️ ","").replace("❌ ",""))
+
+    # ── Tab2: 展開×脚質にゃ ──
+    with t2:
+        st.markdown("#### 展開予測×脚質マッチにゃ")
+
+        if "running_style" not in race_df.columns:
+            st.info("脚質データがないにゃ。予想実行後に表示されるにゃ🐾")
+        else:
+            pace_info = analyze_pace(race_df)
+            pace_label = pace_info.get("pace", "不明")
+            pace_score_val = pace_info.get("pace_score", 0.5)
+
+            pace_icon = {"ハイペース":"🔥","スローペース":"💤","ミドルペース":"⚡","流動的":"🌀"}.get(pace_label,"❓")
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("ペースにゃ", f"{pace_icon} {pace_label}")
+            c2.metric("逃げにゃ",   f"{pace_info.get('escape_count',0)}頭にゃ")
+            c3.metric("先行にゃ",   f"{pace_info.get('senkou_count',0)}頭にゃ")
+            c4.metric("差し追込にゃ",f"{pace_info.get('sashi_count',0)+pace_info.get('oikomi_count',0)}頭にゃ")
+            st.info(pace_info.get("pace_note",""))
+
+            # 展開有利馬 TOP5にゃ
+            st.markdown("#### 展開有利馬 TOP5にゃ")
+            if "pace_advantage" in race_df.columns:
+                top5_pace = race_df.sort_values("pace_advantage", ascending=False).head(5)
+                for rank, (_, r) in enumerate(top5_pace.iterrows(), 1):
+                    pa   = _safe_float(r.get("pace_advantage",1.0),1.0)
+                    icon = "🟢" if pa>=1.05 else ("🟡" if pa>=1.00 else "🔴")
+                    st.markdown(
+                        f"{icon} **{rank}位** 馬番{_safe_int(r.get('horse_no',0),0)} "
+                        f"{r.get('horse_name','')} ({r.get('running_style','不明')}) "
+                        f"展開スコア: **{pa:.3f}**にゃ"
+                    )
+
+    # ── Tab3: 枠番分析にゃ ──
+    with t3:
+        st.markdown(f"#### {tt_label}{distance}m({dist_band}) 枠番有利不利にゃ")
+
+        frame_rows = []
+        for fn in range(1, 9):
+            adv = _get_frame_advantage(fn, track_type, distance)
+            horses_in_frame = race_df[race_df["frame_no"].astype(str).str.strip() == str(fn)]
+            horse_list = " / ".join(
+                str(r.get("horse_name","")) for _, r in horses_in_frame.iterrows()
+            )
+            frame_rows.append({
+                "枠番にゃ": f"{fn}枠",
+                "有利度にゃ": f"{adv:+.2f}",
+                "馬名にゃ": horse_list or "—",
+                "評価にゃ": "✅ 有利" if adv>=0.06 else ("⚠️ やや不利" if adv<=-0.04 else "— 標準"),
+            })
+
+        fdf = pd.DataFrame(frame_rows)
+        def color_frame(row):
+            v = float(row["有利度にゃ"])
+            if v >= 0.06: return ["background-color:#c3e6cb"]*len(row)
+            if v <= -0.06: return ["background-color:#f8d7da"]*len(row)
+            return [""]*len(row)
+        try:
+            st.dataframe(fdf.style.apply(color_frame, axis=1),
+                         use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(fdf, use_container_width=True, hide_index=True)
+
+        # 有利枠の馬にゃ
+        best_frame_adv = max(range(1,9), key=lambda fn: _get_frame_advantage(fn, track_type, distance))
+        best_adv_val   = _get_frame_advantage(best_frame_adv, track_type, distance)
+        st.success(f"✅ このレースの最有利枠にゃ: **{best_frame_adv}枠** ({best_adv_val:+.2f}にゃ)")
+
+    # ── Tab4: EV・Kellyにゃ ──
+    with t4:
+        st.markdown("#### EV乖離・Kelly比・総合判定にゃ")
+        ev_col = "ev_score_v2" if "ev_score_v2" in race_df.columns else "ev_score"
+        ev_disp_cols = [c for c in [
+            "ml_rank","horse_no","horse_name","odds","popularity",
+            "ml_top3_prob", ev_col, "pace_advantage",
+            "kelly_ratio","kelly_ratio_sanren",
+            "buy_flag_v2","buy_flag","pass_score",
+        ] if c in race_df.columns]
+
+        ev_df = race_df[ev_disp_cols].copy()
+        ev_df = ev_df.sort_values("ml_rank" if "ml_rank" in ev_df.columns else ev_col,
+                                   ascending=True if "ml_rank" in ev_df.columns else False)
+
+        if "ml_top3_prob" in ev_df.columns:
+            ev_df["ml_top3_prob"] = (
+                pd.to_numeric(ev_df["ml_top3_prob"],errors="coerce")*100
+            ).round(1).astype(str)+"%"
+        for c in [ev_col,"pace_advantage","kelly_ratio","kelly_ratio_sanren"]:
+            if c in ev_df.columns:
+                ev_df[c] = pd.to_numeric(ev_df[c],errors="coerce").round(3)
+
+        def color_ev4(row):
+            ev = _safe_float(row.get("EV(展開補正)",row.get(ev_col,0)),0)
+            bv = str(row.get("S級判定",row.get("buy_flag_v2","")))
+            if "◎" in bv: return ["background-color:#c3e6cb"]*len(row)
+            if ev >= 0.06: return ["background-color:#d1ecf1"]*len(row)
+            if ev <= -0.08: return ["background-color:#f8d7da"]*len(row)
+            return [""]*len(row)
+
+        rename_ev = {
+            "ml_rank":"AI順位","horse_no":"馬番","horse_name":"馬名",
+            "odds":"オッズ","popularity":"人気","ml_top3_prob":"AI確率",
+            ev_col:"EV(展開補正)","pace_advantage":"展開スコア",
+            "kelly_ratio":"Kelly複勝","kelly_ratio_sanren":"Kelly三連複",
+            "buy_flag_v2":"S級判定","buy_flag":"複勝判定","pass_score":"見送りスコア",
+        }
+        try:
+            st.dataframe(
+                ev_df.rename(columns=rename_ev).style.apply(color_ev4, axis=1),
+                use_container_width=True, hide_index=True
+            )
+        except Exception:
+            st.dataframe(ev_df.rename(columns=rename_ev),
+                         use_container_width=True, hide_index=True)
+
+    # ── Tab5: 買い目一発にゃ ──
+    with t5:
+        st.markdown("#### 🎯 買い目一発にゃ（全券種まとめにゃ）")
+        st.caption("S級・EV・枠番・展開を全部加味した最終買い目にゃ🐾")
+
+        # 総合スコア上位6頭にゃ
+        top6 = sdf.head(6)
+        top6_nos = [int(r["馬番"]) for _, r in top6.iterrows()]
+
+        # S級◎の馬を軸に優先するにゃ
+        s_pivot_rows = sdf[sdf["S級判定"].str.contains("◎", na=False)]
+        if not s_pivot_rows.empty:
+            pivot_no   = int(s_pivot_rows.iloc[0]["馬番"])
+            pivot_name = str(s_pivot_rows.iloc[0]["馬名"])
+            pivot_label = "S級◎"
+        else:
+            pivot_no   = int(top6.iloc[0]["馬番"])
+            pivot_name = str(top6.iloc[0]["馬名"])
+            pivot_label = "総合1位"
+
+        aite5 = [n for n in top6_nos if n != pivot_no][:5]
+
+        # 複勝候補にゃ（S級×複勝にゃ）
+        fuku_candidates = sdf[
+            sdf["S級判定"].str.contains("買い", na=False) &
+            (sdf["複勝判定"] == "買い")
+        ]
+        if fuku_candidates.empty:
+            fuku_candidates = sdf[sdf["複勝判定"] == "買い"]
+        if fuku_candidates.empty:
+            fuku_candidates = sdf.head(3)
+        fuku_nos = [int(r["馬番"]) for _, r in fuku_candidates.iterrows()]
+
+        # ワイド候補にゃ（総合上位2〜4頭のBOXにゃ）
+        wide_nos = top6_nos[:4]
+
+        # ── 表示にゃ ──
+        st.markdown("**① 複勝にゃ（S級×複勝フィルターにゃ）**")
+        if fuku_nos:
+            for fn in fuku_nos[:4]:
+                row = sdf[sdf["馬番"]==fn]
+                if not row.empty:
+                    r = row.iloc[0]
+                    pop = int(r["人気"]); odds = float(r["オッズ"])
+                    fuku_est = max(1.1, odds*0.30)
+                    icon = "🥇" if pop<=3 else ("🥈" if pop<=6 else "💎")
+                    st.info(
+                        f"{icon} **馬番{fn} {r['馬名']}** "
+                        f"（{pop}人気/{odds}倍 / 複勝推定{fuku_est:.1f}倍にゃ）"
+                    )
+        st.markdown("---")
+
+        st.markdown(f"**② 三連複にゃ — 軸:{pivot_no}番{pivot_name}（{pivot_label}にゃ）× 相手{aite5}にゃ**")
+        import itertools as _it
+        san3_combos = [
+            f"{pivot_no}-{min(a,b)}-{max(a,b)}"
+            for a,b in _it.combinations(aite5, 2)
+        ]
+        cols5 = st.columns(5)
+        for i, combo in enumerate(san3_combos[:10]):
+            cols5[i%5].code(combo)
+
+        st.markdown("---")
+        st.markdown(f"**③ ワイドにゃ — 上位{len(wide_nos)}頭BOXにゃ（{len(list(_it.combinations(wide_nos,2)))}点にゃ）**")
+        wide_combos = [f"{min(a,b)}-{max(a,b)}" for a,b in _it.combinations(wide_nos, 2)]
+        wcols = st.columns(min(len(wide_combos), 6))
+        for i, combo in enumerate(wide_combos[:6]):
+            wcols[i%len(wcols)].code(combo)
+
+        st.markdown("---")
+        # 投資プランにゃ
+        n_san3   = len(san3_combos)
+        n_fuku   = len(fuku_nos[:4])
+        n_wide   = len(wide_combos[:6])
+        total    = n_san3*300 + n_fuku*200 + n_wide*100
+
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("複勝にゃ",   f"{n_fuku}点×200円",   f"{n_fuku*200:,}円にゃ")
+        c2.metric("三連複にゃ", f"{n_san3}点×300円",  f"{n_san3*300:,}円にゃ")
+        c3.metric("ワイドにゃ", f"{n_wide}点×100円",  f"{n_wide*100:,}円にゃ")
+        c4.metric("合計にゃ",   f"{n_san3+n_fuku+n_wide}点", f"{total:,}円にゃ")
+
+        # CSV出力にゃ
+        buy_rows = []
+        for fn in fuku_nos[:4]:
+            buy_rows.append({"券種":"複勝","買い目":str(fn),"単価":200})
+        for combo in san3_combos[:10]:
+            buy_rows.append({"券種":"三連複","買い目":combo,"単価":300})
+        for combo in wide_combos[:6]:
+            buy_rows.append({"券種":"ワイド","買い目":combo,"単価":100})
+        buy_df = pd.DataFrame(buy_rows)
+        buy_df["合計"] = buy_df["単価"]
+        st.download_button(
+            "📥 買い目CSVにゃ",
+            data=buy_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name=f"buy_{race_name[:10].replace(' ','_')}.csv",
+            mime="text/csv",
+        )
+
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI v26にゃ")
     st.success(f"起動版にゃ: {VERSION}にゃ")
@@ -9718,6 +10513,21 @@ def app_main():
                 show_pkl_ai_dashboard(bundle, race_df)
             except Exception as _ai_err:
                 st.warning(f"AI分析エラーにゃ: {_ai_err}にゃ")
+
+            # ── 全レース統合分析にゃ（G1も一般レースも対応にゃ）──
+            try:
+                show_race_analysis_full(race_df, strategy_mode=strategy_mode)
+            except Exception as _all_err:
+                st.warning(f"全力分析エラーにゃ: {_all_err}にゃ")
+
+            # ── G1レース専用分析（G1のときは追加でさらに詳しくにゃ）──
+            race_name_str = str(race_df.get("race_name", pd.Series([""])).iloc[0])
+            is_g1 = any(x in race_name_str for x in ["G1","G１","GI","ダービー","天皇賞","有馬","ジャパンC","オークス","菊花賞","皐月賞","安田","マイルC","スプリンターズ","高松宮","宝塚","秋華賞","NHK","ヴィクトリア","フェブラリー","チャンピオンズ"])
+            if is_g1:
+                try:
+                    show_g1_derby_analysis(race_df)
+                except Exception as _g1_err:
+                    st.warning(f"G1専用分析エラーにゃ: {_g1_err}にゃ")
 
             # ML強化ダッシュボードにゃ
             st.markdown("---")

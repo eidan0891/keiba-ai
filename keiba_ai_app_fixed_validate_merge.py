@@ -10105,6 +10105,310 @@ def show_race_analysis_full(race_df: pd.DataFrame,
 
 
 
+
+
+# ============================================================
+# 予想ツール強化モジュールにゃ🐾
+# PKLなしでも動く独自スコアリング
+# + ダブル軸三連複自動生成
+# + 消し馬自動検出
+# + 最終決断画面
+# ============================================================
+
+import itertools as _itertools
+
+
+# ── 汎用騎手スコアDB（重要レース向けにゃ）──
+JOCKEY_STRENGTH = {
+    'Ｃ．ルメール': 0.95, 'C.ルメール': 0.95,
+    '川田将雅':    0.91, '松山弘平':   0.92,
+    '武豊':       0.90, 'Ｄ．レーン':  0.88,
+    '西村淳也':   0.86, '津村明秀':   0.85,
+    '戸崎圭太':   0.84, '佐々木大輔': 0.83,
+    '横山武史':   0.81, '坂井瑠星':   0.82,
+    '横山和生':   0.80, 'Ｍ．ディー':  0.78,
+    '荻野極':     0.74, '丹内祐次':   0.70,
+    '浜中俊':     0.75, 'Ｆ．ゴンサルベス': 0.72,
+    '岩田康誠':   0.58,  # 東京芝2400m【0-0-0-20】にゃ
+    '岩田望来':   0.80,
+    '池添謙一':   0.79, '三浦皇成':   0.77,
+    '菅原明良':   0.78, '北村友一':   0.79,
+    '藤岡佑介':   0.78, '幸英明':     0.76,
+    '和田竜二':   0.77, '団野大成':   0.79,
+    '角田大河':   0.80, '古川奈穂':   0.75,
+}
+
+# ── 枠番有利テーブル（コース×距離にゃ）──
+FRAME_TABLE = {
+    ('芝','短距離'): {1:1.10,2:0.96,3:1.02,4:1.00,5:0.98,6:0.96,7:0.94,8:0.90},
+    ('芝','マイル'): {1:1.06,2:1.04,3:1.02,4:1.00,5:0.99,6:0.98,7:0.97,8:0.95},
+    ('芝','中距離'): {1:1.08,2:1.06,3:1.04,4:1.02,5:1.00,6:1.15,7:1.00,8:0.92},
+    ('芝','長距離'): {1:1.08,2:1.05,3:1.04,4:1.02,5:0.90,6:1.14,7:1.02,8:0.90},
+    ('ダ','短距離'): {1:0.90,2:0.94,3:0.98,4:1.02,5:1.06,6:1.08,7:1.06,8:1.04},
+    ('ダ','マイル'): {1:0.94,2:0.97,3:1.00,4:1.03,5:1.04,6:1.05,7:1.03,8:1.01},
+    ('ダ','中距離'): {1:0.96,2:0.99,3:1.01,4:1.03,5:1.04,6:1.04,7:1.02,8:1.00},
+}
+
+# ── 消し条件DBにゃ ──
+KESHI_CONDITIONS = [
+    {
+        "name":    "岩田康誠×東京芝2400m",
+        "check":   lambda r: "岩田康誠" in str(r.get("jockey","")) and
+                              _safe_int(r.get("distance",0),0) >= 2400 and
+                              "東京" in str(r.get("place","")),
+        "reason":  "東京芝2400m【0-0-0-20】で全滅にゃ",
+        "severity": "❌ 切り",
+    },
+    {
+        "name":    "5枠 芝G1",
+        "check":   lambda r: _safe_int(r.get("frame_no",0),0) == 5 and
+                              "芝" in str(r.get("track_type","")) and
+                              any(x in str(r.get("race_name","")) for x in ["G1","ダービー","天皇賞","有馬"]),
+        "reason":  "5枠はG1芝で馬券内率5%の不振枠にゃ",
+        "severity": "⚠️ 注意",
+    },
+    {
+        "name":    "大外枠(8枠)×1番人気",
+        "check":   lambda r: _safe_int(r.get("frame_no",0),0) == 8 and
+                              _safe_int(r.get("popularity",99),99) == 1 and
+                              _safe_int(r.get("distance",0),0) >= 1800,
+        "reason":  "大外枠1番人気は過剰人気になりやすいにゃ",
+        "severity": "⚠️ 過剰人気注意",
+    },
+    {
+        "name":    "前走大敗(10着以下)",
+        "check":   lambda r: False,  # 前走データがCSVにあれば有効にゃ
+        "reason":  "前走10着以下は巻き返し困難にゃ",
+        "severity": "⚠️ 注意",
+    },
+]
+
+
+def calc_independent_score(race_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    PKLなしで動く独自スコアリングにゃ。
+    オッズ・枠番・騎手・展開スコアから総合点を計算するにゃ。
+    """
+    df = race_df.copy()
+
+    # レース情報にゃ
+    tt       = str(df.get("track_type", pd.Series(["芝"])).iloc[0])
+    dist     = _safe_int(df.get("distance", pd.Series([2000])).iloc[0], 2000)
+    tt_key   = "ダ" if "ダ" in tt else "芝"
+    dist_key = "短距離" if dist<=1400 else ("マイル" if dist<=1800 else ("中距離" if dist<=2200 else "長距離"))
+    frame_tbl= FRAME_TABLE.get((tt_key, dist_key), FRAME_TABLE[("芝","中距離")])
+
+    scores = []
+    for _, r in df.iterrows():
+        odds   = _safe_float(r.get("odds",99), 99)
+        pop    = _safe_int(r.get("popularity",18), 18)
+        frame  = _safe_int(r.get("frame_no",4), 4)
+        jockey = str(r.get("jockey","")).strip()
+
+        # ① 市場確率にゃ（オッズから）
+        base = min(1.0 / max(odds,1.0) * 3.0, 0.90)
+
+        # ② 枠補正にゃ
+        fm = frame_tbl.get(frame, 1.0)
+
+        # ③ 騎手補正にゃ
+        jm = 1.0
+        for k, v in JOCKEY_STRENGTH.items():
+            if k in jockey or jockey in k:
+                jm = v; break
+
+        # ④ 既存AIスコアがあれば加味するにゃ
+        ai_prob   = _safe_float(r.get("ml_top3_prob",0), 0)
+        ev2       = _safe_float(r.get("ev_score_v2", r.get("ev_score",0)), 0)
+        pace_a    = _safe_float(r.get("pace_advantage",1.0), 1.0)
+        final_sc  = _safe_float(r.get("final_score",0), 0)
+        buy_v2    = str(r.get("buy_flag_v2",""))
+
+        if ai_prob > 0:
+            # AI予想あり → AI確率を重視にゃ
+            score = (
+                ai_prob  * 0.40
+                + final_sc * 0.20
+                + ev2    * 0.10
+                + base   * 0.15
+                + (fm-1.0) * 0.10
+                + (jm-0.8) * 0.05
+                + pace_a * 0.05 - 0.05
+            ) * 100
+        else:
+            # AI予想なし → 独自スコアのみにゃ
+            score = base * fm * jm * 100
+
+        # S級◎ボーナスにゃ
+        if "◎" in buy_v2: score += 12
+        elif "○" in buy_v2: score += 6
+
+        scores.append(round(float(np.clip(score, 1, 99)), 2))
+
+    df["ind_score"] = scores
+
+    # 消し判定にゃ
+    keshi_labels = []
+    for _, r in df.iterrows():
+        found = []
+        for cond in KESHI_CONDITIONS:
+            try:
+                if cond["check"](r):
+                    found.append(f"{cond['severity']} {cond['reason']}")
+            except Exception:
+                pass
+        keshi_labels.append(" / ".join(found) if found else "")
+    df["keshi"] = keshi_labels
+
+    return df
+
+
+def show_final_decision(race_df: pd.DataFrame,
+                         strategy_mode: str = STRATEGY_MODE_ROI):
+    """
+    最終決断画面にゃ🏆
+    「これだけ見れば馬券が買えるにゃ」という一枚まとめにゃ。
+    """
+    st.markdown("---")
+    st.subheader("🏆 最終決断にゃ — これだけ見て買えにゃ！🐾")
+
+    if race_df is None or race_df.empty:
+        st.info("予想を実行するにゃ🐾")
+        return
+
+    # 独自スコアを計算にゃ
+    df = calc_independent_score(race_df)
+    df_sorted = df.sort_values("ind_score", ascending=False).reset_index(drop=True)
+
+    # ── レース情報にゃ ──
+    race_name = str(df.get("race_name", pd.Series(["レース"])).iloc[0])[:25]
+    dist      = _safe_int(df.get("distance", pd.Series([2000])).iloc[0], 2000)
+    tt        = str(df.get("track_type", pd.Series(["芝"])).iloc[0])
+    place     = str(df.get("place", pd.Series([""])).iloc[0])
+    tt_l      = "ダート" if "ダ" in tt else "芝"
+
+    st.markdown(f"**{place} {tt_l}{dist}m | {race_name}**")
+
+    # ── 消し馬にゃ ──
+    keshi_df = df[df["keshi"].str.len() > 0]
+    if not keshi_df.empty:
+        st.markdown("#### ❌ 消し馬にゃ（買わない馬にゃ）")
+        for _, r in keshi_df.iterrows():
+            hno  = _safe_int(r.get("horse_no",0),0)
+            name = str(r.get("horse_name",""))
+            st.error(f"馬番{hno} {name} → {r['keshi']}")
+
+    # ── スコアTop8にゃ ──
+    st.markdown("#### 📊 スコアランキングにゃ（総合評価にゃ）")
+    top8 = df_sorted.head(8)
+    disp_cols = ["ind_score","馬番","枠番","馬名","騎手","人気","オッズ","keshi"]
+    # 列名をわかりやすくにゃ
+    top8_disp = top8.rename(columns={
+        "ind_score":"総合スコア","horse_no":"馬番","frame_no":"枠番",
+        "horse_name":"馬名","jockey":"騎手","popularity":"人気","odds":"オッズ","keshi":"消し判定"
+    })
+    disp = [c for c in ["総合スコア","馬番","枠番","馬名","騎手","人気","オッズ","消し判定"] if c in top8_disp.columns]
+
+    def color_final(row):
+        s = float(row.get("総合スコア",0))
+        k = str(row.get("消し判定",""))
+        if "❌" in k: return ["background-color:#f8d7da"]*len(row)
+        if s >= 40:  return ["background-color:#c3e6cb"]*len(row)
+        if s >= 25:  return ["background-color:#d1ecf1"]*len(row)
+        return [""]*len(row)
+
+    try:
+        st.dataframe(top8_disp[disp].style.apply(color_final,axis=1),
+                     use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(top8_disp[disp], use_container_width=True, hide_index=True)
+
+    # ── 軸馬決定にゃ ──
+    # 消し馬を除外した上でスコア上位2頭を軸にするにゃ
+    clean_df = df_sorted[df_sorted["keshi"].str.contains("❌") == False].reset_index(drop=True)
+    if clean_df.empty:
+        clean_df = df_sorted.copy()
+
+    pivot1_row = clean_df.iloc[0]
+    pivot2_row = clean_df.iloc[1] if len(clean_df) > 1 else clean_df.iloc[0]
+    pivot1 = _safe_int(pivot1_row.get("horse_no",0),0)
+    pivot2 = _safe_int(pivot2_row.get("horse_no",0),0)
+    p1_name= str(pivot1_row.get("horse_name",""))
+    p2_name= str(pivot2_row.get("horse_name",""))
+    p1_odds= _safe_float(pivot1_row.get("odds",0),0)
+    p2_odds= _safe_float(pivot2_row.get("odds",0),0)
+    p1_pop = _safe_int(pivot1_row.get("popularity",0),0)
+    p2_pop = _safe_int(pivot2_row.get("popularity",0),0)
+
+    # 相手馬にゃ（上位6頭から軸を除いた4頭にゃ）
+    top6_nos = [_safe_int(r.get("horse_no",0),0) for _,r in clean_df.head(7).iterrows()]
+    aite4    = [n for n in top6_nos if n not in [pivot1, pivot2]][:4]
+
+    st.markdown("---")
+    st.markdown("#### 🎯 三連複 最終買い目にゃ")
+
+    c1, c2 = st.columns(2)
+    c1.success(f"**軸1にゃ: 馬番{pivot1} {p1_name}**\n{p1_pop}人気/{p1_odds}倍 スコア{pivot1_row['ind_score']:.0f}点")
+    c2.info(f"**軸2にゃ: 馬番{pivot2} {p2_name}**\n{p2_pop}人気/{p2_odds}倍 スコア{pivot2_row['ind_score']:.0f}点")
+
+    st.markdown(f"**相手にゃ: 馬番 {aite4}**")
+
+    # 軸1×相手4（6点にゃ）
+    combos1 = sorted([
+        tuple(sorted([pivot1,a,b]))
+        for a,b in _itertools.combinations(aite4,2)
+    ])
+    # 軸2×相手4（6点にゃ）
+    combos2 = sorted([
+        tuple(sorted([pivot2,a,b]))
+        for a,b in _itertools.combinations(aite4,2)
+        if tuple(sorted([pivot2,a,b])) not in combos1
+    ])
+    all_combos = combos1 + combos2
+
+    # 表示にゃ
+    st.markdown(f"**軸{pivot1}×相手 — {len(combos1)}点にゃ**")
+    cols1 = st.columns(min(len(combos1),6))
+    for i, c in enumerate(combos1):
+        cols1[i%len(cols1)].code(f"{c[0]}-{c[1]}-{c[2]}")
+
+    if combos2:
+        st.markdown(f"**軸{pivot2}×相手 — {len(combos2)}点にゃ（追加にゃ）**")
+        cols2 = st.columns(min(len(combos2),6))
+        for i, c in enumerate(combos2):
+            cols2[i%len(cols2)].code(f"{c[0]}-{c[1]}-{c[2]}")
+
+    total_pts = len(all_combos)
+    total_yen = total_pts * 300
+
+    st.markdown("---")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("三連複にゃ", f"{total_pts}点", "×300円にゃ")
+    c2.metric("投資額にゃ", f"¥{total_yen:,}")
+    c3.metric("複勝（軸1）にゃ", f"馬番{pivot1}", "500円にゃ")
+    c4.metric("複勝（軸2）にゃ", f"馬番{pivot2}", "300円にゃ")
+
+    total_all = total_yen + 500 + 300
+    st.success(f"**合計: {total_pts}点+複勝2点 = ¥{total_all:,}にゃ🐾**")
+
+    # CSVダウンロードにゃ
+    buy_rows = [{"券種":"複勝","買い目":str(pivot1),"単価":500}]
+    buy_rows += [{"券種":"複勝","買い目":str(pivot2),"単価":300}]
+    buy_rows += [{"券種":"三連複","買い目":f"{c[0]}-{c[1]}-{c[2]}","単価":300}
+                  for c in all_combos]
+    bdf = pd.DataFrame(buy_rows)
+    bdf["合計"] = bdf["単価"]
+
+    st.download_button(
+        "📥 最終買い目CSV（これを持って馬券売り場へにゃ🐾）",
+        data=bdf.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name=f"final_buy_{race_name[:10].replace(' ','_')}.csv",
+        mime="text/csv",
+        type="primary",
+    )
+
+
+
 def app_main():
     st.title("🐾 にゃんこ競馬AI v26にゃ")
     st.success(f"起動版にゃ: {VERSION}にゃ")
@@ -10513,6 +10817,12 @@ def app_main():
                 show_pkl_ai_dashboard(bundle, race_df)
             except Exception as _ai_err:
                 st.warning(f"AI分析エラーにゃ: {_ai_err}にゃ")
+
+            # ── 最終決断にゃ（これだけ見て馬券を買えるにゃ）──
+            try:
+                show_final_decision(race_df, strategy_mode=strategy_mode)
+            except Exception as _fd_err:
+                st.warning(f"最終決断エラーにゃ: {_fd_err}にゃ")
 
             # ── 全レース統合分析にゃ（G1も一般レースも対応にゃ）──
             try:
